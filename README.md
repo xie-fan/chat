@@ -33,7 +33,7 @@
 - 手机推送：管理员配置 ntfy 后，用户在「我」页开启
 - 备份与恢复：管理后台一键生成备份（数据库全部表 + 附件 / 头像文件，tar.gz）、下载到本地；上传备份文件恢复（需键入 RESTORE 确认，恢复后所有用户需重新登录）
 - 桌面端：关掉窗口留在系统托盘继续收消息；开机自启在「我」页打开，默认关
-- 机器人（webhook bot）：任何人可在「我」页建 bot，给它加一个或多个令牌。外部程序带令牌往入站地址 POST 就以 bot 身份发消息；填了回调地址，私聊 bot 或在群里 @ 它时服务器把消息 POST 过去，回复的文字发回原会话
+- 机器人（webhook bot）：任何人可在「我」页建 bot，给它加一个或多个令牌。外部程序带令牌往入站地址 POST 就以 bot 身份发消息；填了回调地址，私聊 bot 或在群里 @ 它时服务器把消息 POST 过去，回复的文字发回原会话。agent 可以按 OpenAPI 描述（`/v1/bot/openapi.json`）用同一个令牌拉取新消息、读历史、发文件、改和撤回
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
 - 部署：`./scripts/run.sh` 一条命令（Postgres + 服务端托管前端，主机端口 28080）
 
@@ -221,6 +221,23 @@ curl -X POST http://<服务器>/v1/hooks -H 'Authorization: Bearer <令牌>' -H 
 请求头 `X-Chat-Signature: sha256=<hex>`，值是用签名密钥（「我」页可复制、可更换）对请求体做的 HMAC-SHA256。10 秒内回 `{"content": "..."}` 就作为 bot 的回复发回原会话，回别的内容不回复。bot 自己发的消息不会触发任何回调。
 
 已知限制：令牌明文存在服务器上，管理员和备份都能看到；服务器会向用户填的任意地址发请求，包括局域网地址。
+
+### Bot API（给 agent 用）
+
+同一个令牌还能读会话和历史、拉取新消息、发图片和文件、改和撤回自己的消息。接口描述是 OpenAPI，地址 `http://<服务器>/v1/bot/openapi.json`（不要令牌）：能导入 OpenAPI 的 agent 平台直接填这个地址，鉴权选 Bearer、填令牌。
+
+| 接口 | 做什么 |
+|---|---|
+| `GET /v1/bot/updates?timeout=30` | 拉取发给 bot 的新消息（私聊、群里 @ 它的），和回调是同样的事件；取到即交付，不会重复给。没有公网地址的程序用它代替回调地址 |
+| `POST /v1/hooks` | 发消息；可带 `attachment_id`（先 `POST /v1/bot/files` 上传到同一会话）和 `reply_to_id`，返回完整消息 |
+| `GET /v1/bot/conversations`、`/v1/bot/conversations/{id}`、`/v1/bot/conversations/{id}/messages` | bot 所在的会话、成员、历史 |
+| `PATCH /v1/bot/messages/{id}`、`POST /v1/bot/messages/{id}/recall` | 改自己 15 分钟内的文字消息、撤回自己 24 小时内的消息 |
+
+```bash
+curl 'http://<服务器>/v1/bot/updates?timeout=30' -H 'Authorization: Bearer <令牌>'
+```
+
+bot 上传的文件算进主人的存储配额（主人和他的 bot 共用一份）。主人被管理员禁用期间，bot 的令牌返回 403、也不回调，启用后恢复。
 
 ### SDK
 

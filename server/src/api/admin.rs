@@ -106,16 +106,17 @@ pub(super) async fn admin_users(
     };
     // 每人附件已用存储（V2 P2-1，MF1 修订）：同一 storage_path 只归最早一行的
     // 上传者计费——转发/记录克隆行 uploader=转发者但更晚，不会被计入其配额。
+    // bot 上传的记在主人那一行（和配额口径一致），bot 自己那行是 0。
     let ids: Vec<Uuid> = rows.iter().map(|u| u.id).collect();
     let usage: std::collections::HashMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT uploader_id, SUM(size)::bigint
-           FROM (SELECT DISTINCT a.uploader_id, a.storage_path, a.size
-                   FROM attachments a
-                  WHERE a.uploader_id = ANY($1)
+        "SELECT owner_id, SUM(size)::bigint
+           FROM (SELECT DISTINCT COALESCE(u.bot_owner_id, u.id) AS owner_id, a.storage_path, a.size
+                   FROM attachments a JOIN users u ON u.id = a.uploader_id
+                  WHERE COALESCE(u.bot_owner_id, u.id) = ANY($1)
                     AND NOT EXISTS (SELECT 1 FROM attachments o
                                      WHERE o.storage_path = a.storage_path
                                        AND (o.created_at, o.id) < (a.created_at, a.id))) d
-          GROUP BY uploader_id",
+          GROUP BY owner_id",
     )
     .bind(&ids)
     .fetch_all(&st.pool)

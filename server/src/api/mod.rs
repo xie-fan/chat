@@ -49,7 +49,7 @@ pub(crate) const AVATAR_MAX_BYTES: usize = 1024 * 1024;
 /// 账号管理操作（角色/禁用）的事务级顾问锁：串行化，防止并发降权越过末位保护
 const ADMIN_LOCK_KEY: i64 = 0x63_68_61_74_61_64_6D_69; // "chatadmi"
 
-pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
+pub fn router(cfg: &crate::config::Config, st: &SharedState) -> Router<SharedState> {
     Router::new()
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
@@ -144,7 +144,28 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/bots/{id}/secret", post(reset_bot_secret))
         .route("/bots/{id}/tokens", post(create_bot_token))
         .route("/bots/{id}/tokens/{token_id}", delete(delete_bot_token))
-        .route("/hooks", post(post_hook))
+        // Bot API（描述见 /bot/openapi.json）：bot 令牌能调的就是下面合进来的这几条。
+        // bot_auth 把令牌换成 bot 自己的身份，处理函数与用户接口共用；用户凭据在这里不认。
+        .route("/bot/openapi.json", get(bot_openapi))
+        .merge(
+            Router::new()
+                .route("/hooks", post(post_hook))
+                .route("/bot/me", get(get_me))
+                .route("/bot/updates", get(bot_updates))
+                .route("/bot/conversations", get(list_conversations))
+                .route("/bot/conversations/{id}", get(get_conversation))
+                .route("/bot/conversations/{id}/messages", get(list_messages))
+                .route(
+                    "/bot/files",
+                    post(upload_file).layer(DefaultBodyLimit::max(
+                        cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,
+                    )),
+                )
+                .route("/bot/messages/{id}", patch(edit_message))
+                .route("/bot/messages/{id}/recall", post(recall_message))
+                .route("/bot/messages/{id}/record", get(get_record))
+                .route_layer(axum::middleware::from_fn_with_state(st.clone(), bot_auth)),
+        )
         .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(

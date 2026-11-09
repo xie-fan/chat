@@ -464,9 +464,11 @@ pub(super) async fn add_members(
         .await?
         .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     let before = domain::member_ids(&mut *tx, conv).await?;
+    // delivered_seq 从入群这一刻算：bot 只拉得到入群之后 @ 它的消息（行锁内读 last_seq）
     sqlx::query(
-        "INSERT INTO memberships (conversation_id, user_id, role)
-         SELECT $1, unnest($2::uuid[]), 'member' ON CONFLICT DO NOTHING",
+        "INSERT INTO memberships (conversation_id, user_id, role, delivered_seq)
+         SELECT $1, unnest($2::uuid[]), 'member', (SELECT last_seq FROM conversations WHERE id = $1)
+             ON CONFLICT DO NOTHING",
     )
     .bind(conv)
     .bind(&ids)

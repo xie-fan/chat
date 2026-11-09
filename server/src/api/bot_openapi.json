@@ -1,0 +1,566 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Chat Bot API",
+    "version": "1.0.0",
+    "description": "以 bot 身份在 Chat 里收发消息，给外部程序和 agent 用。\n\n**鉴权**：每个请求带 `Authorization: Bearer <令牌>`。令牌由 bot 的主人在客户端「我 → 机器人」里添加，可以有多个、单独删除；令牌不对返回 401，主人账号被禁用期间返回 403。\n\n**收消息**：轮询 `getUpdates`（不需要公网地址），或者在机器人设置里填回调地址（见 webhooks）。两种方式给的事件一样：私聊里收到的每条消息、群里 @ 了 bot 的消息；bot 自己和其他 bot 发的不算。\n\n**发消息**：`sendMessage`，不填 conversation_id 就发到和主人的私聊。发图片或文件先 `uploadFile` 到同一会话，再把返回的 id 作为 attachment_id 发出。\n\n**看上下文**：`listConversations` 列出 bot 所在的会话，`listMessages` 翻历史，`getConversation` 看群成员（在消息里写 @username 提到某人）。消息里的附件用 `downloadFile` 下载。"
+  },
+  "servers": [{ "url": "/v1" }],
+  "security": [{ "botToken": [] }],
+  "paths": {
+    "/bot/me": {
+      "get": {
+        "operationId": "getMe",
+        "summary": "bot 自己的账号",
+        "description": "别人在群里用 @username 提到 bot；消息的 sender_id 等于这里的 id 就是 bot 自己发的。",
+        "responses": {
+          "200": {
+            "description": "bot 的账号",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/bot/updates": {
+      "get": {
+        "operationId": "getUpdates",
+        "summary": "拉取发给 bot 的新消息",
+        "description": "返回还没交付过的事件，按时间先后排：私聊里的每条消息、群里 @ 了 bot 的消息。返回即算交付，下次不会再给；没处理完的用 listMessages 补。没有新消息时最多等 timeout 秒，期间来了消息立刻返回。",
+        "parameters": [
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "没有新消息时最多等几秒，0–50；0 = 立即返回",
+            "schema": { "type": "integer", "minimum": 0, "maximum": 50, "default": 0 }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "最多返回几条",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "新事件；没有就是空数组",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["events"],
+                  "properties": {
+                    "events": { "type": "array", "items": { "$ref": "#/components/schemas/BotEvent" } }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/hooks": {
+      "post": {
+        "operationId": "sendMessage",
+        "summary": "以 bot 身份发消息",
+        "description": "发文字、附件，或带说明文字的附件。不填 conversation_id 就发到和主人的私聊；bot 必须是目标会话的成员。群里写 @username 会提到对方。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/SendMessageRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "发出的消息；带同一个 client_msg_id 重发时是第一次那条",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bot/conversations": {
+      "get": {
+        "operationId": "listConversations",
+        "summary": "bot 所在的会话",
+        "description": "和主人的私聊，以及主人拉它进的群；最近有消息的在前。",
+        "responses": {
+          "200": {
+            "description": "会话列表",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Conversation" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/bot/conversations/{id}": {
+      "get": {
+        "operationId": "getConversation",
+        "summary": "会话详情和成员",
+        "description": "要在群里 @ 某人，就在消息里写 @ 加他的 username。",
+        "parameters": [{ "$ref": "#/components/parameters/ConversationId" }],
+        "responses": {
+          "200": {
+            "description": "会话详情",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ConversationDetail" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/bot/conversations/{id}/messages": {
+      "get": {
+        "operationId": "listMessages",
+        "summary": "会话历史消息",
+        "description": "一页按 seq 从小到大排。都不带时是最新的一页；往前翻用这页第一条的 seq 作 before_seq，接着往后读用最后一条的 seq 作 after_seq。",
+        "parameters": [
+          { "$ref": "#/components/parameters/ConversationId" },
+          {
+            "name": "before_seq",
+            "in": "query",
+            "description": "只要 seq 比它小的（往前翻）",
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "after_seq",
+            "in": "query",
+            "description": "只要 seq 比它大的（往后读）；和 before_seq 同时给时以它为准",
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "一页消息",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessagesPage" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/bot/messages/{id}/record": {
+      "get": {
+        "operationId": "getChatRecord",
+        "summary": "聊天记录的完整内容",
+        "description": "kind 为 chat_record 的消息是别人合并转发来的一段聊天，消息里只有前几条摘要（record_preview），完整内容从这里取。",
+        "parameters": [{ "$ref": "#/components/parameters/MessageId" }],
+        "responses": {
+          "200": {
+            "description": "聊天记录",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatRecord" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bot/files": {
+      "post": {
+        "operationId": "uploadFile",
+        "summary": "上传图片或文件",
+        "description": "上传到哪个会话就只能发到哪个会话，一个附件只能发一次；拿返回的 id 调 sendMessage。Content-Type 为 image/* 的显示成图片，其余显示成文件。单个文件默认最大 25 MB。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["conversation_id", "file"],
+                "properties": {
+                  "conversation_id": { "type": "string", "format": "uuid", "description": "要发到的会话" },
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "文件名和类型取自这一部分的 filename 与 Content-Type"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "附件",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Attachment" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": {
+            "description": "超出存储配额（bot 和主人共用主人的那一份）",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/bot/messages/{id}": {
+      "patch": {
+        "operationId": "editMessage",
+        "summary": "改 bot 自己发的文字消息",
+        "description": "只能改自己发的纯文字消息，发出后 15 分钟内。适合先发「处理中…」再改成结果。",
+        "parameters": [{ "$ref": "#/components/parameters/MessageId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/EditMessageRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "改好的消息",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } }
+          },
+          "400": {
+            "description": "不是纯文字消息、已超过 15 分钟，或内容为空 / 超长",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "expected_version 不是当前版本，或消息已撤回",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/bot/messages/{id}/recall": {
+      "post": {
+        "operationId": "recallMessage",
+        "summary": "撤回 bot 自己发的消息",
+        "description": "发出后 24 小时内。撤回后所有人看到「撤回了一条消息」，正文和附件都清空；重复撤回返回同样结果。",
+        "parameters": [{ "$ref": "#/components/parameters/MessageId" }],
+        "responses": {
+          "200": {
+            "description": "撤回后的消息（recalled 为 true）",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/files/{id}": {
+      "get": {
+        "operationId": "downloadFile",
+        "summary": "下载附件",
+        "description": "消息里 attachment.id 对应的文件，不需要令牌。",
+        "security": [],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          {
+            "name": "thumb",
+            "in": "query",
+            "description": "1 = 图片缩略图（attachment.has_thumb 为 true 时才有，没有就返回原图）",
+            "schema": { "type": "integer", "enum": [1] }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "文件内容，Content-Type 是上传时的类型",
+            "content": { "*/*": { "schema": { "type": "string", "format": "binary" } } }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "botMessage": {
+      "post": {
+        "operationId": "onBotMessage",
+        "summary": "回调：发给 bot 的新消息",
+        "description": "机器人设置里填了回调地址时，每个事件服务器 POST 一次，和 getUpdates 是同一批事件、同一个形状。请求头 X-Chat-Signature 是 `sha256=` 加上用签名密钥对请求体做的 HMAC-SHA256（十六进制），用它确认请求来自本服务器。10 秒内回 `{\"content\": \"...\"}` 就作为 bot 的回复发回原会话；回别的内容或超时都不回复。",
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Chat-Signature",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^sha256=[0-9a-f]{64}$" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BotEvent" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "要回复就带 content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "content": { "type": "string", "description": "回复的文字；空或不带 = 不回复" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "botToken": { "type": "http", "scheme": "bearer", "description": "bot 的入站令牌（「我 → 机器人」里添加）" }
+    },
+    "parameters": {
+      "ConversationId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "会话 id",
+        "schema": { "type": "string", "format": "uuid" }
+      },
+      "MessageId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "消息 id",
+        "schema": { "type": "string", "format": "uuid" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "参数不对，error 里写了原因",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "令牌缺失或无效",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Forbidden": {
+        "description": "bot 的主人账号被禁用了，或者 bot 不是这个会话的成员、无权做这件事（如改别人的消息、超过撤回时限）",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "会话、消息或附件不存在",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string", "description": "原因" },
+          "code": { "type": "string", "description": "部分错误带的稳定错误码，如 recall_expired" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "required": ["id", "username", "display_name", "is_bot"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "username": { "type": "string", "description": "唯一、不可改；群里写 @username 提到他" },
+          "display_name": { "type": "string", "description": "昵称" },
+          "is_bot": { "type": "boolean" }
+        }
+      },
+      "Member": {
+        "type": "object",
+        "required": ["user", "role", "joined_at"],
+        "properties": {
+          "user": { "$ref": "#/components/schemas/User" },
+          "role": { "type": "string", "enum": ["owner", "member"], "description": "owner = 群主" },
+          "joined_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Attachment": {
+        "type": "object",
+        "required": ["id", "file_name", "mime", "size", "has_thumb"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid", "description": "用 downloadFile 下载" },
+          "file_name": { "type": "string" },
+          "mime": { "type": "string" },
+          "size": { "type": "integer", "description": "字节数" },
+          "width": { "type": ["integer", "null"], "description": "图片宽度（像素）" },
+          "height": { "type": ["integer", "null"], "description": "图片高度（像素）" },
+          "has_thumb": { "type": "boolean", "description": "有缩略图：downloadFile 带 thumb=1 取" },
+          "duration_ms": { "type": ["integer", "null"], "description": "语音时长（毫秒）；有值就是语音消息" }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "required": [
+          "id",
+          "conversation_id",
+          "seq",
+          "sender_id",
+          "sender_username",
+          "sender_name",
+          "content",
+          "kind",
+          "mentions",
+          "edit_version",
+          "recalled",
+          "created_at"
+        ],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "conversation_id": { "type": "string", "format": "uuid" },
+          "seq": { "type": "integer", "description": "会话内序号，从 1 起递增、没有空洞" },
+          "sender_id": { "type": "string", "format": "uuid" },
+          "sender_username": { "type": "string" },
+          "sender_name": { "type": "string", "description": "发送者的昵称" },
+          "content": {
+            "type": "string",
+            "description": "正文。附件消息没写文字时是占位，如「[图片]」「[文件] 报告.pdf」"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["text", "image", "file", "audio", "poll", "chat_record", "meeting", "system"],
+            "description": "audio = 语音；poll = 投票；chat_record = 合并转发的聊天记录（完整内容用 getChatRecord 取）；meeting = 会议卡片，content 是会议链接；system = 群里的提示条（建群、改名、拉人、退群等），content 是 JSON，其中 text 是中文说明"
+          },
+          "attachment": { "anyOf": [{ "$ref": "#/components/schemas/Attachment" }, { "type": "null" }] },
+          "mentions": {
+            "type": "array",
+            "items": { "type": "string", "format": "uuid" },
+            "description": "这条消息 @ 到的用户 id（只有群聊有）"
+          },
+          "reply_to_id": { "type": ["string", "null"], "format": "uuid", "description": "回复的是哪条消息" },
+          "forwarded_from": { "type": ["string", "null"], "description": "转发来的消息：原发送者的昵称" },
+          "record_preview": {
+            "type": ["object", "null"],
+            "description": "chat_record 的摘要：title、count 和前几条 items"
+          },
+          "edit_version": { "type": "integer", "description": "改一次加一；editMessage 的 expected_version 填它" },
+          "edited_at": { "type": ["string", "null"], "format": "date-time" },
+          "recalled": { "type": "boolean", "description": "已撤回：正文和附件都已清空" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MessagesPage": {
+        "type": "object",
+        "required": ["messages", "has_more"],
+        "properties": {
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/Message" } },
+          "has_more": { "type": "boolean", "description": "朝这一页的方向还有更多" }
+        }
+      },
+      "Conversation": {
+        "type": "object",
+        "required": ["id", "kind", "member_count", "last_seq", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "kind": { "type": "string", "enum": ["dm", "group", "self"], "description": "dm = 私聊，group = 群" },
+          "name": { "type": ["string", "null"], "description": "群名；私聊为 null" },
+          "owner_id": { "type": ["string", "null"], "format": "uuid", "description": "群主" },
+          "peer": {
+            "anyOf": [{ "$ref": "#/components/schemas/User" }, { "type": "null" }],
+            "description": "私聊的对方，也就是 bot 的主人"
+          },
+          "member_count": { "type": "integer" },
+          "last_seq": { "type": "integer", "description": "最新一条消息的 seq" },
+          "last_message": { "anyOf": [{ "$ref": "#/components/schemas/Message" }, { "type": "null" }] },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ConversationDetail": {
+        "type": "object",
+        "required": ["id", "kind", "members", "last_seq", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "kind": { "type": "string", "enum": ["dm", "group", "self"] },
+          "name": { "type": ["string", "null"] },
+          "owner_id": { "type": ["string", "null"], "format": "uuid" },
+          "members": { "type": "array", "items": { "$ref": "#/components/schemas/Member" } },
+          "last_seq": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ChatRecord": {
+        "type": "object",
+        "required": ["title", "items"],
+        "properties": {
+          "title": { "type": "string" },
+          "source_kind": { "type": "string", "enum": ["dm", "group", "self"], "description": "记录来自哪类会话" },
+          "count": { "type": "integer" },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sender_id": { "type": "string", "format": "uuid" },
+                "sender_name": { "type": "string" },
+                "created_at": { "type": "string", "format": "date-time" },
+                "kind": { "type": "string", "description": "同 Message.kind" },
+                "content": { "type": "string" },
+                "attachment": { "anyOf": [{ "$ref": "#/components/schemas/Attachment" }, { "type": "null" }] },
+                "record": {
+                  "anyOf": [{ "$ref": "#/components/schemas/ChatRecord" }, { "type": "null" }],
+                  "description": "嵌套的聊天记录"
+                }
+              }
+            }
+          }
+        }
+      },
+      "BotEvent": {
+        "type": "object",
+        "required": ["bot_id", "conversation_id", "conversation_type", "message"],
+        "properties": {
+          "bot_id": { "type": "string", "format": "uuid" },
+          "conversation_id": { "type": "string", "format": "uuid" },
+          "conversation_type": {
+            "type": "string",
+            "enum": ["dm", "group"],
+            "description": "dm = 主人私聊 bot；group = 群里有人 @ 了 bot"
+          },
+          "message": { "$ref": "#/components/schemas/Message" }
+        }
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "properties": {
+          "content": { "type": "string", "maxLength": 4000, "description": "正文，最多 4000 字；带附件时可以不填" },
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "发到哪个会话；不填 = 和主人的私聊"
+          },
+          "attachment_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "uploadFile 上传到同一会话返回的 id"
+          },
+          "reply_to_id": { "type": "string", "format": "uuid", "description": "回复同一会话里的哪条消息" },
+          "client_msg_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "description": "幂等键：同一会话里重发同一个值只会有一条消息，返回的也是第一次那条；超时重试时带上"
+          }
+        }
+      },
+      "EditMessageRequest": {
+        "type": "object",
+        "required": ["content", "expected_version"],
+        "properties": {
+          "content": { "type": "string", "minLength": 1, "maxLength": 4000 },
+          "expected_version": { "type": "integer", "description": "消息当前的 edit_version（刚发出的是 0）" }
+        }
+      }
+    }
+  }
+}

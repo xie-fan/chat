@@ -230,12 +230,17 @@ pub(super) async fn finish_edit(
 /// 克隆行 uploader_id 现已记为转发者：同一 storage_path 只归「最早那行的上传者」
 /// （created_at,id 最小的行）计费——克隆行更晚，转发不会推高转发者配额；
 /// 最早行被清扫删除后，存活的最早引用自然接手计费。
+/// bot 上传的算在主人名下：传主人或他的任一个 bot，都按「主人 + 他全部 bot」合计，
+/// 共用主人那一份配额（不然每建一个 bot 就多一份配额）。
 pub async fn storage_used(pool: &PgPool, uid: Uuid) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(SUM(size), 0)::bigint
            FROM (SELECT DISTINCT a.storage_path, a.size
                    FROM attachments a
-                  WHERE a.uploader_id = $1
+                  WHERE a.uploader_id IN (
+                            SELECT u.id FROM users u, users me
+                             WHERE me.id = $1
+                               AND COALESCE(me.bot_owner_id, me.id) IN (u.id, u.bot_owner_id))
                     AND NOT EXISTS (SELECT 1 FROM attachments o
                                      WHERE o.storage_path = a.storage_path
                                        AND (o.created_at, o.id) < (a.created_at, a.id))) d",

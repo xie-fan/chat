@@ -83,6 +83,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0038_push_devices.sql"),
         include_str!("../migrations/0039_message_recall.sql"),
         include_str!("../migrations/0040_chat_record.sql"),
+        include_str!("../migrations/0041_bot_delivery.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
