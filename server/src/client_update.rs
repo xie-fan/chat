@@ -211,7 +211,7 @@ pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLates
 }
 
 /// 本服务对外地址：优先后台配置的 public_url，否则按请求的 Host 拼
-fn origin(public_url: &str, headers: &HeaderMap) -> String {
+pub(crate) fn origin(public_url: &str, headers: &HeaderMap) -> String {
     if !public_url.is_empty() {
         return public_url.to_string();
     }

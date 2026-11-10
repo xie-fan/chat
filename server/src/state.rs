@@ -72,6 +72,9 @@ pub struct AppState {
     pub maintenance: AtomicBool,
     /// V2 P4-1：备份/恢复互斥锁（同一时间只允许一个备份生成或一次恢复进行）。
     pub backup_busy: AtomicBool,
+    /// bot id → 在 GET /bot/updates 上长轮询的请求；有发给它的新消息时 notify_waiters 叫醒。
+    /// 和 conns 一样是单实例内存状态。
+    pub bot_wake: DashMap<Uuid, Arc<tokio::sync::Notify>>,
 }
 
 impl AppState {
@@ -89,6 +92,7 @@ impl AppState {
             ws_ping_interval_ms: AtomicU64::new(30_000),
             maintenance: AtomicBool::new(false),
             backup_busy: AtomicBool::new(false),
+            bot_wake: DashMap::new(),
         })
     }
 
