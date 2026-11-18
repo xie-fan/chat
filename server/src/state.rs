@@ -48,10 +48,22 @@ pub struct TicketGrant {
     pub issued: Instant,
 }
 
+/// 已接入的 ACP 宿主节点 WS 连接
+pub struct AcpHostConn {
+    pub uid: Uuid,
+    pub conn_id: Uuid,
+    pub sid: Option<Uuid>,
+    pub tx: mpsc::Sender<ConnMsg>,
+}
+
 pub struct AppState {
     pub pool: PgPool,
     pub cfg: Config,
     pub conns: ConnMap,
+    /// ACP 宿主节点在线连接：host_id -> AcpHostConn
+    pub acp_hosts: DashMap<Uuid, AcpHostConn>,
+    /// 待宿主响应的 ACP RPC 请求：req_id -> oneshot sender
+    pub acp_rpc_wait: DashMap<Uuid, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
     /// 一次性 WS ticket -> 授权信息
     pub tickets: DashMap<String, TicketGrant>,
     /// 简易限流：key -> 时间戳窗口
@@ -83,6 +95,8 @@ impl AppState {
             pool,
             cfg,
             conns: DashMap::new(),
+            acp_hosts: DashMap::new(),
+            acp_rpc_wait: DashMap::new(),
             tickets: DashMap::new(),
             rate: DashMap::new(),
             epochs: DashMap::new(),
@@ -94,6 +108,59 @@ impl AppState {
             backup_busy: AtomicBool::new(false),
             bot_wake: DashMap::new(),
         })
+    }
+
+    /// 登记 ACP 宿主 WS 连接；同一 host_id 重连时先向旧连接下发 host_superseded 并关闭。
+    pub fn register_acp_host(
+        &self,
+        host_id: Uuid,
+        uid: Uuid,
+        conn_id: Uuid,
+        sid: Option<Uuid>,
+        tx: mpsc::Sender<ConnMsg>,
+    ) {
+        if let Some(prev) = self.acp_hosts.insert(
+            host_id,
+            AcpHostConn {
+                uid,
+                conn_id,
+                sid,
+                tx,
+            },
+        ) {
+            let frame = serde_json::json!({ "type": "host_superseded" }).to_string();
+            let _ = prev.tx.try_send(ConnMsg::Shutdown(frame));
+        }
+    }
+
+    /// 仅当连接表里的 conn_id 仍等于当前连接时才摘除（避免被顶替的旧连接误删新连接）。
+    pub fn unregister_acp_host(&self, host_id: Uuid, conn_id: Uuid) -> bool {
+        self.acp_hosts
+            .remove_if(&host_id, |_, c| c.conn_id == conn_id)
+            .is_some()
+    }
+
+    /// 踢掉满足条件的 ACP 宿主 WS 连接。
+    pub fn kick_acp_hosts(&self, reason: &str, pred: impl Fn(&AcpHostConn) -> bool) {
+        let host_ids: Vec<Uuid> = self
+            .acp_hosts
+            .iter()
+            .filter(|e| pred(e.value()))
+            .map(|e| *e.key())
+            .collect();
+        if host_ids.is_empty() {
+            return;
+        }
+        let frame = serde_json::json!({
+            "type": "force_logout",
+            "reason": reason,
+        })
+        .to_string();
+        for hid in host_ids {
+            if let Some((_, conn)) = self.acp_hosts.remove(&hid) {
+                let _ = conn.tx.try_send(ConnMsg::Shutdown(frame.clone()));
+            }
+        }
     }
 
     fn bump_epoch(&self, uid: Uuid) -> u64 {
@@ -174,6 +241,7 @@ impl AppState {
     /// 返回 Some(epoch) 表示刚才还在线，调用方负责广播离线。
     /// 断线清理看到连接已不在表里，不会再广播一次。
     pub fn kick_user(&self, uid: Uuid, reason: &str) -> Option<u64> {
+        self.kick_acp_hosts(reason, |c| c.uid == uid);
         let Some((_, bucket)) = self.conns.remove(&uid) else {
             return None;
         };
@@ -199,6 +267,7 @@ impl AppState {
         reason: &str,
         keep: impl Fn(Option<Uuid>) -> bool,
     ) -> Option<u64> {
+        self.kick_acp_hosts(reason, |c| c.uid == uid && !keep(c.sid));
         let frame = serde_json::json!({
             "type": "force_logout",
             "reason": reason,
@@ -249,6 +318,7 @@ impl AppState {
     /// 它的恢复请求还在等结果，被踢会先看到踢下线文案，盖住恢复结果。
     /// keep=None（sid 缺失的老 token）：没有可标识的发起者连接，全踢。
     pub fn kick_all_except_session(&self, keep: Option<Uuid>, reason: &str) {
+        self.kick_acp_hosts(reason, |c| !(keep.is_some() && c.sid == keep));
         let uids: Vec<Uuid> = self.conns.iter().map(|e| *e.key()).collect();
         for uid in uids {
             self.kick_matching(uid, reason, |s| keep.is_some() && s == keep);

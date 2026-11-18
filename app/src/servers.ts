@@ -279,6 +279,96 @@ export function clearAuth(storage: Stor, scope: string) {
   } catch {}
 }
 
+// ---------- 多账号切换表 chat_accounts_v1 ----------
+export interface SavedAccount {
+  id: string;
+  serverUrl: string;
+  serverName?: string;
+  access: string;
+  refresh: string;
+  user: UserPublic;
+  updatedAt: number;
+}
+
+const LS_ACCOUNTS = "chat_accounts_v1";
+
+export function accountIdOf(serverUrl: string, userId: string): string {
+  const norm = serverUrl ? (normalizeServerUrl(serverUrl) ?? serverUrl) : "";
+  return `${encServer(norm)}:${userId}`;
+}
+
+export function listSavedAccounts(storage: Stor): SavedAccount[] {
+  try {
+    const raw = storage.getItem(LS_ACCOUNTS);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: SavedAccount[] = [];
+    for (const item of parsed) {
+      const a = item as Partial<SavedAccount> | null;
+      if (
+        !a ||
+        typeof a !== "object" ||
+        typeof a.id !== "string" ||
+        typeof a.serverUrl !== "string" ||
+        typeof a.refresh !== "string" ||
+        !a.refresh ||
+        !a.user ||
+        typeof a.user !== "object" ||
+        typeof a.user.id !== "string"
+      ) {
+        continue;
+      }
+      out.push({
+        id: a.id,
+        serverUrl: a.serverUrl,
+        serverName: typeof a.serverName === "string" ? a.serverName : undefined,
+        access: typeof a.access === "string" ? a.access : "",
+        refresh: a.refresh,
+        user: a.user,
+        updatedAt: typeof a.updatedAt === "number" ? a.updatedAt : 0,
+      });
+    }
+    out.sort((a, b) => b.updatedAt - a.updatedAt);
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function saveAccounts(storage: Stor, list: SavedAccount[]) {
+  try {
+    storage.setItem(LS_ACCOUNTS, JSON.stringify(list));
+  } catch {}
+}
+
+export function upsertSavedAccount(
+  storage: Stor,
+  entry: Omit<SavedAccount, "id" | "updatedAt"> & { updatedAt?: number },
+): SavedAccount[] {
+  const norm = entry.serverUrl ? (normalizeServerUrl(entry.serverUrl) ?? entry.serverUrl) : "";
+  const id = accountIdOf(norm, entry.user.id);
+  const list = listSavedAccounts(storage).filter((x) => x.id !== id);
+  const next: SavedAccount = {
+    id,
+    serverUrl: norm,
+    serverName: entry.serverName,
+    access: entry.access,
+    refresh: entry.refresh,
+    user: entry.user,
+    updatedAt: entry.updatedAt ?? Date.now(),
+  };
+  list.unshift(next);
+  saveAccounts(storage, list);
+  return list;
+}
+
+export function removeSavedAccount(storage: Stor, id: string): SavedAccount[] {
+  const next = listSavedAccounts(storage).filter((x) => x.id !== id);
+  saveAccounts(storage, next);
+  return next;
+}
+
 // ---------- 删除服务器：清掉它名下的全部本地数据 ----------
 // 只认 `<prefix>:<enc>:`（带尾冒号）开头的键：enc 本身无冒号，
 // 别的服务器的 enc 即使以它为前缀也接不上冒号，不会误匹配。

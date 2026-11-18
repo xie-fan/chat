@@ -84,6 +84,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0039_message_recall.sql"),
         include_str!("../migrations/0040_chat_record.sql"),
         include_str!("../migrations/0041_bot_delivery.sql"),
+        include_str!("../migrations/0042_acp_workspace.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -582,6 +583,88 @@ async fn drop_agents_removes_agent_messages_and_conversations() {
         .await
         .unwrap();
     assert_eq!(agent_convs, 0);
+
+    pool.close().await;
+}
+
+/// 0042：清空历史会话归档标记并创建 acp_* 工作区与会话表，且不触碰历史 agent* 禁区。
+#[tokio::test]
+async fn upgrade_0042_acp_workspace() {
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.database(db.name()))
+        .await
+        .unwrap();
+
+    let mut files: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let (before, after): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|p| p.file_name().unwrap().to_str().unwrap() < "0042");
+    for p in &before {
+        sqlx::raw_sql(&std::fs::read_to_string(p).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let u = Uuid::new_v4();
+    let conv = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash) VALUES ($1,'mig41','Mig41','x')")
+        .bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversations (id,type,name,owner_id,last_seq) VALUES ($1,'self','助手',$2,0)")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO memberships (conversation_id,user_id,role) VALUES ($1,$2,'owner')")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversation_preferences (conversation_id,user_id,archived_at) VALUES ($1,$2,now())")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+
+    for p in &after {
+        sqlx::raw_sql(&std::fs::read_to_string(p).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let remaining_archived: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM conversation_preferences WHERE archived_at IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_archived, 0, "0042 应清空所有历史归档状态");
+
+    let acp_tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables
+          WHERE table_schema='public' AND table_name LIKE 'acp_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(acp_tables, 7, "应创建 7 张 acp_* 表");
+
+    let host_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let ws_id = Uuid::new_v4();
+    let sess_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO acp_hosts (id,user_id,install_id,name,online) VALUES ($1,$2,$3,'DevBox',true)")
+        .bind(host_id).bind(u).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO acp_agents (id,user_id,acp_host_id,name,cmd) VALUES ($1,$2,$3,'Claude Code','npx @zed-industries/claude-agent-acp')")
+        .bind(agent_id).bind(u).bind(host_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO acp_workspaces (id,user_id,acp_host_id,cwd,name) VALUES ($1,$2,$3,'~/code/chat','chat')")
+        .bind(ws_id).bind(u).bind(host_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO acp_sessions (id,user_id,acp_workspace_id,acp_agent_id,title) VALUES ($1,$2,$3,$4,'Init')")
+        .bind(sess_id).bind(u).bind(ws_id).bind(agent_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO acp_turns (acp_session_id,user_id,seq,role,payload) VALUES ($1,$2,1,'user','{\"text\":\"hi\"}')")
+        .bind(sess_id).bind(u).execute(&pool).await.unwrap();
+    let bad_role = sqlx::query("INSERT INTO acp_turns (acp_session_id,user_id,seq,role) VALUES ($1,$2,2,'invalid')")
+        .bind(sess_id).bind(u).execute(&pool).await;
+    assert!(bad_role.is_err(), "非法 turn role 必须被 CHECK 约束拒绝");
 
     pool.close().await;
 }

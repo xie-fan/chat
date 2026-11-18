@@ -225,6 +225,7 @@ pub fn router(cfg: &crate::config::Config, st: &SharedState) -> Router<SharedSta
             // 备份包远大于默认 2MB 上限：走路由级放大；内容流式落盘不整包进内存
             post(crate::backup::restore).layer(DefaultBodyLimit::disable()),
         )
+        .nest("/acp", crate::acp::routes::router(cfg))
     // （维护模式闸在 build_router 里 .layer 到 /v1 子路由上：from_fn_with_state 需要 state）
 }
 

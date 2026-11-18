@@ -88,6 +88,15 @@ function state(patch: Partial<AppState> = {}): AppState {
     drafts: {},
     avatars: {},
     pendingJump: null,
+    acpSettings: { default_permission: "auto_read" },
+    acpHosts: [],
+    acpAgents: [],
+    acpWorkspaces: [],
+    acpSessions: [],
+    acpLoaded: false,
+    activeAcpHostId: null,
+    activeAcpWorkspaceId: null,
+    activeAcpSessionId: null,
     ...patch,
   };
 }

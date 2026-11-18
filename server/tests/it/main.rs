@@ -16,6 +16,7 @@ use std::time::Duration as Dur;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
+mod acp;
 mod admin;
 mod announcements;
 mod attachments;

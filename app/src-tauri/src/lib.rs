@@ -1,4 +1,6 @@
-// 托盘、关窗隐藏仅桌面
+// 托盘、关窗隐藏、ACP 本地宿主仅桌面
+#[cfg(desktop)]
+mod acp_host;
 #[cfg(desktop)]
 mod tray;
 #[cfg(desktop)]
@@ -8,6 +10,11 @@ mod download;
 // AS2：Android 应用内 APK 安装（缓存 + FileProvider + 系统安装器，与附件下载分离）
 mod apk_installer;
 
+#[cfg(desktop)]
+pub fn maybe_run_cli() -> bool {
+    acp_host::maybe_run_cli()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -16,17 +23,22 @@ pub fn run() {
         .plugin(download::init())
         .plugin(apk_installer::init());
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_autostart::init(
-        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-        None,
-    ));
+    let builder = builder
+        .manage(acp_host::AcpHostState::new())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(desktop)]
     let builder = builder
         .invoke_handler(tauri::generate_handler![
             download::download_to_downloads,
-            updater::install_update
+            updater::install_update,
+            acp_host::acp_host_start,
+            acp_host::acp_host_ticket,
+            acp_host::acp_host_stop
         ])
         .setup(|app| {
             tray::install(app.handle())?;

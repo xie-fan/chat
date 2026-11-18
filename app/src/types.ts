@@ -343,6 +343,7 @@ export type WsOut =
   | { type: "invalidate"; what: string }
   | { type: "pins_updated"; conversation_id: string }
   | { type: "force_logout"; reason: string }
+  | { type: "acp_event"; event: string; data: unknown }
   | {
       type: "error";
       code: string;
@@ -537,4 +538,129 @@ export interface BackupTicket {
 export interface RestoreResult {
   tables: string[];
   files: number;
+}
+
+// ---------- ACP Agent Workspace ----------
+export type AcpPermissionPolicy = "ask" | "auto_read" | "allow_all";
+export type AcpThinkingLevel = "关" | "低" | "中" | "高";
+
+export interface AcpSettings {
+  default_permission: AcpPermissionPolicy;
+}
+
+export interface AcpHost {
+  id: string;
+  name: string;
+  os: string;
+  ip: string;
+  roots: string[];
+  online: boolean;
+  latency_ms: number;
+  last_seen: string;
+}
+
+export interface AcpAgent {
+  id: string;
+  host_id: string;
+  preset: string;
+  name: string;
+  adapter: string;
+  cmd: string;
+  env: Record<string, string>;
+  short_tag: string;
+  badge_bg: string;
+  default_model: string;
+  model_options: string[];
+  permission_override: "inherit" | AcpPermissionPolicy;
+  capabilities: string[];
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AcpWorkspace {
+  id: string;
+  host_id: string;
+  cwd: string;
+  name: string;
+  branch: string;
+  branches: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AcpAttachment {
+  id: string;
+  file_name: string;
+  mime: string;
+  size: number;
+}
+
+export interface AcpPlanStep {
+  label: string;
+  state: "done" | "active" | "pending";
+}
+
+export interface AcpTurn {
+  id: string;
+  session_id: string;
+  seq: number;
+  role: "user" | "agent_plan" | "permission" | "terminal_out" | "agent_text";
+  status: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AcpDiffItem {
+  file: string;
+  added: number;
+  removed: number;
+  status: string;
+  diff_lines?: string[];
+}
+
+export interface AcpRpcLogEntry {
+  dir: "in" | "out" | string;
+  method: string;
+  summary: string;
+  ts?: string;
+}
+
+export interface AcpSession {
+  id: string;
+  workspace_id: string;
+  agent_id: string;
+  title: string;
+  selected_model: string;
+  thinking_level: AcpThinkingLevel;
+  permission_policy: AcpPermissionPolicy;
+  acp_session_key: string | null;
+  running: boolean;
+  diffs: AcpDiffItem[];
+  rpc_logs: AcpRpcLogEntry[];
+  created_at: string;
+  updated_at: string;
+  turns?: AcpTurn[];
+}
+
+export interface AcpBootstrap {
+  settings: AcpSettings;
+  hosts: AcpHost[];
+  agents: AcpAgent[];
+  workspaces: AcpWorkspace[];
+  sessions: AcpSession[];
+}
+
+export interface AcpDirEntry {
+  name: string;
+  path: string;
+  has_children: boolean;
+}
+
+export interface AcpDirListing {
+  path: string;
+  parent: string | null;
+  roots: string[];
+  entries: AcpDirEntry[];
 }

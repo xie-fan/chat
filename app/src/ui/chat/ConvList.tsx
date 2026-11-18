@@ -4,64 +4,56 @@ import {
   applyPrefUpdate,
   convAvatarText,
   convTitle,
-  isArchived,
   isMuted,
   isPinned,
   setState,
+  sortConversations,
   useApp,
 } from "../../store";
 import type { ConversationView, PrefUpdate } from "../../types";
 import { openConversation } from "../../ws";
-import { convPreview } from "./convPreview";
-import CtxMenu from "./CtxMenu";
-import { fmtTime } from "./fmtTime";
-import NewGroupModal from "./NewGroupModal";
-import SearchPanel from "./SearchPanel";
 import Avatar from "../Avatar";
 import EmptyState from "../EmptyState";
 import Skeleton from "../Skeleton";
-
+import { BotIcon, FolderSyncIcon, PlusIcon, SearchIcon } from "../icons";
+import CtxMenu from "./CtxMenu";
+import { convPreview } from "./convPreview";
+import { fmtTime } from "./fmtTime";
+import NewGroupModal from "./NewGroupModal";
+import SearchPanel from "./SearchPanel";
 
 /** 静音状态的悬浮说明 */
 function muteLabel(c: ConversationView): string {
   const p = c.preference;
-  if (!p) return "";
+  if (!p) return "已静音";
   if (p.mute_forever) return "已永久静音";
   if (p.muted_until && Date.parse(p.muted_until) > Date.now())
     return `静音至 ${new Date(p.muted_until).toLocaleString()}`;
-  return "";
+  return "已静音";
 }
 
 export default function ConvList() {
   const s = useApp();
   const [q, setQ] = useState("");
-  const [tab, setTab] = useState<"chats" | "archived">("chats");
   const [showNewGroup, setShowNewGroup] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; c: ConversationView } | null>(null);
   const [menuBusy, setMenuBusy] = useState(false);
   const [menuErr, setMenuErr] = useState<string | null>(null);
 
-  const chats = s.conversations;
-  const archivedCount = chats.filter(isArchived).length;
+  const chats = useMemo(() => sortConversations(s.conversations), [s.conversations]);
 
-  const list = useMemo(() => {
-    const inTab = chats.filter((c) =>
-      tab === "archived" ? isArchived(c) : !isArchived(c),
-    );
-    const kw = q.trim().toLowerCase();
-    if (!kw) return inTab;
-    return inTab.filter((c) => convTitle(c).toLowerCase().includes(kw));
-  }, [s.conversations, q, tab]);
+  const list = chats.filter((c) => {
+    const title = convTitle(c, s.me?.id);
+    return !q.trim() || title.toLowerCase().includes(q.trim().toLowerCase());
+  });
 
   const openMenu = (e: React.MouseEvent, c: ConversationView) => {
     e.preventDefault();
     e.stopPropagation();
     setMenuErr(null);
-    // 菜单位置交给 CtxMenu 按真实尺寸翻转/夹紧
     setMenu({ x: e.clientX, y: e.clientY, c });
   };
 
-  /** 偏好提交：服务端确认后合并（不乐观回滚）；同会话一次一个 */
   const submitPref = async (id: string, body: PrefUpdate) => {
     if (menuBusy) return;
     setMenuBusy(true);
@@ -77,7 +69,6 @@ export default function ConvList() {
     }
   };
 
-  // Esc 关闭菜单（键盘可操作性）
   useEffect(() => {
     if (!menu) return;
     const onKey = (e: KeyboardEvent) => {
@@ -85,195 +76,218 @@ export default function ConvList() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [menu != null]);
+  }, [menu]);
 
   const muteOneHour = () => new Date(Date.now() + 3600_000).toISOString();
-  // 「今天」= 本地下一午夜（转 UTC 提交，§8.3）
+
   const muteToday = () => {
-    const d = new Date();
-    d.setHours(24, 0, 0, 0);
-    return d.toISOString();
+    const end = new Date();
+    end.setHours(24, 0, 0, 0);
+    return end.toISOString();
   };
 
   return (
     <aside className="conv-list">
-      <div className="conv-head">
-        <input
-          className="search"
-          placeholder="搜索"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onKeyDown={(e) => {
-            // V2 P3-1：Esc 退出搜索态，回到普通会话列表
-            if (e.key === "Escape") setQ("");
-          }}
-        />
-        <button className="icon-btn" title="发起群聊" onClick={() => setShowNewGroup(true)}>
-          +
-        </button>
+      <div className="conv-header-wrap">
+        <div className="conv-head-top">
+          <div className="conv-head-title-row">
+            <h2 className="conv-head-title">消息会话</h2>
+            <span className={`status-pill${s.wsReady ? " online" : ""}`}>
+              <i className={`dot${s.wsReady ? " on" : ""}`} />
+              <span>{s.wsReady ? "在线" : "重连中"}</span>
+            </span>
+          </div>
+          <button
+            type="button"
+            className="conv-new-btn"
+            title="发起群聊"
+            onClick={() => setShowNewGroup(true)}
+          >
+            <PlusIcon size={14} />
+            <span>发起群聊</span>
+          </button>
+        </div>
+
+        <div className="conv-search-bar">
+          <span className="conv-search-icon">
+            <SearchIcon size={14} />
+          </span>
+          <input
+            className="search"
+            placeholder="搜索会话或聊天记录"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
       </div>
-      {/* 断线时挂在列表顶部的横幅；WS 重连会自动恢复，无需刷新 */}
+
       {!s.wsReady && <div className="offline-banner">离线，正在重连…</div>}
-      <div className="conv-tabs" role="tablist">
-        <button
-          role="tab"
-          aria-selected={tab === "chats"}
-          className={tab === "chats" ? "on" : ""}
-          onClick={() => setTab("chats")}
-        >
-          会话
-        </button>
-        <button
-          role="tab"
-          aria-selected={tab === "archived"}
-          className={tab === "archived" ? "on" : ""}
-          onClick={() => setTab("archived")}
-        >
-          归档{archivedCount > 0 ? ` (${archivedCount})` : ""}
-        </button>
-      </div>
-      {/* V2 P3-1：输入搜索词进入全局搜索态（本地会话 + 服务端聊天记录） */}
+
       {q.trim() ? (
         <SearchPanel q={q} />
       ) : (
-      <div className="conv-scroll">
-        {list.length === 0 && !s.wsReady && tab === "chats" && !q.trim() && (
-          <Skeleton rows={5} />
-        )}
-        {list.length === 0 && (s.wsReady || tab === "archived" || !!q.trim()) && (
-          <EmptyState
-            title={tab === "archived" ? "没有归档会话" : "还没有会话"}
-            detail={tab === "archived" ? undefined : "去「联系人」加好友开始聊天吧"}
-            testId="conv-list-empty"
-          />
-        )}
-        {list.map((c) => {
-          const title = convTitle(c, s.me?.id);
-          const peerOnline = c.kind === "dm" && c.peer ? !!s.online[c.peer.id] : false;
-          const typing = s.typing[c.id];
-          const typingFresh = typing && Date.now() - typing.ts < 5000;
-          const muted = isMuted(c);
-          // V2 P1-3：副标题预览（typing > 草稿 > 最新消息）
-          const pv = convPreview(c, {
-            draft: s.drafts[c.id],
-            active: s.activeConv === c.id,
-            typing: !!typingFresh,
-            meId: s.me?.id,
-          });
-          return (
-            <div
-              key={c.id}
-              className={`conv-item ${s.activeConv === c.id ? "on" : ""}`}
-              onClick={() => openConversation(c.id)}
-              onContextMenu={(e) => openMenu(e, c)}
-            >
-              {c.kind === "dm" && c.peer ? (
-                <Avatar
-                  userId={c.peer.id}
-                  name={c.peer.display_name}
-                  avatarVersion={c.peer.avatar_version}
-                  hasAvatar={c.peer.has_avatar}
-                >
-                  {peerOnline && <i className="online-dot" />}
-                </Avatar>
-              ) : (
-                <div className={`avatar ${c.kind === "self" ? "self-avatar" : ""}`}>
-                  {c.kind === "self" ? "🗂" : convAvatarText(c)}
-                </div>
-              )}
-              <div className="conv-mid">
-                <div className="conv-title">
-                  {isPinned(c) && <span className="conv-flag" title="已置顶">📌</span>}
-                  {title}
-                  {muted && (
-                    <span className="conv-flag" title={muteLabel(c)}>🔕</span>
-                  )}
-                </div>
-                <div className="conv-sub">
-                  {c.has_mention && c.unread_count > 0 && (
-                    <span className="mention-tag">[有人@我]</span>
-                  )}
-                  {pv.kind === "draft" && <span className="draft-tag">[草稿]</span>}
-                  {pv.text}
-                </div>
-              </div>
-              <div className="conv-right">
-                <div className="conv-time">{fmtTime(c.last_message?.created_at ?? c.created_at)}</div>
-                {c.unread_count > 0 && (
-                  <div className={`unread ${muted ? "muted" : ""}`}>
-                    {c.unread_count > 99 ? "99+" : c.unread_count}
-                  </div>
-                )}
-              </div>
-              <button
-                className="icon-btn conv-menu-btn"
-                title="会话设置"
-                aria-label="会话设置"
-                onClick={(e) => openMenu(e, c)}
+        <div className="conv-scroll">
+          {list.length === 0 && !s.wsReady && <Skeleton rows={5} />}
+          {list.length === 0 && s.wsReady && (
+            <EmptyState
+              title="还没有会话"
+              detail="去「联系人」加好友或点击右上角发起群聊"
+            />
+          )}
+          {list.map((c) => {
+            const title = convTitle(c, s.me?.id);
+            const peerOnline = c.kind === "dm" && c.peer && s.online[c.peer.id];
+            const typing = s.typing[c.id];
+            const typingFresh = typing && Date.now() - typing.ts < 5000;
+            const muted = isMuted(c);
+            const pv = convPreview(c, {
+              draft: s.drafts[c.id],
+              active: s.activeConv === c.id,
+              typing: !!typingFresh,
+              meId: s.me?.id,
+            });
+            return (
+              <div
+                key={c.id}
+                className={`conv-item${s.activeConv === c.id ? " on" : ""}`}
+                onClick={() => openConversation(c.id)}
+                onContextMenu={(e) => openMenu(e, c)}
               >
-                ⋯
-              </button>
-            </div>
-          );
-        })}
-      </div>
+                {c.kind === "dm" && c.peer && !c.peer.is_bot ? (
+                  <Avatar
+                    userId={c.peer.id}
+                    name={c.peer.display_name}
+                    avatarVersion={c.peer.avatar_version}
+                    hasAvatar={c.peer.has_avatar}
+                  >
+                    {peerOnline && <i className="online-dot" />}
+                  </Avatar>
+                ) : c.kind === "self" ? (
+                  <div className="avatar self-avatar">
+                    <FolderSyncIcon size={20} />
+                  </div>
+                ) : c.kind === "dm" && c.peer?.is_bot ? (
+                  <div className="avatar bot-avatar">
+                    <BotIcon />
+                  </div>
+                ) : (
+                  <div className="avatar">{convAvatarText(c)}</div>
+                )}
+
+                <div className="conv-mid">
+                  <div className="conv-title-row">
+                    {isPinned(c) && (
+                      <span className="conv-flag" title="已置顶">
+                        📌
+                      </span>
+                    )}
+                    <span className="conv-title">{title}</span>
+                    {muted && (
+                      <span className="conv-flag" title={muteLabel(c)}>
+                        🔕
+                      </span>
+                    )}
+                  </div>
+                  <div className="conv-sub">
+                    {c.has_mention && c.unread_count > 0 && (
+                      <span className="mention-tag">[有人@我]</span>
+                    )}
+                    {pv.kind === "draft" && <span className="draft-tag">[草稿]</span>}
+                    {pv.text}
+                  </div>
+                </div>
+
+                <div className="conv-right">
+                  <div className="conv-time">
+                    {fmtTime(c.last_message?.created_at ?? c.created_at)}
+                  </div>
+                  {c.unread_count > 0 && (
+                    <div className={`unread ${muted ? "muted" : ""}`}>
+                      {c.unread_count > 99 ? "99+" : c.unread_count}
+                    </div>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  className="icon-btn conv-menu-btn"
+                  title="会话操作"
+                  aria-label="会话操作"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setMenuErr(null);
+                    setMenu({ x: r.right, y: r.bottom, c });
+                  }}
+                >
+                  ⋯
+                </button>
+              </div>
+            );
+          })}
+        </div>
       )}
+
       {showNewGroup && <NewGroupModal onClose={() => setShowNewGroup(false)} />}
 
-      {/* 会话偏好菜单：置顶 / 静音 / 归档（右键或 ⋯ 按钮打开） */}
       {menu && (
         <CtxMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)}>
           <button
+            type="button"
             className="ctx-item"
             disabled={menuBusy}
             onClick={() => void submitPref(menu.c.id, { pinned: !isPinned(menu.c) })}
           >
-            {isPinned(menu.c) ? "取消置顶" : "置顶"}
+            {isPinned(menu.c) ? "取消置顶" : "置顶会话"}
           </button>
-          {isMuted(menu.c) ? (
-            <button
-              className="ctx-item"
-              disabled={menuBusy}
-              onClick={() => void submitPref(menu.c.id, { mute: { mode: "none" } })}
-            >
-              取消静音{menu.c.preference?.mute_forever ? "（永久）" : ""}
-            </button>
-          ) : (
-            <>
+          {menu.c.kind !== "self" &&
+            (isMuted(menu.c) ? (
               <button
+                type="button"
                 className="ctx-item"
                 disabled={menuBusy}
-                onClick={() =>
-                  void submitPref(menu.c.id, { mute: { mode: "until", until: muteOneHour() } })
-                }
+                onClick={() => void submitPref(menu.c.id, { mute: { mode: "none" } })}
               >
-                静音 1 小时
+                取消静音{menu.c.preference?.mute_forever ? "（永久）" : ""}
               </button>
-              <button
-                className="ctx-item"
-                disabled={menuBusy}
-                onClick={() =>
-                  void submitPref(menu.c.id, { mute: { mode: "until", until: muteToday() } })
-                }
-              >
-                静音至明天
-              </button>
-              <button
-                className="ctx-item"
-                disabled={menuBusy}
-                onClick={() => void submitPref(menu.c.id, { mute: { mode: "forever" } })}
-              >
-                永久静音
-              </button>
-            </>
-          )}
-          <button
-            className="ctx-item"
-            disabled={menuBusy}
-            onClick={() => void submitPref(menu.c.id, { archived: !isArchived(menu.c) })}
-          >
-            {isArchived(menu.c) ? "取消归档" : "归档"}
-          </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="ctx-item"
+                  disabled={menuBusy}
+                  onClick={() =>
+                    void submitPref(menu.c.id, {
+                      mute: { mode: "until", until: muteOneHour() },
+                    })
+                  }
+                >
+                  静音 1 小时
+                </button>
+                <button
+                  type="button"
+                  className="ctx-item"
+                  disabled={menuBusy}
+                  onClick={() =>
+                    void submitPref(menu.c.id, {
+                      mute: { mode: "until", until: muteToday() },
+                    })
+                  }
+                >
+                  今天内静音
+                </button>
+                <button
+                  type="button"
+                  className="ctx-item"
+                  disabled={menuBusy}
+                  onClick={() =>
+                    void submitPref(menu.c.id, { mute: { mode: "forever" } })
+                  }
+                >
+                  永久静音
+                </button>
+              </>
+            ))}
           {menuErr && <div className="ctx-err">{menuErr}</div>}
         </CtxMenu>
       )}

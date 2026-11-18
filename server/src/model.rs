@@ -369,6 +369,8 @@ pub struct TicketRes {
 #[derive(Debug, Deserialize)]
 pub struct WsTicketQuery {
     pub ticket: String,
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,10 +4,11 @@ import { setState, useApp } from "../store";
 import type { FriendView, UserPublic } from "../types";
 import { openConversation } from "../ws";
 import Avatar from "./Avatar";
-import { confirmDialog } from "./Modal";
-import { AZ_INDEX, groupFriendsByLetter } from "./contactsAz";
 import EmptyState from "./EmptyState";
+import { confirmDialog } from "./Modal";
 import { SkeletonLines } from "./Skeleton";
+import { AZ_INDEX, groupFriendsByLetter } from "./contactsAz";
+import { SearchIcon } from "./icons";
 
 /** 搜索结果行：已是好友的给「发消息」，非好友走加好友流程 */
 export function FoundUserRow({
@@ -31,8 +32,13 @@ export function FoundUserRow({
 }) {
   const isFriend = friendList.some((f) => f.user.id === u.id);
   return (
-    <div className="row found">
-      <Avatar userId={u.id} name={u.display_name} avatarVersion={u.avatar_version} hasAvatar={u.has_avatar} />
+    <div className="row found contact-row-card">
+      <Avatar
+        userId={u.id}
+        name={u.display_name}
+        avatarVersion={u.avatar_version}
+        hasAvatar={u.has_avatar}
+      />
       <div className="grow">
         <div>{u.display_name}</div>
         <div className="muted">@{u.username}</div>
@@ -113,8 +119,7 @@ export default function ContactsPanel() {
   };
 
   const openDm = (u: UserPublic) => {
-    const c = s.conversations.find((c) => c.kind === "dm" && c.peer?.id === u.id);
-    // 走统一入口：已读上报 + 归档会话打开即解除归档（§8.3）
+    const c = s.conversations.find((x) => x.kind === "dm" && x.peer?.id === u.id);
     if (c) openConversation(c.id);
     else setState({ tab: "chats", activeConv: null });
   };
@@ -144,74 +149,119 @@ export default function ContactsPanel() {
 
   return (
     <main className="contacts">
-      <div className="contacts-layout">
-        <div className="contacts-main">
-          <h2>联系人</h2>
+      <div className="contacts-layout contacts-inner">
+        <div className="contacts-main" style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <h2 style={{ margin: 0 }}>联系人与团队成员</h2>
+            <span className="status-pill">共 {s.friends.length} 位好友</span>
+          </div>
 
-          <section className="card">
-            <h3>添加好友</h3>
-            <div className="row">
-              <input
-                placeholder="搜索用户名或昵称"
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && search()}
-              />
-              <button onClick={search}>搜索</button>
-            </div>
-            {searching && <SkeletonLines rows={2} />}
-            {!searching && results?.length === 0 && (
-              <EmptyState title="没有匹配的用户" hint="换个关键词试试" testId="empty-search" />
-            )}
-            {results?.map((u) => (
-              <FoundUserRow
-                key={u.id}
-                u={u}
-                friendList={s.friends}
-                picked={picked?.id === u.id}
-                msg={msg}
-                onPick={() => setPicked(u)}
-                onMsg={setMsg}
-                onSend={sendReq}
-                onDm={() => openDm(u)}
-              />
-            ))}
-            {hint && <div className="muted">{hint}</div>}
-          </section>
-
-          <section className="card">
-            <h3>新的朋友 {s.requests.incoming.length > 0 && `(${s.requests.incoming.length})`}</h3>
-            {s.requests.incoming.length === 0 && s.requests.outgoing.length === 0 && (
-              <EmptyState title="暂无好友请求" hint="去添加好友开始聊天" testId="empty-requests" />
-            )}
-            {s.requests.incoming.map((r) => (
-              <div className="row" key={r.id}>
-                <Avatar userId={r.user.id} name={r.user.display_name} avatarVersion={r.user.avatar_version} hasAvatar={r.user.has_avatar} />
-                <div className="grow">
-                  <div>{r.user.display_name}</div>
-                  <div className="muted">{r.message || "请求加你为好友"}</div>
+          <div className="bento-grid">
+            <section className="bento-card">
+              <h3>
+                <span>添加好友</span>
+              </h3>
+              <div className="row" style={{ gap: 8 }}>
+                <div className="conv-search-bar" style={{ flex: 1 }}>
+                  <span className="conv-search-icon">
+                    <SearchIcon size={14} />
+                  </span>
+                  <input
+                    className="search"
+                    placeholder="搜索用户名或昵称"
+                    value={q}
+                    onChange={(e) => setQ(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && search()}
+                  />
                 </div>
-                <button className="primary" onClick={() => friends.accept(r.id).then(reload)}>
-                  接受
+                <button className="btn-accent" onClick={search}>
+                  搜索
                 </button>
-                <button onClick={() => friends.decline(r.id).then(reload)}>拒绝</button>
               </div>
-            ))}
-            {s.requests.outgoing.map((r) => (
-              <div className="row" key={r.id}>
-                <Avatar userId={r.user.id} name={r.user.display_name} avatarVersion={r.user.avatar_version} hasAvatar={r.user.has_avatar} />
-                <div className="grow">
-                  <div>{r.user.display_name}</div>
-                  <div className="muted">等待对方通过</div>
-                </div>
-              </div>
-            ))}
-          </section>
+              {searching && <SkeletonLines rows={2} />}
+              {!searching && results?.length === 0 && (
+                <EmptyState
+                  title="没有匹配的用户"
+                  hint="换个关键词试试"
+                  testId="empty-search"
+                />
+              )}
+              {results?.map((u) => (
+                <FoundUserRow
+                  key={u.id}
+                  u={u}
+                  friendList={s.friends}
+                  picked={picked?.id === u.id}
+                  msg={msg}
+                  onPick={() => setPicked(u)}
+                  onMsg={setMsg}
+                  onSend={sendReq}
+                  onDm={() => openDm(u)}
+                />
+              ))}
+              {hint && <div className="muted">{hint}</div>}
+            </section>
 
-          <section className="card" data-testid="contacts-book">
+            <section className="bento-card">
+              <h3>
+                <span>
+                  新的朋友{" "}
+                  {s.requests.incoming.length > 0 && `(${s.requests.incoming.length})`}
+                </span>
+              </h3>
+              {s.requests.incoming.length === 0 && s.requests.outgoing.length === 0 && (
+                <EmptyState
+                  title="暂无好友请求"
+                  hint="去添加好友开始聊天"
+                  testId="empty-requests"
+                />
+              )}
+              {s.requests.incoming.map((r) => (
+                <div className="row contact-row-card" key={r.id}>
+                  <Avatar
+                    userId={r.user.id}
+                    name={r.user.display_name}
+                    avatarVersion={r.user.avatar_version}
+                    hasAvatar={r.user.has_avatar}
+                  />
+                  <div className="grow">
+                    <div>{r.user.display_name}</div>
+                    <div className="muted">{r.message || "请求加你为好友"}</div>
+                  </div>
+                  <button
+                    className="primary"
+                    onClick={() => friends.accept(r.id).then(reload)}
+                  >
+                    接受
+                  </button>
+                  <button onClick={() => friends.decline(r.id).then(reload)}>拒绝</button>
+                </div>
+              ))}
+              {s.requests.outgoing.map((r) => (
+                <div className="row contact-row-card" key={r.id}>
+                  <Avatar
+                    userId={r.user.id}
+                    name={r.user.display_name}
+                    avatarVersion={r.user.avatar_version}
+                    hasAvatar={r.user.has_avatar}
+                  />
+                  <div className="grow">
+                    <div>{r.user.display_name}</div>
+                    <div className="muted">等待对方通过</div>
+                  </div>
+                </div>
+              ))}
+            </section>
+          </div>
+
+          <section className="bento-card" data-testid="contacts-book">
             <h3>我的好友（{s.friends.length}）</h3>
             {s.friends.length === 0 ? (
-              <EmptyState title="还没有好友" hint="搜索用户名添加一位朋友" testId="empty-friends" />
+              <EmptyState
+                title="还没有好友"
+                hint="搜索用户名添加一位朋友"
+                testId="empty-friends"
+              />
             ) : (
               groups.map((g) => (
                 <div key={g.letter}>
@@ -221,14 +271,20 @@ export default function ContactsPanel() {
                   {g.friends.map((f) => {
                     const u = f.user;
                     return (
-                      <div className="row" key={u.id}>
-                        <Avatar userId={u.id} name={u.display_name} avatarVersion={u.avatar_version} hasAvatar={u.has_avatar}>
+                      <div className="row contact-row-card" key={u.id}>
+                        <Avatar
+                          userId={u.id}
+                          name={u.display_name}
+                          avatarVersion={u.avatar_version}
+                          hasAvatar={u.has_avatar}
+                        >
                           {s.online[u.id] && <i className="online-dot" />}
                         </Avatar>
                         <div className="grow">
                           <div>{u.display_name}</div>
                           <div className="muted">
-                            @{u.username} · {u.is_bot ? "机器人" : s.online[u.id] ? "在线" : "离线"}
+                            @{u.username} ·{" "}
+                            {u.is_bot ? "机器人" : s.online[u.id] ? "在线" : "离线"}
                           </div>
                         </div>
                         <button className="primary" onClick={() => openDm(u)}>

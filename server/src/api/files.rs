@@ -40,7 +40,7 @@ mod stored_path_tests {
     }
 }
 
-pub(super) fn pct_encode(s: &str) -> String {
+pub(crate) fn pct_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -77,7 +77,7 @@ pub(crate) async fn upload_quota(
 
 /// 上传中的临时文件（FILES_DIR/.upload-*.part）。没被 store_upload 收走就在 Drop 时删掉。
 pub(crate) struct TempUpload {
-    path: std::path::PathBuf,
+    pub(crate) path: std::path::PathBuf,
     pub size: usize,
 }
 
@@ -354,7 +354,7 @@ pub(super) struct FileQuery {
 
 /// 允许 inline 预览的 MIME 白名单：仅渲染型媒体。SVG 可携带脚本，必须排除；
 /// text/html、xhtml、xml 等一律走 attachment，避免在聊天 origin 上同源执行。
-pub(super) fn inline_safe(mime: &str) -> bool {
+pub(crate) fn inline_safe(mime: &str) -> bool {
     let m = mime
         .split(';')
         .next()
@@ -490,7 +490,7 @@ pub(super) async fn download_recalled(
 /// 流式发文件（不整个读进内存），支持 Range（音视频拖动、iOS 播放要用）和条件请求。
 /// 类型、下载方式、缓存头用库里记的，不用按扩展名猜的；缓存策略由调用方给定
 /// （公开下载 immutable；撤回取回 no-store）。
-pub(super) async fn serve_stored(
+pub(crate) async fn serve_stored(
     path: std::path::PathBuf,
     req: axum::extract::Request,
     mime: &str,

@@ -41,7 +41,14 @@ pub async fn ws_handler(
         session_version: grant.session_version,
         sid: grant.sid,
     };
-    Ok(ws.on_upgrade(move |socket| handle_session(socket, st, access)))
+    let is_host = q.role.as_deref() == Some("host");
+    Ok(ws.on_upgrade(move |socket| async move {
+        if is_host {
+            let _ = crate::acp::host_ws::host_session(socket, st, access).await;
+        } else {
+            handle_session(socket, st, access).await;
+        }
+    }))
 }
 
 /// 单连接入站上限：INBOUND_WINDOW 内最多这么多帧

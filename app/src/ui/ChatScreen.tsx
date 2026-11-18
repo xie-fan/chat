@@ -1,96 +1,159 @@
-import { useEffect } from "react";
-import { dismissToast, setState, useApp } from "../store";
-import { consumeBack } from "./chat/backStack";
+import { useEffect, useState } from "react";
 import { revealDownloaded } from "../download";
+import {
+  dismissToast,
+  isMuted,
+  pendingAcpApprovalsCount,
+  setState,
+  useApp,
+} from "../store";
+import {
+  readThemeChoice,
+  resolveRenderedDark,
+  toggleQuickTheme,
+} from "../theme";
 import { openConversation, refreshCatalogs } from "../ws";
-import ConvList from "./chat/ConvList";
-import ChatView from "./chat/ChatView";
-import ContactsPanel from "./ContactsPanel";
-import MePanel from "./me/MePanel";
-import AdminPanel from "./admin/AdminPanel";
 import Avatar from "./Avatar";
-import { ChatBubbleIcon, ContactsIcon, GearIcon, ShieldIcon } from "./icons";
+import ContactsPanel from "./ContactsPanel";
+import AcpWorkspaceView from "./acp/AcpWorkspaceView";
+import AdminPanel from "./admin/AdminPanel";
+import ChatView from "./chat/ChatView";
+import ConvList from "./chat/ConvList";
+import { consumeBack } from "./chat/backStack";
+import {
+  ChatBubbleIcon,
+  ContactsIcon,
+  CpuIcon,
+  GearIcon,
+  MoonIcon,
+  ShieldIcon,
+  SunIcon,
+  WifiIcon,
+  WifiOffIcon,
+} from "./icons";
+import MePanel from "./me/MePanel";
 
 export default function ChatScreen() {
   const s = useApp();
+  const [isDark, setIsDark] = useState(() =>
+    resolveRenderedDark(readThemeChoice(localStorage)),
+  );
 
   useEffect(() => {
-    void refreshCatalogs().catch((e) => console.warn("initial load failed", e));
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const sync = () =>
+      setIsDark(resolveRenderedDark(readThemeChoice(localStorage)));
+    mq?.addEventListener("change", sync);
+    return () => mq?.removeEventListener("change", sync);
   }, []);
 
-  // 打开会话压一条历史记录：安卓返回键 / 浏览器后退先关会话回列表，而不是退出 app
+  // 初始化拉会话与联系人目录 + Android 硬件返回键支持
   useEffect(() => {
-    if (s.activeConv && !history.state?.chat) history.pushState({ chat: 1 }, "");
-    else if (!s.activeConv && history.state?.chat) history.back();
-  }, [s.activeConv]);
-  useEffect(() => {
+    void refreshCatalogs().catch((e) => console.warn("initial load failed", e));
+    history.pushState({ chat: 1 }, "");
     const onPop = () => {
-      if (history.state?.chat) return;
-      // MF2：返回键先关 ChatView 里最上层的覆盖物（转发弹窗 → 预览 → 记录查看页 → 多选），
-      // 消费掉就补回 {chat:1} 让会话保持打开；没有覆盖层才退回会话列表
       if (consumeBack()) history.pushState({ chat: 1 }, "");
-      else setState({ activeConv: null });
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  const pendingCount = s.requests.incoming.length;
-  const totalUnread = s.conversations.reduce((a, c) => a + c.unread_count, 0);
+  const totalUnread = s.conversations.reduce(
+    (n, c) => (isMuted(c) && !c.has_mention ? n : n + c.unread_count),
+    0,
+  );
+  const pendingReq = s.requests.incoming.length;
+  const pendingApprovals = pendingAcpApprovalsCount(s.acpSessions);
 
   return (
     <div className="shell">
-      <nav className="rail">
-        <Avatar
-          className="rail-avatar"
-          userId={s.me?.id}
-          name={s.me?.display_name}
-          avatarVersion={s.me?.avatar_version}
-          hasAvatar={s.me?.has_avatar}
-          title={s.me?.display_name}
-        />
+      <nav className="rail" aria-label="主导航">
         <button
-          className={`rail-btn ${s.tab === "chats" ? "on" : ""}`}
+          type="button"
+          className="rail-avatar-btn"
+          onClick={() => setState({ tab: "me" })}
+          title={s.me?.display_name || "个人设置"}
+          style={{ border: "none", background: "transparent", padding: 0, cursor: "pointer" }}
+        >
+          <Avatar
+            className="rail-avatar"
+            userId={s.me?.id}
+            name={s.me?.display_name ?? ""}
+            avatarVersion={s.me?.avatar_version}
+            hasAvatar={s.me?.has_avatar}
+          />
+        </button>
+
+        <button
+          className={`rail-btn${s.tab === "chats" ? " on" : ""}`}
           onClick={() => setState({ tab: "chats" })}
-          title="聊天"
           data-testid="rail-chats"
         >
           <ChatBubbleIcon />
-          会话
-          {totalUnread > 0 && <i className="badge">{totalUnread > 99 ? "99+" : totalUnread}</i>}
+          <span>会话</span>
+          {totalUnread > 0 && (
+            <em className="badge">{totalUnread > 99 ? "99+" : totalUnread}</em>
+          )}
         </button>
+
         <button
-          className={`rail-btn ${s.tab === "contacts" ? "on" : ""}`}
+          className={`rail-btn${s.tab === "contacts" ? " on" : ""}`}
           onClick={() => setState({ tab: "contacts" })}
-          title="联系人"
           data-testid="rail-contacts"
         >
           <ContactsIcon />
-          联系人
-          {pendingCount > 0 && <i className="badge">{pendingCount}</i>}
+          <span>联系人</span>
+          {pendingReq > 0 && <em className="badge">{pendingReq}</em>}
         </button>
+
         <button
-          className={`rail-btn ${s.tab === "me" ? "on" : ""}`}
+          className={`rail-btn${s.tab === "agents" ? " on" : ""}`}
+          onClick={() => setState({ tab: "agents" })}
+          data-testid="rail-agents"
+        >
+          <CpuIcon size={20} />
+          <span>Agent</span>
+          {pendingApprovals > 0 && (
+            <em className="badge amber">{pendingApprovals}</em>
+          )}
+        </button>
+
+        <button
+          className={`rail-btn${s.tab === "me" ? " on" : ""}`}
           onClick={() => setState({ tab: "me" })}
-          title="我"
           data-testid="rail-me"
         >
           <GearIcon />
-          我
+          <span>设置</span>
         </button>
+
         {s.me?.role === "admin" && (
           <button
-            className={`rail-btn ${s.tab === "admin" ? "on" : ""}`}
+            className={`rail-btn${s.tab === "admin" ? " on" : ""}`}
             onClick={() => setState({ tab: "admin" })}
-            title="后台管理"
             data-testid="rail-admin"
           >
             <ShieldIcon />
-            管理
+            <span>管理</span>
           </button>
         )}
+
         <div className="rail-foot">
-          <span className={`dot ${s.wsReady ? "on" : ""}`} title={s.wsReady ? "已连接" : "未连接"} />
+          <div
+            title={s.wsReady ? "实时连接正常" : "正在重连服务器…"}
+            style={{ color: s.wsReady ? "var(--ok)" : "var(--text-muted)" }}
+          >
+            {s.wsReady ? <WifiIcon size={16} /> : <WifiOffIcon size={16} />}
+          </div>
+          <button
+            type="button"
+            className="rail-icon-btn"
+            onClick={() => setIsDark(toggleQuickTheme() === "dark")}
+            title={isDark ? "切换浅色模式" : "切换深色模式"}
+            aria-label="切换浅色/深色主题"
+          >
+            {isDark ? <SunIcon size={16} /> : <MoonIcon size={16} />}
+          </button>
         </div>
       </nav>
 
@@ -101,13 +164,13 @@ export default function ChatScreen() {
         </>
       )}
       {s.tab === "contacts" && <ContactsPanel />}
+      {s.tab === "agents" && <AcpWorkspaceView />}
       {s.tab === "me" && <MePanel />}
       {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
 
-      {/* 最小应用内提示：新消息 toast 点击打开会话；下载完成 toast（桌面）点击在文件夹中显示 */}
       <div className="toasts" aria-live="polite">
         {s.toasts.map((t) => (
-          <button
+          <div
             key={t.id}
             className="toast"
             onClick={() => {
@@ -117,12 +180,11 @@ export default function ChatScreen() {
             }}
           >
             <b>{t.title}</b>
-            {t.text && <span>{t.text}</span>}
-            {/* MF2：结果未确认类的操作重试（同一 client_op_id 幂等重发） */}
+            {t.text && <div className="toast-body">{t.text}</div>}
             {t.action && (
-              <span
+              <button
+                type="button"
                 className="toast-act"
-                role="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   dismissToast(t.id);
@@ -130,9 +192,9 @@ export default function ChatScreen() {
                 }}
               >
                 {t.action.label}
-              </span>
+              </button>
             )}
-          </button>
+          </div>
         ))}
       </div>
     </div>

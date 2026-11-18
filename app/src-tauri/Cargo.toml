@@ -20,7 +20,7 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # MM4 下载地址校验（复用依赖树里已有的 crate）
 url = "2"
-uuid = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # 开机自启只有桌面平台（Android 不编译这个插件）
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
@@ -28,10 +28,14 @@ tauri-plugin-autostart = "2"
 # 在线更新（Windows 安装包；Android 走下载 APK）
 tauri-plugin-updater = "2"
 # MM4 桌面下载：reqwest 流式 GET（rustls-no-provider 与 updater 共栈）；Android 走 Kotlin MediaStore 插件
-reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-no-provider", "json"] }
 # rustls-no-provider 不带默认加密提供者，构建 Client 前手动装 ring（与 updater 相同做法）
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+base64 = "0.22"
+dirs = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
