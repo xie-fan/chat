@@ -4,6 +4,13 @@ import { writeDrafts, type DraftEntry, type DraftReuse } from "./drafts";
 import { cacheKey, getRecent, touchRecent, writeLocalCache } from "./localCache";
 import { recordLabel } from "./ui/chat/chatRecord";
 import type {
+  AcpAgent,
+  AcpBootstrap,
+  AcpHost,
+  AcpSession,
+  AcpSettings,
+  AcpTurn,
+  AcpWorkspace,
   ConversationPref,
   ConversationView,
   FriendView,
@@ -41,7 +48,7 @@ export interface AppState {
   friends: FriendView[];
   requests: RequestsView;
   wsReady: boolean;
-  tab: "chats" | "contacts" | "me" | "admin";
+  tab: "chats" | "contacts" | "agents" | "me" | "admin";
   /** composer 引用卡片：正在回复的目标消息（null=普通发送） */
   replyingTo: MessageView | null;
   /** composer 编辑态：正在编辑的消息（expected_version 取其当前 edit_version） */
@@ -56,6 +63,16 @@ export interface AppState {
   avatars: Record<string, AvatarInfo>;
   /** 全局搜索跳转目标（V2 P3-1）：打开会话后由 ChatView 消费并清空 */
   pendingJump: { convId: string; messageId: string; seq: number } | null;
+  /** ACP Agent 工作区状态 */
+  acpSettings: AcpSettings;
+  acpHosts: AcpHost[];
+  acpAgents: AcpAgent[];
+  acpWorkspaces: AcpWorkspace[];
+  acpSessions: AcpSession[];
+  acpLoaded: boolean;
+  activeAcpHostId: string | null;
+  activeAcpWorkspaceId: string | null;
+  activeAcpSessionId: string | null;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -64,27 +81,42 @@ export interface AvatarInfo {
   has: boolean;
 }
 
-let state: AppState = {
-  me: null,
-  conversations: [],
-  messages: {},
-  hasMore: {},
-  historyLoaded: {},
-  activeConv: null,
-  online: {},
-  typing: {},
-  friends: [],
-  requests: { incoming: [], outgoing: [] },
+const emptySessionData = () => ({
+  me: null as UserPublic | null,
+  conversations: [] as ConversationView[],
+  messages: {} as Record<string, MessageView[]>,
+  hasMore: {} as Record<string, boolean>,
+  historyLoaded: {} as Record<string, boolean>,
+  activeConv: null as string | null,
+  online: {} as Record<string, boolean>,
+  typing: {} as Record<string, { user: UserPublic; ts: number }>,
+  friends: [] as FriendView[],
+  requests: { incoming: [], outgoing: [] } as RequestsView,
   wsReady: false,
-  tab: "chats",
-  replyingTo: null,
-  editingMessage: null,
-  reactionPending: {},
-  toasts: [],
-  drafts: {},
-  avatars: {},
-  pendingJump: null,
-};
+  tab: "chats" as AppState["tab"],
+  replyingTo: null as MessageView | null,
+  editingMessage: null as MessageView | null,
+  reactionPending: {} as Record<string, boolean>,
+  toasts: [] as Toast[],
+  drafts: {} as Record<string, DraftEntry>,
+  avatars: {} as Record<string, AvatarInfo>,
+  pendingJump: null as AppState["pendingJump"],
+  acpSettings: { default_permission: "auto_read" } as AcpSettings,
+  acpHosts: [] as AcpHost[],
+  acpAgents: [] as AcpAgent[],
+  acpWorkspaces: [] as AcpWorkspace[],
+  acpSessions: [] as AcpSession[],
+  acpLoaded: false,
+  activeAcpHostId: null as string | null,
+  activeAcpWorkspaceId: null as string | null,
+  activeAcpSessionId: null as string | null,
+});
+
+export function resetSessionState(): Partial<AppState> {
+  return emptySessionData();
+}
+
+let state: AppState = emptySessionData();
 
 const listeners = new Set<() => void>();
 
@@ -609,4 +641,204 @@ export function resolveAck(
   real: MessageView,
 ): MessageView[] {
   return upsertMessage(list.filter((m) => m.id !== `client:${clientMsgId}`), real);
+}
+
+// ---------- ACP Workspace 状态归并与选择器 ----------
+
+export function pendingAcpApprovalsCount(sessions: AcpSession[]): number {
+  let n = 0;
+  for (const s of sessions) {
+    for (const t of s.turns ?? []) {
+      if (t.role === "permission" && t.status === "pending") n++;
+    }
+  }
+  return n;
+}
+
+function reconcileAcpSelection(
+  cur: Pick<
+    AppState,
+    "acpHosts" | "acpWorkspaces" | "acpSessions" | "activeAcpHostId" | "activeAcpWorkspaceId" | "activeAcpSessionId"
+  >,
+): Pick<AppState, "activeAcpHostId" | "activeAcpWorkspaceId" | "activeAcpSessionId"> {
+  const hostId =
+    cur.acpHosts.find((h) => h.id === cur.activeAcpHostId)?.id ??
+    cur.acpHosts.find((h) => h.online)?.id ??
+    cur.acpHosts[0]?.id ??
+    null;
+
+  const hostWorkspaces = hostId
+    ? cur.acpWorkspaces.filter((w) => w.host_id === hostId)
+    : cur.acpWorkspaces;
+
+  const currentSess = cur.acpSessions.find((s) => s.id === cur.activeAcpSessionId) ?? null;
+  let wsId: string | null =
+    hostWorkspaces.find((w) => w.id === cur.activeAcpWorkspaceId)?.id ??
+    (currentSess ? hostWorkspaces.find((w) => w.id === currentSess.workspace_id)?.id : undefined) ??
+    hostWorkspaces[0]?.id ??
+    null;
+
+  const sessInWs = wsId ? cur.acpSessions.filter((s) => s.workspace_id === wsId) : [];
+  let sessId: string | null =
+    sessInWs.find((s) => s.id === cur.activeAcpSessionId)?.id ?? sessInWs[0]?.id ?? null;
+
+  // 若选中的会话不属于当前 host 的第一个目录，优先保住同 host 下有会话的目录
+  if (!sessId && hostWorkspaces.length > 0) {
+    const withSess = hostWorkspaces.find((w) =>
+      cur.acpSessions.some((s) => s.workspace_id === w.id),
+    );
+    if (withSess) {
+      wsId = withSess.id;
+      sessId = cur.acpSessions.find((s) => s.workspace_id === wsId)?.id ?? null;
+    }
+  }
+
+  return {
+    activeAcpHostId: hostId,
+    activeAcpWorkspaceId: wsId,
+    activeAcpSessionId: sessId,
+  };
+}
+
+export function applyAcpBootstrap(s: AppState, bs: AcpBootstrap): Partial<AppState> {
+  const nextBase = {
+    acpSettings: bs.settings,
+    acpHosts: bs.hosts,
+    acpAgents: bs.agents,
+    acpWorkspaces: bs.workspaces,
+    acpSessions: bs.sessions,
+    acpLoaded: true,
+    activeAcpHostId: s.activeAcpHostId,
+    activeAcpWorkspaceId: s.activeAcpWorkspaceId,
+    activeAcpSessionId: s.activeAcpSessionId,
+  };
+  return {
+    ...nextBase,
+    ...reconcileAcpSelection(nextBase),
+  };
+}
+
+function upsertById<T extends { id: string }>(list: T[], item: T, append = true): T[] {
+  const idx = list.findIndex((x) => x.id === item.id);
+  if (idx >= 0) {
+    const next = [...list];
+    next[idx] = item;
+    return next;
+  }
+  return append ? [...list, item] : [item, ...list];
+}
+
+export function applyAcpEvent(
+  s: AppState,
+  event: string,
+  raw: unknown,
+): Partial<AppState> {
+  const data = (raw ?? {}) as Record<string, unknown>;
+  switch (event) {
+    case "settings_updated": {
+      const settings = data.settings as AcpSettings | undefined;
+      return settings ? { acpSettings: settings } : {};
+    }
+    case "host_upserted": {
+      const host = data.host as AcpHost | undefined;
+      if (!host) return {};
+      const acpHosts = upsertById(s.acpHosts, host);
+      return {
+        acpHosts,
+        ...reconcileAcpSelection({ ...s, acpHosts }),
+      };
+    }
+    case "host_deleted": {
+      const hostId = String(data.host_id ?? "");
+      const acpHosts = s.acpHosts.filter((h) => h.id !== hostId);
+      const removedWsIds = new Set(
+        s.acpWorkspaces.filter((w) => w.host_id === hostId).map((w) => w.id),
+      );
+      const acpWorkspaces = s.acpWorkspaces.filter((w) => w.host_id !== hostId);
+      const acpAgents = s.acpAgents.filter((a) => a.host_id !== hostId);
+      const acpSessions = s.acpSessions.filter((x) => !removedWsIds.has(x.workspace_id));
+      return {
+        acpHosts,
+        acpAgents,
+        acpWorkspaces,
+        acpSessions,
+        ...reconcileAcpSelection({
+          ...s,
+          acpHosts,
+          acpWorkspaces,
+          acpSessions,
+        }),
+      };
+    }
+    case "agent_upserted": {
+      const agent = data.agent as AcpAgent | undefined;
+      if (!agent) return {};
+      return { acpAgents: upsertById(s.acpAgents, agent) };
+    }
+    case "agent_deleted": {
+      const agentId = String(data.agent_id ?? "");
+      const acpAgents = s.acpAgents.filter((a) => a.id !== agentId);
+      const acpSessions = s.acpSessions.filter((x) => x.agent_id !== agentId);
+      return {
+        acpAgents,
+        acpSessions,
+        ...reconcileAcpSelection({ ...s, acpSessions }),
+      };
+    }
+    case "workspace_upserted": {
+      const ws = data.workspace as AcpWorkspace | undefined;
+      if (!ws) return {};
+      const acpWorkspaces = upsertById(s.acpWorkspaces, ws, false);
+      return {
+        acpWorkspaces,
+        ...reconcileAcpSelection({ ...s, acpWorkspaces }),
+      };
+    }
+    case "workspace_deleted": {
+      const wsId = String(data.workspace_id ?? "");
+      const acpWorkspaces = s.acpWorkspaces.filter((w) => w.id !== wsId);
+      const acpSessions = s.acpSessions.filter((x) => x.workspace_id !== wsId);
+      return {
+        acpWorkspaces,
+        acpSessions,
+        ...reconcileAcpSelection({ ...s, acpWorkspaces, acpSessions }),
+      };
+    }
+    case "session_upserted": {
+      const incoming = data.session as AcpSession | undefined;
+      if (!incoming) return {};
+      const prev = s.acpSessions.find((x) => x.id === incoming.id);
+      const merged: AcpSession = {
+        ...incoming,
+        turns: incoming.turns ?? prev?.turns ?? [],
+      };
+      const acpSessions = upsertById(s.acpSessions, merged, false);
+      return {
+        acpSessions,
+        ...reconcileAcpSelection({ ...s, acpSessions }),
+      };
+    }
+    case "session_deleted": {
+      const sessId = String(data.session_id ?? "");
+      const acpSessions = s.acpSessions.filter((x) => x.id !== sessId);
+      return {
+        acpSessions,
+        ...reconcileAcpSelection({ ...s, acpSessions }),
+      };
+    }
+    case "turn_upserted": {
+      const sessId = String(data.session_id ?? "");
+      const turn = data.turn as AcpTurn | undefined;
+      if (!sessId || !turn) return {};
+      const acpSessions = s.acpSessions.map((sess) => {
+        if (sess.id !== sessId) return sess;
+        const turns = upsertById(sess.turns ?? [], turn);
+        turns.sort((a, b) => a.seq - b.seq);
+        return { ...sess, turns };
+      });
+      return { acpSessions };
+    }
+    default:
+      return {};
+  }
 }

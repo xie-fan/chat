@@ -8,11 +8,15 @@ import {
   listServers,
   removeServer,
   saveSession,
+  savedAccounts,
   serverInfo,
   serverLabel,
   serverScope,
   setServer,
+  switchToAccount,
   takeKickReason,
+  type SavedAccount,
+  type ServerEntry,
 } from "../api";
 import { readDrafts } from "../drafts";
 import { parseInviteParam } from "../invite";
@@ -24,40 +28,65 @@ import {
   requestFormSubmit,
   resolveServerBlur,
   resolveServerInput,
-  type ServerEntry,
 } from "../servers";
 import { setState } from "../store";
+import {
+  readThemeChoice,
+  resolveRenderedDark,
+  toggleQuickTheme,
+} from "../theme";
 import type { RegistrationMode } from "../types";
 import { startWs } from "../ws";
+import {
+  ChevronDownIcon,
+  CpuIcon,
+  EyeIcon,
+  EyeOffIcon,
+  KeyIcon,
+  LockIcon,
+  MoonIcon,
+  PlusIcon,
+  ServerIcon,
+  SunIcon,
+  TrashIcon,
+  UserIcon,
+} from "./icons";
+import { confirmDialog } from "./Modal";
 
 export default function AuthScreen() {
-  const [mode, setMode] = useState<"login" | "register">(
-    // ?invite=CODE → 直接进注册并预填邀请码
-    () => (parseInviteParam(window.location.search) ? "register" : "login"),
+  const [mode, setMode] = useState<"login" | "register">(() =>
+    parseInviteParam(window.location.search) ? "register" : "login",
   );
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [displayName, setDisplayName] = useState("");
   const [inviteCode, setInviteCode] = useState(() =>
     parseInviteParam(window.location.search),
   );
   const [regMode, setRegMode] = useState<RegistrationMode>("open");
-  const [username, setUsername] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [password, setPassword] = useState("");
   const [server, setServerUrl] = useState(getServer());
   const [servers, setServers] = useState<ServerEntry[]>(() => listServers());
+  const [accounts, setAccounts] = useState<SavedAccount[]>(() => savedAccounts());
+  const [editServer, setEditServer] = useState(false);
   const [err, setErr] = useState(takeKickReason);
   const [busy, setBusy] = useState(false);
-  // 服务器地址收在卡片下方，默认折叠
-  const [editServer, setEditServer] = useState(false);
-  const formRef = useRef<HTMLFormElement>(null);
-  const usernameRef = useRef<HTMLInputElement>(null);
-  const passwordRef = useRef<HTMLInputElement>(null);
-  const serverInputRef = useRef<HTMLInputElement>(null);
-  // window.confirm 开着时页面失焦会触发地址框 onBlur；旗标挡住失焦提交，
-  // 让「https→http 确认取消 / 删除确认取消」不把地址框里未提交的输入落盘（F3）
-  const confirmingRef = useRef(false);
+  const [isDark, setIsDark] = useState(() =>
+    resolveRenderedDark(readThemeChoice(localStorage)),
+  );
 
-  // 挂载时 + 服务器地址输入变化（防抖 ~500ms）探测目标服务器的注册模式；
-  // 探测失败按 open（serverInfo 内部已兜底）
+  const formRef = useRef<HTMLFormElement>(null);
+  const userRef = useRef<HTMLInputElement>(null);
+  const passRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const sync = () =>
+      setIsDark(resolveRenderedDark(readThemeChoice(localStorage)));
+    mq?.addEventListener("change", sync);
+    return () => mq?.removeEventListener("change", sync);
+  }, []);
+
   useEffect(() => {
     let stale = false;
     const t = setTimeout(() => {
@@ -71,82 +100,81 @@ export default function AuthScreen() {
     };
   }, [server]);
 
-  // 关闭注册时注册入口整体消失（含已在注册页的情况）
   const effMode = regMode === "closed" ? "login" : mode;
-
-  // 桌面壳的页面来自 tauri://localhost，没有「同源服务器」，地址留空只会连到自己
   const desktop = inTauri();
   const cur = getServer();
 
-  /** 选中列表里的服务器（本标签页换到它；登录成功才会进列表顶部排序） */
-  const pick = (url: string) => {
+  const focusCred = (which: "username" | "password") => {
+    (which === "username" ? userRef : passRef).current?.focus();
+  };
+
+  const pickServer = (url: string) => {
     setServer(url);
     setServerUrl(getServer());
     setErr("");
     setEditServer(false);
   };
 
-  /** 弹原生确认框；期间按住 confirmingRef，地址框的 onBlur 不得提交（F3） */
-  const ask = (fn: () => boolean) => {
-    confirmingRef.current = true;
-    try {
-      return fn();
-    } finally {
-      // 归还焦点时可能补发失焦事件，旗标多活一个宏任务
-      setTimeout(() => {
-        confirmingRef.current = false;
-      }, 0);
+  const removeSv = async (sv: ServerEntry) => {
+    if (confirmServerRemove(sv)) {
+      const label = sv.name || sv.url || "当前站点";
+      if (
+        !(await confirmDialog(
+          `服务器「${label}」上仍有已保存的登录账号，移除后需要重新登录。确定移除？`,
+          { danger: true, okText: "移除" },
+        ))
+      ) {
+        return;
+      }
     }
-  };
-
-  /** 删除已保存的服务器条目：凭据/缓存/未发出的消息一并清掉 */
-  const drop = (sv: ServerEntry) => {
-    if (!ask(() => confirmServerRemove(sv))) return;
     const fallback = removeServer(sv.url);
     setServers(listServers());
+    setAccounts(savedAccounts());
     if (sv.url === cur) {
-      // 删的是当前选中的：换到最近使用的另一个（没有则默认）
       setServer(fallback);
       setServerUrl(getServer());
     }
   };
 
-  /** 地址框输入合法时保存为当前服务器并把输入框刷成规范化地址；顺带清掉旧地址错误（F7） */
-  const commitServer = (url: string) => {
-    setServer(url);
-    setServerUrl(url);
-    setEditServer(false);
-    setErr("");
-  };
-
-  /** 焦点移到指定凭据字段（F5/F8 共用） */
-  const focusCred = (field: "username" | "password") =>
-    (field === "username" ? usernameRef : passwordRef).current?.focus();
-
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (busy) return;
     setErr("");
-    // 提交一律用地址框当前输入：有未保存的改动先提交再登录，不等 blur
+
     const r0 = resolveServerInput(server, { desktop, origin: location.origin });
     if (!r0.ok) {
       setErr(r0.err);
-      // 错误不能藏在折叠面板里：展开并聚焦地址框（F2 + F8）
       setEditServer(true);
-      setTimeout(() => serverInputRef.current?.focus(), 0);
       return;
     }
+
     const norm = r0.url;
-    // https 页面连 http 服务器会被浏览器拦截，先说清楚再放行；取消则不保存地址
     if (
       needsInsecureConfirm(desktop, location.protocol, norm) &&
-      !ask(() => window.confirm("浏览器会阻止 https 页面访问 http 服务器，仍要继续吗？"))
+      !(await confirmDialog(
+        `即将通过未加密的 HTTP 连接「${norm}」，凭据可能被窃听。确定继续？`,
+        { danger: true, okText: "继续连接" },
+      ))
     ) {
       return;
     }
+
+    if (editServer) {
+      const empty = firstEmptyCredential(username, password);
+      if (empty) {
+        setServer(norm);
+        setServerUrl(norm);
+        setServers(listServers());
+        setEditServer(false);
+        focusCred(empty);
+        return;
+      }
+    }
+
     setBusy(true);
     try {
-      commitServer(norm);
+      setServer(norm);
+      setServerUrl(norm);
       const r =
         effMode === "login"
           ? await auth.login(username.trim(), password)
@@ -157,207 +185,336 @@ export default function AuthScreen() {
               inviteCode.trim() || undefined,
             );
       saveSession(r);
-      setState({ me: r.user, drafts: readDrafts(localStorage, serverScope(), r.user.id) });
+      setServers(listServers());
+      setAccounts(savedAccounts());
+      setState({
+        me: r.user,
+        drafts: readDrafts(localStorage, serverScope(), r.user.id),
+      });
       void startWs();
     } catch (ex) {
-      // fetch 连不上时只抛 TypeError（Safari 写作 "Load failed"），带上地址才好排查
-      setErr(
-        ex instanceof TypeError
-          ? `连不上服务器 ${norm}`
-          : ex instanceof Error
-            ? ex.message
-            : "请求失败",
-      );
-      // 失败后焦点别丢到 body：回第一个空凭据字段，否则密码框（F8）
+      setErr(ex instanceof Error ? ex.message : "操作失败");
       focusCred(firstEmptyCredential(username, password) ?? "password");
     } finally {
       setBusy(false);
     }
   };
 
-  // 鼠标按下就拦下默认的焦点转移：地址框不失焦→面板不收起→卡片不位移，
-  // mouseup 时按钮还在原处，点击不会落空（T6 桌面端登录按钮失灵）
-  const keepFocus = (e: React.MouseEvent) => e.preventDefault();
-
-  // F9：preventDefault 后 Firefox 不出 :active；按下加 .pressed、抬起/移出/取消
-  // 移除，样式与 :active 一致且不改布局（卡片不能位移，否则点击又落空）
-  const unpress = (e: React.PointerEvent<HTMLElement>) =>
-    e.currentTarget.classList.remove("pressed");
-  const pressable = {
-    onPointerDown: (e: React.PointerEvent<HTMLElement>) =>
-      e.currentTarget.classList.add("pressed"),
-    onPointerUp: unpress,
-    onPointerLeave: unpress,
-    onPointerCancel: unpress,
-  };
-
-  /** 地址框回车：动作由 planServerEnter 定（IME/忙碌不动、凭据空只存地址、齐全则提交） */
-  const onServerEnter = (e: React.KeyboardEvent) => {
+  const onServerKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== "Enter") return;
     const plan = planServerEnter({
-      composing: isImeEnter(e.nativeEvent), // F1：输入法选词的 Enter 不算提交
-      busy, // F6：登录在飞时什么都不做
+      composing: isImeEnter(e.nativeEvent),
+      busy,
       input: server,
       username,
       password,
       desktop,
       origin: location.origin,
     });
-    if (plan.t === "ignore") return; // 不 preventDefault，完全不动
-    e.preventDefault();
-    if (plan.t === "err") {
-      setErr(plan.err); // 面板仍展开，错误看得见（F2）
+    if (plan.t === "ignore") {
+      if (busy) e.preventDefault();
       return;
     }
+    e.preventDefault();
+    if (plan.t === "err") {
+      setErr(plan.err);
+      return;
+    }
+    setServer(plan.url);
+    setServerUrl(plan.url);
+    setServers(listServers());
     if (plan.t === "focus") {
-      // F5：只提交地址，不发表单；聚焦第一个空凭据字段
-      commitServer(plan.url);
+      setEditServer(false);
       focusCred(plan.field);
       return;
     }
-    // submit：地址先不落盘，submit() 里 https→http 确认通过才 commitServer（取消=不保存）
-    requestFormSubmit(formRef.current); // F4：老 WebKit 无 requestSubmit 时派发 submit 事件
+    requestFormSubmit(formRef.current);
+  };
+
+  const toggleTheme = () => {
+    const next = toggleQuickTheme();
+    setIsDark(next === "dark");
   };
 
   return (
     <div className="auth-wrap">
+      <button
+        type="button"
+        className="auth-theme-pill"
+        onClick={toggleTheme}
+        title="切换浅色 / 深色主题"
+      >
+        {isDark ? <SunIcon size={15} /> : <MoonIcon size={15} />}
+        <span>{isDark ? "浅色模式" : "深色模式"}</span>
+      </button>
+
       <div className="auth-col">
-        <form className="auth-card" onSubmit={submit} ref={formRef}>
-          <div className="auth-head">
-            <h1 className="auth-title">Chat</h1>
-            {regMode !== "closed" && (
+        <div className="auth-showcase">
+          <div className="auth-hero">
+            <div className="auth-brand">
+              <div className="auth-brand-icon">
+                <CpuIcon size={20} />
+              </div>
+              <span>Chat Workspace</span>
+            </div>
+
+            <div className="auth-hero-art" aria-hidden="true">
+              <svg width="240" height="168" viewBox="0 0 240 168" fill="none">
+                <rect
+                  x="16"
+                  y="16"
+                  width="208"
+                  height="136"
+                  rx="18"
+                  fill="rgba(255,255,255,0.10)"
+                  stroke="rgba(255,255,255,0.22)"
+                />
+                <rect
+                  x="30"
+                  y="34"
+                  width="98"
+                  height="32"
+                  rx="10"
+                  fill="rgba(255,255,255,0.22)"
+                />
+                <circle cx="46" cy="50" r="8" fill="#A5B4FC" />
+                <rect x="60" y="45" width="52" height="5" rx="2.5" fill="rgba(255,255,255,0.8)" />
+                <rect x="60" y="54" width="34" height="4" rx="2" fill="rgba(255,255,255,0.5)" />
+
+                <rect
+                  x="96"
+                  y="78"
+                  width="114"
+                  height="34"
+                  rx="10"
+                  fill="rgba(255,255,255,0.16)"
+                  stroke="rgba(255,255,255,0.25)"
+                />
+                <circle cx="192" cy="95" r="8" fill="#34D399" />
+                <rect x="110" y="89" width="66" height="5" rx="2.5" fill="#fff" />
+                <rect x="128" y="98" width="48" height="4" rx="2" fill="rgba(255,255,255,0.55)" />
+
+                <rect
+                  x="30"
+                  y="120"
+                  width="180"
+                  height="18"
+                  rx="9"
+                  fill="rgba(15,23,42,0.28)"
+                />
+                <circle cx="42" cy="129" r="3" fill="#34D399" />
+                <rect x="52" y="127" width="84" height="4" rx="2" fill="rgba(255,255,255,0.72)" />
+              </svg>
+            </div>
+
+            <div>
+              <h2>连接团队与本地 AI 工作流</h2>
+              <p>
+                实时协同聊天、群公告置顶与文件流转，集成多账号一键切换与 ACP 本地机器智能体工作区。
+              </p>
+            </div>
+          </div>
+
+          <form ref={formRef} className="auth-form-pane" onSubmit={submit}>
+            {regMode !== "closed" ? (
+              <div className="auth-tabs">
+                <button
+                  type="button"
+                  className={`auth-tab${effMode === "login" ? " on" : ""}`}
+                  onClick={() => {
+                    setMode("login");
+                    setErr("");
+                  }}
+                >
+                  登录账号
+                </button>
+                <button
+                  type="button"
+                  className={`auth-tab${effMode === "register" ? " on" : ""}`}
+                  onClick={() => {
+                    setMode("register");
+                    setErr("");
+                  }}
+                >
+                  注册新用户
+                </button>
+              </div>
+            ) : (
+              <div className="auth-note">当前服务器已关闭公开注册，请使用已有账号登录。</div>
+            )}
+
+            <div className="auth-field">
+              <span className="auth-field-icon">
+                <UserIcon />
+              </span>
+              <input
+                ref={userRef}
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="用户名"
+                autoComplete="username"
+                required
+              />
+            </div>
+
+            {effMode === "register" && (
+              <div className="auth-field">
+                <span className="auth-field-icon">
+                  <PlusIcon size={16} />
+                </span>
+                <input
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="显示昵称（可选）"
+                  maxLength={50}
+                />
+              </div>
+            )}
+
+            <div className="auth-field">
+              <span className="auth-field-icon">
+                <LockIcon size={17} />
+              </span>
+              <input
+                ref={passRef}
+                type={showPw ? "text" : "password"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={effMode === "login" ? "密码" : "设置密码（6-72 位）"}
+                autoComplete={effMode === "login" ? "current-password" : "new-password"}
+                required
+              />
               <button
                 type="button"
-                className="auth-switch"
-                onMouseDown={keepFocus}
-                {...pressable}
-                onClick={() => setMode(mode === "login" ? "register" : "login")}
+                className="auth-eye-btn"
+                onClick={() => setShowPw((v) => !v)}
+                aria-label={showPw ? "隐藏密码" : "显示密码"}
               >
-                {mode === "login" ? "注册 →" : "← 登录"}
+                {showPw ? <EyeOffIcon size={16} /> : <EyeIcon />}
               </button>
-            )}
-          </div>
-          <input
-            ref={usernameRef}
-            placeholder="用户名（3-20 位字母数字下划线）"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoComplete="username"
-            required
-          />
-          {effMode === "register" && (
-            <input
-              placeholder="昵称（可留空，之后可改）"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-            />
-          )}
-          {effMode === "register" && regMode === "invite" && (
-            <input
-              placeholder="邀请码"
-              value={inviteCode}
-              onChange={(e) => setInviteCode(e.target.value)}
-              required
-            />
-          )}
-          <input
-            ref={passwordRef}
-            type="password"
-            placeholder="密码（至少 6 位）"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete={
-              effMode === "login" ? "current-password" : "new-password"
-            }
-            required
-          />
-          {regMode === "closed" && (
-            <div className="auth-note">管理员已关闭注册</div>
-          )}
-          {err && (
-            <div className="auth-err" role="alert">
-              {err}
             </div>
-          )}
-          <button className="primary" disabled={busy} onMouseDown={keepFocus} {...pressable}>
-            {busy ? "请稍候…" : effMode === "login" ? "登录" : "注册并登录"}
-          </button>
-        </form>
-        <div className="auth-server">
-          {editServer ? (
-            <div
-              className="auth-server-form"
-              onBlur={(e) => {
-                // 焦点移到表单内（列表选择/删除按钮）不收起；点出表单才收起并记住地址
-                if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-                // 确认框开着时的失焦不是真失焦：跳过提交（F3，取消必须不改已保存地址）
-                if (confirmingRef.current) return;
-                const r = resolveServerBlur(server, {
-                  desktop,
-                  origin: location.origin,
-                });
-                if (r.t === "collapse") return setEditServer(false);
-                if (r.t === "err") return setErr(r.err); // 面板保持展开，错误不藏（F2）
-                commitServer(r.url); // 不点登录也记住，顺带清掉旧错误（F7）
-              }}
-            >
-              <input
-                ref={serverInputRef}
-                autoFocus
-                onKeyDown={onServerEnter}
-                placeholder={
-                  desktop
-                    ? "服务器地址，如 http://192.168.1.5:28080"
-                    : "服务器地址（留空用本站，如 http://192.168.1.5:28080）"
-                }
-                value={server}
-                onChange={(e) => setServerUrl(e.target.value)}
-              />
-              {servers.length > 0 && (
-                <div className="auth-server-list">
-                  {servers.map((sv) => (
-                    <div className="auth-server-item" key={sv.url}>
-                      <button
-                        type="button"
-                        className="auth-server-pick"
-                        onMouseDown={keepFocus}
-                        {...pressable}
-                        onClick={() => pick(sv.url)}
-                      >
-                        <span>
-                          {serverLabel(sv.url, sv)}
-                          {sv.url === cur && <span className="muted">（当前）</span>}
-                        </span>
-                        <span className="muted">
-                          {serverLabel(sv.url, sv) !== sv.url && `${sv.url} · `}
-                          {sv.username ? `@${sv.username}` : "未登录"}
-                        </span>
-                      </button>
-                      {!isSameOriginServer(sv.url) && (
-                        <button
-                          type="button"
-                          className="auth-server-del"
-                          title={`删除 ${sv.url}`}
-                          onMouseDown={keepFocus}
-                          {...pressable}
-                          onClick={() => drop(sv)}
-                        >
-                          ×
-                        </button>
-                      )}
-                    </div>
+
+            {effMode === "register" && regMode === "invite" && (
+              <div className="auth-field">
+                <span className="auth-field-icon">
+                  <KeyIcon size={16} />
+                </span>
+                <input
+                  value={inviteCode}
+                  onChange={(e) => setInviteCode(e.target.value)}
+                  placeholder="邀请码（必填）"
+                  required
+                />
+              </div>
+            )}
+
+            {err && <div className="auth-err">{err}</div>}
+
+            <button className="auth-submit" disabled={busy}>
+              {busy ? "处理中…" : effMode === "login" ? "立即登录" : "创建账号并登录"}
+            </button>
+
+            {accounts.length > 0 && (
+              <div className="auth-saved-box">
+                <div className="auth-saved-title">已保存账号 · 一键进入</div>
+                <div className="auth-saved-list">
+                  {accounts.slice(0, 6).map((acc) => (
+                    <button
+                      key={acc.id}
+                      type="button"
+                      className="auth-saved-chip"
+                      onClick={() => {
+                        setErr("");
+                        switchToAccount(acc.id);
+                      }}
+                      title={`${acc.user.display_name} @ ${acc.serverName || acc.serverUrl}`}
+                    >
+                      <span>{acc.user.display_name || acc.user.username}</span>
+                      <span className="muted">@{acc.user.username}</span>
+                    </button>
                   ))}
                 </div>
-              )}
-            </div>
-          ) : (
+              </div>
+            )}
+          </form>
+        </div>
+
+        <div className="auth-server">
+          {!editServer ? (
             <button
               type="button"
-              className="auth-switch"
-              onClick={() => setEditServer(true)}
+              className="auth-server-pill"
+              onClick={() => {
+                setServers(listServers());
+                setEditServer(true);
+              }}
             >
-              服务器：{serverLabel(cur, servers.find((s) => s.url === cur))} · 修改
+              <ServerIcon />
+              <span>服务器：{serverLabel(cur, servers.find((x) => x.url === cur))}</span>
+              <ChevronDownIcon size={14} />
             </button>
+          ) : (
+            <div className="st-card" style={{ width: "min(440px, 92vw)" }}>
+              <div className="st-card-head">
+                <h3>选择或输入服务器</h3>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => setEditServer(false)}
+                >
+                  收起
+                </button>
+              </div>
+              <div className="auth-server-form">
+                <input
+                  value={server}
+                  onChange={(e) => setServerUrl(e.target.value)}
+                  onKeyDown={onServerKeyDown}
+                  onBlur={() => {
+                    const r = resolveServerBlur(server, {
+                      desktop,
+                      origin: location.origin,
+                    });
+                    if (r.t === "commit") {
+                      setServer(r.url);
+                      setServerUrl(r.url);
+                      setServers(listServers());
+                    } else if (r.t === "collapse") {
+                      setEditServer(false);
+                    } else {
+                      setErr(r.err);
+                    }
+                  }}
+                  placeholder={desktop ? "https://chat.example.com" : "留空使用当前站点"}
+                />
+                {servers.length > 0 && (
+                  <div className="auth-server-list">
+                    {servers.map((sv) => (
+                      <div key={sv.url} className="auth-server-item">
+                        <button
+                          type="button"
+                          className="auth-server-pick"
+                          onClick={() => pickServer(sv.url)}
+                        >
+                          <span>{sv.name || (isSameOriginServer(sv.url) ? "当前站点" : sv.url)}</span>
+                          {sv.url && <span className="muted">{sv.url}</span>}
+                        </button>
+                        {(sv.url !== cur || servers.length > 1) && (
+                          <button
+                            type="button"
+                            className="auth-server-del"
+                            aria-label="移除服务器"
+                            onClick={() => void removeSv(sv)}
+                          >
+                            <TrashIcon size={14} />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           )}
         </div>
       </div>

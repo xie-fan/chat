@@ -18,6 +18,10 @@ import {
   removeServerEntry,
   upsertServer,
   writeAuth,
+  accountIdOf,
+  listSavedAccounts,
+  upsertSavedAccount,
+  removeSavedAccount,
   type ServerEntry,
 } from "./servers";
 import { memStorage } from "./testStorage";
@@ -464,5 +468,55 @@ describe("upsertServer 记录最近登录用户名", () => {
     const e: ServerEntry = listServers(st)[0];
     expect(e.username).toBe("u1");
     expect(e.name).toBe("测试服");
+  });
+});
+
+// ===== Multi-Account Registry =====
+describe("multi-account chat_accounts_v1", () => {
+  it("accountIdOf normalizes empty and explicit server urls", () => {
+    expect(accountIdOf("", "u1")).not.toBe(accountIdOf("https://chat.example.com", "u1"));
+    expect(accountIdOf("https://a.example", "u1")).toBe(
+      accountIdOf("https://a.example/", "u1"),
+    );
+  });
+
+  it("upsertSavedAccount inserts, updates existing without duplicate, and removeSavedAccount deletes", () => {
+    const st = memStorage();
+    upsertSavedAccount(st, {
+      serverUrl: "https://a.example",
+      serverName: "A 站",
+      access: "acc-1",
+      refresh: "ref-1",
+      user: user("u1"),
+    });
+    upsertSavedAccount(st, {
+      serverUrl: "https://b.example",
+      serverName: "B 站",
+      access: "acc-2",
+      refresh: "ref-2",
+      user: user("u2"),
+    });
+    upsertSavedAccount(st, {
+      serverUrl: "https://a.example",
+      serverName: "A 站重命名",
+      access: "acc-1b",
+      refresh: "ref-1b",
+      user: user("u1"),
+    });
+
+    const list = listSavedAccounts(st);
+    expect(list).toHaveLength(2);
+    expect(list[0].user.id).toBe("u1");
+    expect(list[0].serverName).toBe("A 站重命名");
+    expect(list[0].access).toBe("acc-1b");
+
+    const after = removeSavedAccount(st, list[0].id);
+    expect(after).toHaveLength(1);
+    expect(after[0].user.id).toBe("u2");
+  });
+
+  it("ignores malformed account storage JSON", () => {
+    const st = memStorage({ chat_accounts_v1: "{bad" });
+    expect(listSavedAccounts(st)).toEqual([]);
   });
 });

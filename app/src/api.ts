@@ -1,22 +1,38 @@
 import { cacheKey, removeLocalCache } from "./localCache";
 import {
+  accountIdOf,
   authKey,
   encServer,
   kickReasonKey,
+  listSavedAccounts as listSavedAccountsIn,
   listServers as listServersIn,
   migrateLegacyStorage,
   normalizeServerUrl,
   readAuth,
+  removeSavedAccount as removeSavedAccountIn,
   removeServerData,
   removeServerEntry,
+  upsertSavedAccount as upsertSavedAccountIn,
   upsertServer,
   writeAuth,
+  type SavedAccount,
   type ServerEntry,
 } from "./servers";
 
 export { normalizeServerUrl } from "./servers";
-export type { ServerEntry } from "./servers";
+export type { SavedAccount, ServerEntry } from "./servers";
 import type {
+  AcpAgent,
+  AcpAttachment,
+  AcpBootstrap,
+  AcpDirListing,
+  AcpHost,
+  AcpPermissionPolicy,
+  AcpSession,
+  AcpSettings,
+  AcpThinkingLevel,
+  AcpTurn,
+  AcpWorkspace,
   AdminOverview,
   AdminSettings,
   AdminUserView,
@@ -250,8 +266,9 @@ export function watchIdentity(onChange: () => void) {
   });
 }
 
-export function saveSession(r: AuthResponse) {
-  const scope = serverScope();
+export function saveSession(r: AuthResponse, serverName?: string) {
+  const srv = getServer();
+  const scope = encServer(srv);
   const prev = readAuth(localStorage, scope)?.user.id ?? "";
   // 换号：清掉上一个账号在本服务器键下的快照，防串号（别的服务器不动）
   if (prev && prev !== r.user.id) removeLocalCache(localStorage, cacheKey(scope, prev));
@@ -260,9 +277,20 @@ export function saveSession(r: AuthResponse) {
     refresh: r.refresh_token,
     user: r.user,
   });
-  // 登录成功的服务器才进列表（记最近登录用户名）
   try {
-    upsertServer(localStorage, getServer(), { username: r.user.username });
+    upsertServer(localStorage, srv, {
+      username: r.user.username,
+      ...(serverName ? { name: serverName } : {}),
+    });
+    const knownName =
+      serverName ?? listServersIn(localStorage).find((s) => s.url === srv)?.name;
+    upsertSavedAccountIn(localStorage, {
+      serverUrl: srv,
+      serverName: knownName,
+      access: r.access_token,
+      refresh: r.refresh_token,
+      user: r.user,
+    });
   } catch {}
   sessionGen++; // 新登录 = 新会话
   boundIdentity = storedIdentity();
@@ -276,10 +304,139 @@ function clearServerSession(scope: string) {
   removeServerData(localStorage, scope);
 }
 export function clearSession() {
-  // 登出/换号/被踢：只清本服务器的凭据与数据，其他服务器不受影响
+  // 登出/换号/被踢：只清本服务器的凭据与数据，其他服务器不受影响；并移除多账号列表里当前账号
+  const srv = getServer();
+  const curUid = readAuth(localStorage, encServer(srv))?.user.id;
+  if (curUid) {
+    removeSavedAccountIn(localStorage, accountIdOf(srv, curUid));
+  }
   clearServerSession(serverScope());
   sessionGen++; // 登出 = 旧会话作废
   boundIdentity = storedIdentity();
+}
+
+export function savedAccounts(): SavedAccount[] {
+  const list = listSavedAccountsIn(localStorage);
+  // 若当前会话未在多账号表里（例如从旧版升级上来），自动补一条展示
+  const curSrv = getServer();
+  const cur = readAuth(localStorage, serverScope());
+  if (cur) {
+    const id = accountIdOf(curSrv, cur.user.id);
+    if (!list.some((x) => x.id === id)) {
+      const srvName = listServersIn(localStorage).find((s) => s.url === curSrv)?.name;
+      return upsertSavedAccountIn(localStorage, {
+        serverUrl: curSrv,
+        serverName: srvName,
+        access: cur.access,
+        refresh: cur.refresh,
+        user: cur.user,
+      });
+    }
+  }
+  return list;
+}
+
+export function currentAccountId(): string | null {
+  const cur = readAuth(localStorage, serverScope());
+  return cur ? accountIdOf(getServer(), cur.user.id) : null;
+}
+
+export function removeAccount(id: string): SavedAccount[] {
+  const curId = currentAccountId();
+  const next = removeSavedAccountIn(localStorage, id);
+  if (curId && id === curId) {
+    clearSession();
+  }
+  return next;
+}
+
+export async function addAccount(
+  rawServer: string,
+  serverName: string | undefined,
+  username: string,
+  password: string,
+  displayName?: string,
+): Promise<SavedAccount> {
+  const srv = normalizeServerUrl(rawServer);
+  if (!srv) throw new ApiError(400, "服务器地址格式无效");
+  const res = await timedFetch(`${srv}/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: username.trim(),
+      password,
+      device_label: deviceLabel(),
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    let msg = text || "登录失败";
+    try {
+      const j = JSON.parse(text) as { error?: unknown };
+      if (typeof j.error === "string") msg = j.error;
+    } catch {}
+    if (res.status === 401) msg = "用户名或密码错误";
+    throw new ApiError(res.status, msg);
+  }
+  const authResp = JSON.parse(text) as AuthResponse;
+  let user = authResp.user;
+  if (displayName && displayName.trim() && displayName.trim() !== user.display_name) {
+    try {
+      const patchRes = await timedFetch(`${srv}/v1/users/me`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          authorization: `Bearer ${authResp.access_token}`,
+        },
+        body: JSON.stringify({ display_name: displayName.trim() }),
+      });
+      if (patchRes.ok) {
+        user = (await patchRes.json()) as UserPublic;
+      }
+    } catch {}
+  }
+  const cleanName = serverName?.trim() || undefined;
+  upsertServer(localStorage, srv, {
+    username: user.username,
+    ...(cleanName ? { name: cleanName } : {}),
+  });
+  const updated = upsertSavedAccountIn(localStorage, {
+    serverUrl: srv,
+    serverName: cleanName ?? listServersIn(localStorage).find((s) => s.url === srv)?.name,
+    access: authResp.access_token,
+    refresh: authResp.refresh_token,
+    user,
+  });
+  return updated.find((a) => a.id === accountIdOf(srv, user.id))!;
+}
+
+export function switchToAccount(id: string): SavedAccount | null {
+  const target = listSavedAccountsIn(localStorage).find((a) => a.id === id);
+  if (!target) return null;
+  const scope = encServer(target.serverUrl);
+  const prev = readAuth(localStorage, scope)?.user.id ?? "";
+  if (prev && prev !== target.user.id) removeLocalCache(localStorage, cacheKey(scope, prev));
+  writeAuth(localStorage, scope, {
+    access: target.access,
+    refresh: target.refresh,
+    user: target.user,
+  });
+  setServer(target.serverUrl);
+  upsertServer(localStorage, target.serverUrl, {
+    username: target.user.username,
+    ...(target.serverName ? { name: target.serverName } : {}),
+  });
+  upsertSavedAccountIn(localStorage, {
+    serverUrl: target.serverUrl,
+    serverName: target.serverName,
+    access: target.access,
+    refresh: target.refresh,
+    user: target.user,
+  });
+  sessionGen++;
+  boundIdentity = storedIdentity();
+  window.dispatchEvent(new Event("chat:switch-account"));
+  return target;
 }
 
 export class ApiError extends Error {
@@ -349,6 +506,8 @@ async function serverDenied(res: Response): Promise<boolean> {
 function denySession(status: number, reason: string, srv: string): never {
   requireIdentity();
   const scope = encServer(srv);
+  const kickedUid = readAuth(localStorage, scope)?.user.id;
+  if (kickedUid) removeSavedAccountIn(localStorage, accountIdOf(srv, kickedUid));
   clearServerSession(scope);
   try {
     sessionStorage.setItem(kickReasonKey(scope), reason);
@@ -411,6 +570,15 @@ async function refreshOnce(gen: number, srv: string, rt: string): Promise<Refres
     refresh: r.refresh_token,
     user: r.user,
   });
+  try {
+    upsertSavedAccountIn(localStorage, {
+      serverUrl: srv,
+      serverName: listServersIn(localStorage).find((s) => s.url === srv)?.name,
+      access: r.access_token,
+      refresh: r.refresh_token,
+      user: r.user,
+    });
+  } catch {}
   return { r: "ok" };
 }
 
@@ -567,6 +735,23 @@ export function isDesktopShell(): boolean {
   return !/Android/i.test(w.navigator?.userAgent ?? "");
 }
 
+function syncAccountProfile(u: UserPublic) {
+  try {
+    const srv = getServer();
+    const cur = readAuth(localStorage, encServer(srv));
+    if (cur && cur.user.id === u.id) {
+      writeAuth(localStorage, encServer(srv), { ...cur, user: u });
+      upsertSavedAccountIn(localStorage, {
+        serverUrl: srv,
+        serverName: listServersIn(localStorage).find((s) => s.url === srv)?.name,
+        access: cur.access,
+        refresh: cur.refresh,
+        user: u,
+      });
+    }
+  } catch {}
+}
+
 // ---------- auth ----------
 export const auth = {
   register: (username: string, password: string, display_name?: string, inviteCode?: string) =>
@@ -585,16 +770,30 @@ export const auth = {
     if (rt) post("/auth/logout", { refresh_token: rt }).catch(() => {});
     clearSession();
   },
-  me: () => get<UserPublic>("/users/me"),
-  updateMe: (display_name: string) => patch<UserPublic>("/users/me", { display_name }),
+  me: async () => {
+    const u = await get<UserPublic>("/users/me");
+    syncAccountProfile(u);
+    return u;
+  },
+  updateMe: async (display_name: string) => {
+    const u = await patch<UserPublic>("/users/me", { display_name });
+    syncAccountProfile(u);
+    return u;
+  },
   /** 上传已裁好的头像；字段名 file，返回更新后的本人资料 */
-  uploadAvatar: (file: Blob) => {
+  uploadAvatar: async (file: Blob) => {
     const fd = new FormData();
     const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
     fd.append("file", file, `avatar.${ext}`);
-    return call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd }, { timeoutMs: 0 });
+    const u = await call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd }, { timeoutMs: 0 });
+    syncAccountProfile(u);
+    return u;
   },
-  removeAvatar: () => call<UserPublic>("/users/me/avatar", { method: "DELETE" }),
+  removeAvatar: async () => {
+    const u = await call<UserPublic>("/users/me/avatar", { method: "DELETE" });
+    syncAccountProfile(u);
+    return u;
+  },
   /** 自助改密：返回为当前 session 新签发的凭据（其他 session 已被服务端撤销） */
   changePassword: (old_password: string, new_password: string) =>
     post<AuthResponse>("/users/me/password", { old_password, new_password }),
@@ -945,4 +1144,76 @@ export const admin = {
       xhr.onerror = () => reject(new ApiError(0, "网络错误"));
       xhr.send(fd);
     }),
+};
+
+// ---------- ACP Agent Workspace ----------
+export const acp = {
+  bootstrap: () => get<AcpBootstrap>("/acp/bootstrap"),
+  updateSettings: (default_permission: AcpPermissionPolicy) =>
+    put<AcpSettings>("/acp/settings", { default_permission }),
+  renameHost: (id: string, name: string) => patch<AcpHost>(`/acp/hosts/${id}`, { name }),
+  deleteHost: (id: string) => del<void>(`/acp/hosts/${id}`),
+  listDirs: (hostId: string, path = "") =>
+    get<AcpDirListing>(`/acp/hosts/${hostId}/dirs?path=${encodeURIComponent(path)}`),
+  createAgent: (body: {
+    host_id: string;
+    preset: string;
+    name: string;
+    adapter?: string;
+    cmd: string;
+    env?: Record<string, string>;
+  }) => post<AcpAgent>("/acp/agents", body),
+  updateAgent: (
+    id: string,
+    body: {
+      name?: string;
+      cmd?: string;
+      default_model?: string;
+      model_options?: string[];
+      permission_override?: "inherit" | AcpPermissionPolicy;
+    },
+  ) => patch<AcpAgent>(`/acp/agents/${id}`, body),
+  deleteAgent: (id: string) => del<void>(`/acp/agents/${id}`),
+  createWorkspace: (body: { host_id: string; cwd: string; name?: string }) =>
+    post<AcpWorkspace>("/acp/workspaces", body),
+  deleteWorkspace: (id: string) => del<void>(`/acp/workspaces/${id}`),
+  gitCheckout: (workspaceId: string, branch: string) =>
+    post<AcpWorkspace>(`/acp/workspaces/${workspaceId}/git-checkout`, { branch }),
+  createSession: (body: { workspace_id: string; agent_id: string; title?: string }) =>
+    post<AcpSession>("/acp/sessions", body),
+  updateSession: (
+    id: string,
+    body: {
+      title?: string;
+      selected_model?: string;
+      thinking_level?: AcpThinkingLevel;
+      permission_policy?: AcpPermissionPolicy;
+    },
+  ) => patch<AcpSession>(`/acp/sessions/${id}`, body),
+  deleteSession: (id: string) => del<void>(`/acp/sessions/${id}`),
+  sendPrompt: (
+    sessionId: string,
+    body: {
+      text: string;
+      files?: string[];
+      attachment_ids?: string[];
+      model?: string;
+      thinking_level?: AcpThinkingLevel;
+      permission_policy?: AcpPermissionPolicy;
+    },
+  ) => post<AcpTurn>(`/acp/sessions/${sessionId}/prompts`, body),
+  cancelSession: (sessionId: string) =>
+    post<AcpSession>(`/acp/sessions/${sessionId}/cancel`, {}),
+  replyPermission: (
+    turnId: string,
+    option_id: "allow_once" | "allow_always" | "reject_once" | "reject_always",
+  ) => post<AcpTurn>(`/acp/permissions/${turnId}`, { option_id }),
+  uploadFile: (file: File, sessionId?: string): Promise<AcpAttachment> => {
+    const fd = new FormData();
+    if (sessionId) fd.append("session_id", sessionId);
+    fd.append("file", file, file.name);
+    return call<AcpAttachment>("/acp/files", { method: "POST", body: fd }, { timeoutMs: 0 });
+  },
+  fileUrl: (id: string, dl?: boolean) =>
+    `${getServer()}/v1/acp/files/${id}${dl ? "?dl=1" : ""}`,
 };

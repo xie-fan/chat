@@ -47,7 +47,8 @@ const MIGRATION_VERSION_SQL: &str =
 /// 快照里数据库引用的文件（相对 FILES_DIR）：附件原文件、缩略图、头像
 const REFERENCED_FILES_SQL: &str = "SELECT storage_path FROM attachments
     UNION SELECT thumb_path FROM attachments WHERE thumb_path IS NOT NULL
-    UNION SELECT 'avatars/' || avatar_path FROM users WHERE avatar_path IS NOT NULL";
+    UNION SELECT 'avatars/' || avatar_path FROM users WHERE avatar_path IS NOT NULL
+    UNION SELECT storage_path FROM acp_attachments";
 
 /// 备份旁的缺失清单：`<备份名>.missing`，每行一个相对路径；完整的备份没有这个文件
 fn missing_list_path(bdir: &Path, name: &str) -> PathBuf {

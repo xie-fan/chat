@@ -3,11 +3,12 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { watchIdentity } from "./api";
 import { flushDrafts } from "./store";
-import { applyTheme, readThemeChoice } from "./theme";
+import { applyAccent, applyTheme, readAccentChoice, readThemeChoice } from "./theme";
 import "./styles.css";
 
 // 主题在 React 渲染前应用，避免先白后黑闪一下（system = 不设 data-theme，媒体查询接管）
 applyTheme(readThemeChoice(localStorage));
+applyAccent(readAccentChoice(localStorage));
 // Web 端最小 app-shell：服务端停止时用浏览器缓存仍能打开（/v1 API 不缓存；Tauri 壳不注册）
 if (
   import.meta.env.PROD &&

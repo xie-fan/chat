@@ -1,4 +1,5 @@
 import {
+  acp,
   ApiError,
   auth,
   clearSession,
@@ -15,6 +16,8 @@ import { clearReuseOnAck, failReuseSend } from "./drafts";
 import { kickReasonKey } from "./servers";
 import {
   absorbAvatarUsers,
+  applyAcpBootstrap,
+  applyAcpEvent,
   applyGroupLeft,
   applyLiveMessage,
   applyPrefUpdate,
@@ -243,13 +246,19 @@ async function connect() {
 async function afterOpen(sock: WebSocket, gen: number) {
   const alive = () =>
     !stopped && gen === wsGen && gen === session() && ws === sock && sock.readyState === WebSocket.OPEN;
-  // 重连恢复：刷新本人资料（离线期间可能被改）+ 拉全部目录
+  // 重连恢复：刷新本人资料（离线期间可能被改）+ 拉全部目录 + 同步 ACP 工作区
   const [me] = await Promise.all([
     auth.me().catch((e: unknown) => {
       console.warn("me refresh failed", e);
       return null;
     }),
     refreshCatalogs().catch((e: unknown) => console.warn("refresh failed", e)),
+    acp
+      .bootstrap()
+      .then((bs) => {
+        if (alive()) setState((cur) => applyAcpBootstrap(cur, bs));
+      })
+      .catch(() => {}),
   ]);
   if (me && alive()) setState({ me });
   if (!alive()) return;
@@ -474,6 +483,9 @@ function dispatch(f: WsOut) {
       window.dispatchEvent(
         new CustomEvent("chat:pins", { detail: f.conversation_id }),
       );
+      break;
+    case "acp_event":
+      setState((cur) => applyAcpEvent(cur, f.event, f.data));
       break;
     case "force_logout": {
       // 被踢下线（禁用/重置密码/改密/移出设备）：记本服务器的原因 → 停连接 → 回登录页
@@ -866,12 +878,5 @@ export function openConversation(id: string) {
         x.id === id ? { ...x, unread_count: 0, has_mention: false } : x,
       ),
     }));
-  }
-  if (c?.preference?.archived_at) {
-    const gen = session();
-    void convs
-      .setPref(id, { archived: false })
-      .then((pref) => { if (gen === session()) setState((cur) => applyPrefUpdate(cur, id, pref)); })
-      .catch((e) => console.warn("unarchive failed", e));
   }
 }

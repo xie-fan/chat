@@ -3,6 +3,7 @@ import { ApiError, convs, files, msgs as msgsApi, serverInfo, serverScope, serve
 import {
   applyLiveMessage,
   applyUpdatedMessage,
+  convAvatarText,
   convTitle,
   getState,
   fetchForward,
@@ -42,7 +43,6 @@ import { confirmDialog } from "../Modal";
 import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
 import AudioBubble from "./AudioBubble";
-import ConvMedia from "./ConvMedia";
 import CtxMenu from "./CtxMenu";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
@@ -113,6 +113,12 @@ import {
   RecallIcon,
   ReplyIcon,
   StarIcon,
+  BotIcon,
+  CodeIcon,
+  FolderSyncIcon,
+  ImageIcon,
+  SearchIcon,
+  SmileIcon,
 } from "../icons";
 
 function fmtSize(n: number): string {
@@ -240,7 +246,12 @@ export default function ChatView() {
   const stickBottom = useRef(true);
   const lastTypingSent = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
+  const imgInput = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const [showEmoji, setShowEmoji] = useState(false);
+  const [showCode, setShowCode] = useState(false);
+  const [codeLang, setCodeLang] = useState("ts");
+  const [codeBody, setCodeBody] = useState("");
   const draftBeforeEdit = useRef(""); // 编辑态接管 composer 前的草稿
   const prevConv = useRef<string | null>(null); // 上一次渲染的会话（草稿归属判定）
   const [members, setMembers] = useState<MemberView[]>([]);
@@ -364,6 +375,8 @@ export default function ChatView() {
     prevConv.current = conv?.id ?? null;
     // 切换会话时退出回复/编辑态（目标属于旧会话）
     setState({ replyingTo: null, editingMessage: null });
+    setShowEmoji(false);
+    setShowCode(false);
     setText(conv ? (getState().drafts[conv.id]?.text ?? "") : "");
   }, [conv?.id]);
 
@@ -1528,6 +1541,27 @@ export default function ChatView() {
         <button className="chat-back" aria-label="返回" onClick={() => setState({ activeConv: null })}>
           ‹
         </button>
+        {conv.kind === "dm" && conv.peer && !conv.peer.is_bot ? (
+          <Avatar
+            size="sm"
+            userId={conv.peer.id}
+            name={conv.peer.display_name}
+            avatarVersion={conv.peer.avatar_version}
+            hasAvatar={conv.peer.has_avatar}
+          >
+            {peerOnline && <i className="online-dot" />}
+          </Avatar>
+        ) : conv.kind === "self" ? (
+          <div className="avatar sm self-avatar">
+            <FolderSyncIcon size={16} />
+          </div>
+        ) : conv.kind === "dm" && conv.peer?.is_bot ? (
+          <div className="avatar sm bot-avatar">
+            <BotIcon />
+          </div>
+        ) : (
+          <div className="avatar sm">{convAvatarText(conv)}</div>
+        )}
         <div className="chat-head-main">
           <div className="chat-title">{title}</div>
           <div className="chat-status">
@@ -1552,18 +1586,19 @@ export default function ChatView() {
         <button
           className="icon-btn chat-head-btn"
           title="搜索聊天记录"
+          aria-label="搜索聊天记录"
           onClick={() => {
             setShowSearch(!showSearch);
             setSearchQ("");
             setSearchRes(null);
           }}
         >
-          🔍
+          <SearchIcon size={16} />
         </button>
-        {/* V2 P3-1：群=群信息（含文件与图片页签）；私聊/文件传输助手=文件与图片入口 */}
         <button
           className="icon-btn chat-head-btn"
-          title={conv.kind === "group" ? "群信息" : "文件与图片"}
+          title={conv.kind === "group" ? "群聊信息" : "会话详情与文件"}
+          aria-label={conv.kind === "group" ? "群聊信息" : "会话详情与文件"}
           onClick={() => setShowInfo(!showInfo)}
         >
           ⋯
@@ -1609,7 +1644,7 @@ export default function ChatView() {
         </div>
       )}
 
-      <div className="msg-scroll" ref={scrollRef} onScroll={onScroll}>
+      <div className="msg-scroll chat-dot-bg" ref={scrollRef} onScroll={onScroll}>
         {loadingMore && (<><div className="msg-sys">加载历史…</div><Skeleton rows={2} /></>)}
         {!hasMore && msgs.length > 0 && <div className="msg-sys">— 没有更多了 —</div>}
         {msgs.map((m, i) => {
@@ -2036,6 +2071,72 @@ export default function ChatView() {
         ) : (
           <>
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
+            <input ref={imgInput} type="file" accept="image/*" hidden multiple onChange={onFile} />
+            {showEmoji && (
+              <div className="composer-popover" onClick={(e) => e.stopPropagation()}>
+                <div className="emoji-grid">
+                  {[
+                    "😀", "😄", "😂", "🥰", "😎", "🤔", "😮", "😭",
+                    "👍", "👏", "🙏", "🎉", "🔥", "❤️", "✨", "🚀",
+                    "👀", "✅", "❌", "⚠️", "💡", "💻", "📦", "🐛",
+                  ].map((em) => (
+                    <button
+                      key={em}
+                      type="button"
+                      className="emoji-btn"
+                      onClick={() => {
+                        onInput(text + em);
+                        setShowEmoji(false);
+                        taRef.current?.focus();
+                      }}
+                    >
+                      {em}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {showCode && (
+              <div className="composer-popover code-popover" onClick={(e) => e.stopPropagation()}>
+                <div className="row between" style={{ alignItems: "center" }}>
+                  <b style={{ fontSize: 13 }}>插入代码片段</b>
+                  <select value={codeLang} onChange={(e) => setCodeLang(e.target.value)} style={{ width: "auto" }}>
+                    <option value="ts">TypeScript</option>
+                    <option value="js">JavaScript</option>
+                    <option value="py">Python</option>
+                    <option value="rust">Rust</option>
+                    <option value="bash">Bash</option>
+                    <option value="sql">SQL</option>
+                    <option value="json">JSON</option>
+                  </select>
+                </div>
+                <textarea
+                  rows={5}
+                  placeholder="粘贴或输入代码…"
+                  value={codeBody}
+                  onChange={(e) => setCodeBody(e.target.value)}
+                />
+                <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+                  <button type="button" className="btn-ghost" onClick={() => setShowCode(false)}>
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-accent"
+                    disabled={!codeBody.trim()}
+                    onClick={() => {
+                      const block = `\`\`\`${codeLang}\n${codeBody.trimEnd()}\n\`\`\``;
+                      onInput(text ? `${text.trimEnd()}\n${block}` : block);
+                      setCodeBody("");
+                      setShowCode(false);
+                      taRef.current?.focus();
+                    }}
+                  >
+                    插入到输入框
+                  </button>
+                </div>
+              </div>
+            )}
             {s.replyingTo && (
               <div className="composer-banner">
                 <span className="cb-label">回复 {s.replyingTo.sender_name}</span>
@@ -2165,11 +2266,46 @@ export default function ChatView() {
               />
               <div className="composer-tools">
                 <button
+                  type="button"
                   className="icon-btn"
-                  title="发送图片/文件（也可直接粘贴）"
+                  title="表情"
+                  aria-label="表情"
+                  onClick={() => {
+                    setShowEmoji((v) => !v);
+                    setShowCode(false);
+                  }}
+                >
+                  <SmileIcon size={18} />
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  title="发送图片"
+                  aria-label="发送图片"
+                  onClick={() => imgInput.current?.click()}
+                >
+                  <ImageIcon size={18} />
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  title="发送文件（也可直接粘贴）"
+                  aria-label="发送文件"
                   onClick={() => fileInput.current?.click()}
                 >
                   <PaperclipIcon />
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  title="插入代码片段"
+                  aria-label="插入代码片段"
+                  onClick={() => {
+                    setShowCode((v) => !v);
+                    setShowEmoji(false);
+                  }}
+                >
+                  <CodeIcon size={18} />
                 </button>
                 <VoiceRecorder
                   convId={conv.id}
@@ -2212,23 +2348,11 @@ export default function ChatView() {
             data-testid="slide-mask"
             onClick={() => setShowInfo(false)}
           />
-          {conv.kind === "group" ? (
-            <GroupInfo
-              conv={conv}
-              onClose={() => setShowInfo(false)}
-              onPreview={openPreview}
-            />
-          ) : (
-            <aside className="group-info" data-testid="slide-over">
-              <div className="gi-head">
-                <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>
-                <button className="icon-btn" onClick={() => setShowInfo(false)}>
-                  ✕
-                </button>
-              </div>
-              <ConvMedia conv={conv} onPreview={openPreview} />
-            </aside>
-          )}
+          <GroupInfo
+            conv={conv}
+            onClose={() => setShowInfo(false)}
+            onPreview={openPreview}
+          />
         </>
       )}
       {showPoll && conv.kind === "group" && (

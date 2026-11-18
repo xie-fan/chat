@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { auth, saveSession } from "../../api";
 import type { SessionView } from "../../types";
 import { startWs, stopWs } from "../../ws";
+import { confirmDialog } from "../Modal";
 import SetRow from "./SetRow";
 
 const fmtTime = (s: string) => new Date(s).toLocaleString();
@@ -79,7 +80,13 @@ export default function SecuritySettings() {
   };
 
   const revokeOthers = async () => {
-    if (!confirm("退出其他所有设备？它们的登录将立即失效。")) return;
+    if (
+      !(await confirmDialog("退出其他所有设备？它们的登录将立即失效。", {
+        danger: true,
+        okText: "退出其他设备",
+      }))
+    )
+      return;
     setBusyId("others");
     setListMsg("");
     try {
