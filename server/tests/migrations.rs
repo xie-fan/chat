@@ -85,6 +85,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0040_chat_record.sql"),
         include_str!("../migrations/0041_bot_delivery.sql"),
         include_str!("../migrations/0042_acp_workspace.sql"),
+        include_str!("../migrations/0043_acp_hardening.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -665,6 +666,29 @@ async fn upgrade_0042_acp_workspace() {
     let bad_role = sqlx::query("INSERT INTO acp_turns (acp_session_id,user_id,seq,role) VALUES ($1,$2,2,'invalid')")
         .bind(sess_id).bind(u).execute(&pool).await;
     assert!(bad_role.is_err(), "非法 turn role 必须被 CHECK 约束拒绝");
+
+    let dup_idx: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='idx_acp_turns_session_seq'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(dup_idx, 0, "0043 应移除与 UNIQUE 重复的 idx_acp_turns_session_seq");
+
+    for idx_name in [
+        "idx_acp_sessions_agent",
+        "idx_acp_turns_user",
+        "idx_acp_attachments_session",
+    ] {
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname=$1",
+        )
+        .bind(idx_name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cnt, 1, "0043 应创建索引 {idx_name}");
+    }
 
     pool.close().await;
 }

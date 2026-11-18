@@ -12,6 +12,8 @@ import {
   removeSavedAccount as removeSavedAccountIn,
   removeServerData,
   removeServerEntry,
+  removeUserServerData,
+  updateSavedAccountTokens as updateSavedAccountTokensIn,
   upsertSavedAccount as upsertSavedAccountIn,
   upsertServer,
   writeAuth,
@@ -185,8 +187,16 @@ export function removeServer(url: string): string {
   const norm = normalizeServerUrl(url) ?? url;
   const scope = encServer(norm);
   try {
-    const rt = readAuth(localStorage, scope)?.refresh;
-    if (rt) {
+    const rts = new Set<string>();
+    const curRt = readAuth(localStorage, scope)?.refresh;
+    if (curRt) rts.add(curRt);
+    for (const acc of listSavedAccountsIn(localStorage)) {
+      if ((normalizeServerUrl(acc.serverUrl) ?? acc.serverUrl) === norm) {
+        if (acc.refresh) rts.add(acc.refresh);
+        removeSavedAccountIn(localStorage, acc.id);
+      }
+    }
+    for (const rt of rts) {
       void timedFetch(`${norm}/v1/auth/logout`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -299,18 +309,27 @@ export function loadSession(): { user: UserPublic } | null {
   const a = readAuth(localStorage, serverScope());
   return a ? { user: a.user } : null;
 }
-/** 清某服务器名下的凭据与全部本地数据（auth/cache/outbox/drafts）；不广播、不记踢人原因 */
-function clearServerSession(scope: string) {
-  removeServerData(localStorage, scope);
+/** 仅清某服务器上当前活跃用户的凭据与敏感/用户专属数据，保留同服务器其他已保存账号的缓存与草稿 */
+function clearActiveUserOnScope(srv: string, scope: string) {
+  const uid = readAuth(localStorage, scope)?.user.id;
+  try {
+    localStorage.removeItem(authKey(scope));
+  } catch {}
+  if (uid) {
+    removeSavedAccountIn(localStorage, accountIdOf(srv, uid));
+    removeUserServerData(localStorage, scope, uid);
+  } else {
+    const norm = normalizeServerUrl(srv) ?? srv;
+    const hasOthers = listSavedAccountsIn(localStorage).some(
+      (a) => (normalizeServerUrl(a.serverUrl) ?? a.serverUrl) === norm,
+    );
+    if (!hasOthers) removeServerData(localStorage, scope);
+  }
 }
 export function clearSession() {
-  // 登出/换号/被踢：只清本服务器的凭据与数据，其他服务器不受影响；并移除多账号列表里当前账号
+  // 登出/被踢：只清本服务器当前账号的凭据与数据，其他服务器及同服其他已保存账号不受影响
   const srv = getServer();
-  const curUid = readAuth(localStorage, encServer(srv))?.user.id;
-  if (curUid) {
-    removeSavedAccountIn(localStorage, accountIdOf(srv, curUid));
-  }
-  clearServerSession(serverScope());
+  clearActiveUserOnScope(srv, encServer(srv));
   sessionGen++; // 登出 = 旧会话作废
   boundIdentity = storedIdentity();
 }
@@ -343,9 +362,22 @@ export function currentAccountId(): string | null {
 
 export function removeAccount(id: string): SavedAccount[] {
   const curId = currentAccountId();
+  const target = listSavedAccountsIn(localStorage).find((a) => a.id === id);
+  if (target?.refresh) {
+    const base = normalizeServerUrl(target.serverUrl) ?? target.serverUrl;
+    void timedFetch(`${base}/v1/auth/logout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: target.refresh }),
+    }).catch(() => {});
+  }
   const next = removeSavedAccountIn(localStorage, id);
   if (curId && id === curId) {
     clearSession();
+    window.dispatchEvent(new Event("chat:logout"));
+  } else if (target) {
+    const base = normalizeServerUrl(target.serverUrl) ?? target.serverUrl;
+    removeUserServerData(localStorage, encServer(base), target.user.id);
   }
   return next;
 }
@@ -413,30 +445,54 @@ export async function addAccount(
 export function switchToAccount(id: string): SavedAccount | null {
   const target = listSavedAccountsIn(localStorage).find((a) => a.id === id);
   if (!target) return null;
-  const scope = encServer(target.serverUrl);
-  const prev = readAuth(localStorage, scope)?.user.id ?? "";
-  if (prev && prev !== target.user.id) removeLocalCache(localStorage, cacheKey(scope, prev));
-  writeAuth(localStorage, scope, {
-    access: target.access,
-    refresh: target.refresh,
-    user: target.user,
-  });
+  window.dispatchEvent(new Event("chat:before-switch-account"));
+
+  const curSrv = getServer();
+  const curAuth = readAuth(localStorage, encServer(curSrv));
+  if (curAuth) {
+    updateSavedAccountTokensIn(localStorage, accountIdOf(curSrv, curAuth.user.id), {
+      access: curAuth.access,
+      refresh: curAuth.refresh,
+      user: curAuth.user,
+    });
+  }
+
+  const targetScope = encServer(target.serverUrl);
+  const prev = readAuth(localStorage, targetScope);
+  if (prev && prev.user.id !== target.user.id) {
+    updateSavedAccountTokensIn(localStorage, accountIdOf(target.serverUrl, prev.user.id), {
+      access: prev.access,
+      refresh: prev.refresh,
+      user: prev.user,
+    });
+  }
+  const chosen =
+    prev && prev.user.id === target.user.id
+      ? { access: prev.access, refresh: prev.refresh, user: prev.user }
+      : { access: target.access, refresh: target.refresh, user: target.user };
+
+  writeAuth(localStorage, targetScope, chosen);
   setServer(target.serverUrl);
   upsertServer(localStorage, target.serverUrl, {
-    username: target.user.username,
+    username: chosen.user.username,
     ...(target.serverName ? { name: target.serverName } : {}),
   });
   upsertSavedAccountIn(localStorage, {
     serverUrl: target.serverUrl,
     serverName: target.serverName,
-    access: target.access,
-    refresh: target.refresh,
-    user: target.user,
+    access: chosen.access,
+    refresh: chosen.refresh,
+    user: chosen.user,
   });
   sessionGen++;
   boundIdentity = storedIdentity();
   window.dispatchEvent(new Event("chat:switch-account"));
-  return target;
+  return {
+    ...target,
+    access: chosen.access,
+    refresh: chosen.refresh,
+    user: chosen.user,
+  };
 }
 
 export class ApiError extends Error {
@@ -506,9 +562,7 @@ async function serverDenied(res: Response): Promise<boolean> {
 function denySession(status: number, reason: string, srv: string): never {
   requireIdentity();
   const scope = encServer(srv);
-  const kickedUid = readAuth(localStorage, scope)?.user.id;
-  if (kickedUid) removeSavedAccountIn(localStorage, accountIdOf(srv, kickedUid));
-  clearServerSession(scope);
+  clearActiveUserOnScope(srv, scope);
   try {
     sessionStorage.setItem(kickReasonKey(scope), reason);
   } catch {}
@@ -571,9 +625,7 @@ async function refreshOnce(gen: number, srv: string, rt: string): Promise<Refres
     user: r.user,
   });
   try {
-    upsertSavedAccountIn(localStorage, {
-      serverUrl: srv,
-      serverName: listServersIn(localStorage).find((s) => s.url === srv)?.name,
+    updateSavedAccountTokensIn(localStorage, accountIdOf(srv, r.user.id), {
       access: r.access_token,
       refresh: r.refresh_token,
       user: r.user,
@@ -1151,6 +1203,7 @@ export const acp = {
   bootstrap: () => get<AcpBootstrap>("/acp/bootstrap"),
   updateSettings: (default_permission: AcpPermissionPolicy) =>
     put<AcpSettings>("/acp/settings", { default_permission }),
+  createPairCode: () => post<{ code: string; expires_in: number }>("/acp/hosts/pair-code"),
   renameHost: (id: string, name: string) => patch<AcpHost>(`/acp/hosts/${id}`, { name }),
   deleteHost: (id: string) => del<void>(`/acp/hosts/${id}`),
   listDirs: (hostId: string, path = "") =>
@@ -1168,6 +1221,7 @@ export const acp = {
     body: {
       name?: string;
       cmd?: string;
+      env?: Record<string, string>;
       default_model?: string;
       model_options?: string[];
       permission_override?: "inherit" | AcpPermissionPolicy;
@@ -1213,6 +1267,53 @@ export const acp = {
     if (sessionId) fd.append("session_id", sessionId);
     fd.append("file", file, file.name);
     return call<AcpAttachment>("/acp/files", { method: "POST", body: fd }, { timeoutMs: 0 });
+  },
+  downloadFile: async (id: string, fileName: string): Promise<void> => {
+    const gen = session();
+    const srv = getServer();
+    const path = `/acp/files/${id}?dl=1`;
+    let res = await raw(srv, path, undefined, 0);
+    requireSession(gen);
+    if (res.status === 401) {
+      const refreshed = await tryRefresh(gen, srv);
+      requireSession(gen);
+      if (refreshed.r === "transient") {
+        throw new ApiError(503, "暂时连不上服务器，请稍后再试");
+      }
+      if (refreshed.r === "ok") {
+        res = await raw(srv, path, undefined, 0);
+        requireSession(gen);
+      }
+      const reason =
+        refreshed.r === "invalid"
+          ? refreshed.reason ?? LOGOUT_EXPIRED
+          : res.status === 401 && (await serverDenied(res))
+            ? LOGOUT_EXPIRED
+            : null;
+      if (reason) denySession(401, reason, srv);
+      if (res.status === 401) {
+        throw new ApiError(503, "暂时连不上服务器，请稍后再试");
+      }
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      let msg = text || `下载失败 (${res.status})`;
+      try {
+        const j = JSON.parse(text) as { error?: unknown };
+        if (typeof j?.error === "string") msg = j.error;
+      } catch {}
+      throw new ApiError(res.status, msg);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName || "attachment";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   },
   fileUrl: (id: string, dl?: boolean) =>
     `${getServer()}/v1/acp/files/${id}${dl ? "?dl=1" : ""}`,

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { acp } from "../../api";
+import { acp, isDesktopShell } from "../../api";
+import { getLocalAllowAll, setLocalAllowAll } from "../../acpHost";
 import { applyAcpBootstrap, setState, useApp } from "../../store";
 import type { AcpPermissionPolicy } from "../../types";
 import { AttachAgentModal } from "../acp/AcpModals";
@@ -36,6 +37,14 @@ export default function AgentSettingsSection() {
   const [hostNameDraft, setHostNameDraft] = useState("");
   const [attachHostId, setAttachHostId] = useState<string | null | undefined>(undefined);
   const [err, setErr] = useState("");
+  const [localAllowAll, setLocalAllowAllState] = useState(false);
+  const [localPolicyBusy, setLocalPolicyBusy] = useState(false);
+
+  useEffect(() => {
+    if (isDesktopShell()) {
+      void getLocalAllowAll().then(setLocalAllowAllState);
+    }
+  }, []);
 
   useEffect(() => {
     if (!s.acpLoaded) {
@@ -166,6 +175,40 @@ export default function AgentSettingsSection() {
             </button>
           ))}
         </div>
+
+        {isDesktopShell() && (
+          <div
+            className="row between"
+            style={{
+              marginTop: 12,
+              paddingTop: 12,
+              borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.08))",
+              gap: 12,
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 600 }}>本机允许完全自动执行 (allow_all)</div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                未开启本机放行时，远程传入的 allow_all 将在本机自动降级为 auto_read。
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              aria-label="本机允许完全自动执行"
+              checked={localAllowAll}
+              disabled={localPolicyBusy}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setErr("");
+                setLocalPolicyBusy(true);
+                void setLocalAllowAll(next)
+                  .then((v) => setLocalAllowAllState(v.allow_all_local))
+                  .catch((ex) => setErr(ex instanceof Error ? ex.message : "更新本机策略失败"))
+                  .finally(() => setLocalPolicyBusy(false));
+              }}
+            />
+          </div>
+        )}
       </section>
 
       <section className="st-card">
@@ -216,14 +259,20 @@ export default function AgentSettingsSection() {
                           <button
                             type="button"
                             className="btn-accent"
-                            onClick={() =>
-                              void acp.renameHost(h.id, hostNameDraft.trim()).then((uh) => {
-                                setRenamingHostId(null);
-                                setState((cur) => ({
-                                  acpHosts: cur.acpHosts.map((x) => (x.id === uh.id ? uh : x)),
-                                }));
-                              })
-                            }
+                            onClick={() => {
+                              setErr("");
+                              void acp
+                                .renameHost(h.id, hostNameDraft.trim())
+                                .then((uh) => {
+                                  setRenamingHostId(null);
+                                  setState((cur) => ({
+                                    acpHosts: cur.acpHosts.map((x) => (x.id === uh.id ? uh : x)),
+                                  }));
+                                })
+                                .catch((e) =>
+                                  setErr(e instanceof Error ? e.message : "重命名主机失败"),
+                                );
+                            }}
                           >
                             保存
                           </button>
@@ -301,7 +350,8 @@ export default function AgentSettingsSection() {
                                 <select
                                   className="acp-select"
                                   value={ag.default_model}
-                                  onChange={(e) =>
+                                  onChange={(e) => {
+                                    setErr("");
                                     void acp
                                       .updateAgent(ag.id, { default_model: e.target.value })
                                       .then((u) =>
@@ -311,7 +361,10 @@ export default function AgentSettingsSection() {
                                           ),
                                         })),
                                       )
-                                  }
+                                      .catch((ex) =>
+                                        setErr(ex instanceof Error ? ex.message : "更新模型失败"),
+                                      );
+                                  }}
                                 >
                                   {ag.model_options.map((m) => (
                                     <option key={m} value={m}>
@@ -326,7 +379,8 @@ export default function AgentSettingsSection() {
                                 <select
                                   className="acp-select"
                                   value={ag.permission_override}
-                                  onChange={(e) =>
+                                  onChange={(e) => {
+                                    setErr("");
                                     void acp
                                       .updateAgent(ag.id, {
                                         permission_override: e.target.value as
@@ -340,7 +394,10 @@ export default function AgentSettingsSection() {
                                           ),
                                         })),
                                       )
-                                  }
+                                      .catch((ex) =>
+                                        setErr(ex instanceof Error ? ex.message : "更新权限策略失败"),
+                                      );
+                                  }}
                                 >
                                   <option value="inherit">继承全局策略</option>
                                   <option value="ask">每次询问</option>

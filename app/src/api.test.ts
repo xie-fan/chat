@@ -1,6 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { auth, browserDeviceLabel, clearSession, convs, deviceLabel, getServer, loadSession, saveSession, serverScope, setServer, watchIdentity } from "./api";
-import { authKey, encServer, kickReasonKey, readAuth, writeAuth } from "./servers";
+import {
+  auth,
+  browserDeviceLabel,
+  clearSession,
+  convs,
+  deviceLabel,
+  getServer,
+  loadSession,
+  removeServer,
+  saveSession,
+  savedAccounts,
+  serverScope,
+  setServer,
+  switchToAccount,
+  watchIdentity,
+} from "./api";
+import { accountIdOf, authKey, encServer, kickReasonKey, readAuth, upsertSavedAccount, writeAuth } from "./servers";
 import { memStorage } from "./testStorage";
 import type { AuthResponse } from "./types";
 
@@ -515,5 +530,140 @@ describe("request timeout", () => {
     const rejected = expect(request).rejects.toMatchObject({ status: 0 });
     await vi.advanceTimersByTimeAsync(10_000);
     await rejected;
+  });
+});
+
+// ===== Multi-account isolation & cleanup =====
+describe("multi-account switch, logout, and server removal", () => {
+  it("switchToAccount preserves sibling account cache/drafts and emits chat:before-switch-account before changing server", () => {
+    const alice = login("alice");
+    const bob = login("bob");
+    const scopeTest = encServer(TEST_SRV);
+    const events: Array<{ type: string; server: string }> = [];
+    window.addEventListener("chat:before-switch-account", () => {
+      events.push({ type: "before", server: getServer() });
+    });
+    window.addEventListener("chat:switch-account", () => {
+      events.push({ type: "after", server: getServer() });
+    });
+
+    setServer(TEST_SRV);
+    saveSession(alice);
+    localStorage.setItem(`chat_cache:${scopeTest}:alice`, "alice-snap");
+    localStorage.setItem(`chat_drafts:${scopeTest}:alice`, JSON.stringify({ c1: "alice draft" }));
+
+    const OTHER_SRV = "https://other.example";
+    const scopeOther = encServer(OTHER_SRV);
+    upsertSavedAccount(localStorage, {
+      serverUrl: OTHER_SRV,
+      access: bob.access_token,
+      refresh: bob.refresh_token,
+      user: bob.user,
+    });
+    localStorage.setItem(`chat_cache:${scopeOther}:bob`, "bob-snap");
+
+    // Also store a sibling user on TEST_SRV with rotated tokens in authKey
+    upsertSavedAccount(localStorage, {
+      serverUrl: TEST_SRV,
+      access: "alice-stale",
+      refresh: "alice-stale-rt",
+      user: alice.user,
+    });
+
+    const bobAccId = accountIdOf(OTHER_SRV, "bob");
+    const switched = switchToAccount(bobAccId);
+    expect(switched?.user.id).toBe("bob");
+    expect(getServer()).toBe(OTHER_SRV);
+    expect(events).toEqual([
+      { type: "before", server: TEST_SRV },
+      { type: "after", server: OTHER_SRV },
+    ]);
+    // Outgoing rotated tokens from TEST_SRV authKey were synced back to savedAccounts
+    const savedAlice = savedAccounts().find((a) => a.id === accountIdOf(TEST_SRV, "alice"));
+    expect(savedAlice?.access).toBe("alice-access");
+    expect(savedAlice?.refresh).toBe("alice-refresh");
+    expect(localStorage.getItem(`chat_cache:${scopeTest}:alice`)).toBe("alice-snap");
+
+    // Switching back to alice on TEST_SRV preserves bob cache too
+    switchToAccount(accountIdOf(TEST_SRV, "alice"));
+    expect(localStorage.getItem(`chat_cache:${scopeOther}:bob`)).toBe("bob-snap");
+  });
+
+  it("clearSession only cleans active user data and leaves sibling saved account on same server intact", () => {
+    const scope = serverScope();
+    const bob = login("bob");
+    upsertSavedAccount(localStorage, {
+      serverUrl: TEST_SRV,
+      access: bob.access_token,
+      refresh: bob.refresh_token,
+      user: bob.user,
+    });
+    localStorage.setItem(`chat_cache:${scope}:old`, "old-cache");
+    localStorage.setItem(`chat_reedit:${scope}:old`, "old-reedit");
+    localStorage.setItem(
+      `chat_drafts:${scope}:old`,
+      JSON.stringify({
+        c1: { text: "keep text", reuse: { attachment_id: "att1", file_name: "a", mime: "text/plain", size: 1, kind: "file", conversation_id: "c1" } },
+      }),
+    );
+
+    localStorage.setItem(`chat_cache:${scope}:bob`, "bob-cache");
+    localStorage.setItem(`chat_reedit:${scope}:bob`, "bob-reedit");
+    localStorage.setItem(
+      `chat_drafts:${scope}:bob`,
+      JSON.stringify({
+        c2: { text: "bob text", reuse: { attachment_id: "att2", file_name: "b", mime: "text/plain", size: 2, kind: "file", conversation_id: "c2" } },
+      }),
+    );
+
+    clearSession();
+
+    expect(curAuth()).toBeNull();
+    expect(localStorage.getItem(`chat_cache:${scope}:old`)).toBeNull();
+    expect(localStorage.getItem(`chat_reedit:${scope}:old`)).toBeNull();
+    expect(JSON.parse(localStorage.getItem(`chat_drafts:${scope}:old`)!)).toEqual({ c1: "keep text" });
+
+    // Sibling saved account on same server remains intact
+    expect(savedAccounts().some((a) => a.user.id === "bob")).toBe(true);
+    expect(localStorage.getItem(`chat_cache:${scope}:bob`)).toBe("bob-cache");
+    expect(localStorage.getItem(`chat_reedit:${scope}:bob`)).toBe("bob-reedit");
+    expect(JSON.parse(localStorage.getItem(`chat_drafts:${scope}:bob`)!).c2.reuse.attachment_id).toBe("att2");
+  });
+
+  it("removeServer revokes refresh tokens for all saved accounts on that server and removes them", () => {
+    const SRV_A = "http://srv-a.example";
+    const alice = login("alice");
+    const bob = login("bob");
+    writeAuth(localStorage, encServer(SRV_A), {
+      access: alice.access_token,
+      refresh: alice.refresh_token,
+      user: alice.user,
+    });
+    upsertSavedAccount(localStorage, {
+      serverUrl: SRV_A,
+      access: alice.access_token,
+      refresh: alice.refresh_token,
+      user: alice.user,
+    });
+    upsertSavedAccount(localStorage, {
+      serverUrl: SRV_A,
+      access: bob.access_token,
+      refresh: bob.refresh_token,
+      user: bob.user,
+    });
+
+    const fetcher = vi.fn((_url?: string, _init?: RequestInit) =>
+      Promise.resolve(new Response(null, { status: 204 })),
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    removeServer(SRV_A);
+
+    const loggedOutTokens = fetcher.mock.calls
+      .filter((c) => String(c[0]).startsWith(`${SRV_A}/v1/auth/logout`))
+      .map((c) => JSON.parse(String((c[1] as RequestInit | undefined)?.body)).refresh_token);
+    expect(loggedOutTokens.sort()).toEqual(["alice-refresh", "bob-refresh"]);
+    expect(savedAccounts().some((a) => a.serverUrl === SRV_A)).toBe(false);
+    expect(localStorage.getItem(authKey(encServer(SRV_A)))).toBeNull();
   });
 });

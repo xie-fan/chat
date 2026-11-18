@@ -26,27 +26,25 @@ export default function ServerSetting() {
   const [err, setErr] = useState("");
   const cur = getServer();
 
-  const reload = () => {
-    flushDrafts(); // 在途草稿先按本服务器键落盘
-    location.reload();
-  };
-
   const switchTo = (url: string) => {
     if (url === cur) return;
+    flushDrafts();
     setServer(url);
-    reload();
+    location.reload();
   };
 
   const del = (sv: ServerEntry) => {
     if (!confirmServerRemove(sv)) return;
-    const fallback = removeServer(sv.url);
+    flushDrafts();
     if (sv.url === cur) {
-      // 删的是当前服务器：换到最近使用的另一个（没有则默认），回登录页——
+      // 删的是当前服务器：先设跳过自动登录再换到最近使用的另一个，回登录页——
       // 即使回退服务器还带着凭据也不自动登入
-      setServer(fallback);
       skipAutoLoginOnce();
-      reload();
+      const fallback = removeServer(sv.url);
+      setServer(fallback);
+      location.reload();
     } else {
+      removeServer(sv.url);
       setList(listServers());
     }
   };

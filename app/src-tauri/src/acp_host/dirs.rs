@@ -2,21 +2,29 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const MAX_ENTRIES: usize = 500;
+const SENSITIVE_DIR_NAMES: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube"];
+
+pub fn is_sensitive_path(p: &Path) -> bool {
+    p.components().any(|c| {
+        matches!(c, std::path::Component::Normal(name) if {
+            let low = name.to_string_lossy().to_ascii_lowercase();
+            SENSITIVE_DIR_NAMES.contains(&low.as_str())
+        })
+    })
+}
 
 pub fn roots() -> Vec<String> {
     let mut out = Vec::new();
     if let Some(home) = dirs::home_dir() {
         out.push(clean_path_str(&home));
     }
-    if cfg!(windows) {
+    if out.is_empty() && cfg!(windows) {
         for letter in b'A'..=b'Z' {
             let drive = format!("{}:\\", letter as char);
             if Path::new(&drive).exists() {
                 out.push(drive);
             }
         }
-    } else if !out.iter().any(|p| p == "/") {
-        out.push("/".to_string());
     }
     out
 }
@@ -61,6 +69,9 @@ pub fn list_dir(raw_path: &str) -> Result<Value, String> {
     }
 
     let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    if is_sensitive_path(&canon) {
+        return Err("拒绝浏览包含密钥或凭证的敏感目录".to_string());
+    }
     let path_str = clean_path_str(&canon);
     let parent = canon
         .parent()
@@ -76,6 +87,9 @@ pub fn list_dir(raw_path: &str) -> Result<Value, String> {
                 return None;
             }
             let name = entry.file_name().to_string_lossy().to_string();
+            if SENSITIVE_DIR_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+                return None;
+            }
             let full = clean_path_str(&entry.path());
             let has_children = std::fs::read_dir(entry.path())
                 .map(|mut rd| {

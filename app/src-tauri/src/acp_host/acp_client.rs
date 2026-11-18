@@ -100,6 +100,7 @@ pub async fn run_prompt_task(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    command::configure_child_group(&mut cmd);
     for (k, v) in &msg.agent.env {
         cmd.env(k, v);
     }
@@ -141,6 +142,7 @@ pub async fn run_prompt_task(
         });
     }
 
+    let upload_dir = session_upload_dir(&msg.session_id);
     let res = drive_stdio(
         stdout,
         stdin,
@@ -153,7 +155,10 @@ pub async fn run_prompt_task(
     )
     .await;
 
-    let _ = child.kill().await;
+    command::kill_child_tree(&mut child).await;
+    if let Some(udir) = upload_dir {
+        let _ = std::fs::remove_dir_all(udir);
+    }
     match res {
         Ok(acp_key) => {
             let diffs = command::collect_git_diffs(&dir).await;
@@ -351,7 +356,11 @@ where
         .await?;
 
     let mut cancel_rx = drv.cancel.clone();
-    let cancelled = drv.wait_resp_or_cancel(prompt_req_id, &mut cancel_rx).await?;
+    let cancelled = drv.wait_resp_or_cancel(prompt_req_id, &mut cancel_rx).await;
+    for (_, mut term) in drv.terminals.drain() {
+        command::kill_child_tree(&mut term.child).await;
+    }
+    let cancelled = cancelled?;
     if cancelled {
         let _ = drv
             .notify("session/cancel", json!({ "sessionId": resolved_sid }))
@@ -363,9 +372,34 @@ where
     Ok(Some(resolved_sid))
 }
 
+fn session_upload_dir(session_id: &str) -> Option<PathBuf> {
+    let parsed = Uuid::parse_str(session_id.trim()).ok()?;
+    Some(super::host_data_dir().join("uploads").join(parsed.to_string()))
+}
+
+fn restrict_dir_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn restrict_file_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn build_prompt_blocks(msg: &PromptStartMsg, dir: &Path, image_ok: bool) -> Vec<Value> {
     let mut blocks = Vec::new();
-    let upload_dir = std::env::temp_dir().join("chat-acp-uploads").join(&msg.session_id);
+    let upload_dir = session_upload_dir(&msg.session_id);
     for att in &msg.attachments {
         if let Some(b64) = &att.data_base64 {
             if image_ok && att.mime.starts_with("image/") {
@@ -376,11 +410,21 @@ fn build_prompt_blocks(msg: &PromptStartMsg, dir: &Path, image_ok: bool) -> Vec<
                 }));
                 continue;
             }
+            let Some(ref udir) = upload_dir else {
+                continue;
+            };
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                let _ = std::fs::create_dir_all(&upload_dir);
-                let safe_name = att.file_name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-                let dest = upload_dir.join(safe_name);
+                let _ = std::fs::create_dir_all(udir);
+                restrict_dir_owner(udir);
+                let safe_name: String = att
+                    .file_name
+                    .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+                    .chars()
+                    .take(120)
+                    .collect();
+                let dest = udir.join(format!("{}_{safe_name}", Uuid::new_v4().simple()));
                 if std::fs::write(&dest, bytes).is_ok() {
+                    restrict_file_owner(&dest);
                     blocks.push(json!({
                         "type": "resource_link",
                         "uri": file_uri(&dest),
@@ -393,8 +437,12 @@ fn build_prompt_blocks(msg: &PromptStartMsg, dir: &Path, image_ok: bool) -> Vec<
     }
     for f in &msg.files {
         let clean = f.trim().trim_start_matches('@');
-        if !clean.is_empty() {
-            let path = dir.join(clean);
+        if !clean.is_empty() && permission::path_inside_root(clean, dir) {
+            let path = if Path::new(clean).is_absolute() {
+                PathBuf::from(clean)
+            } else {
+                dir.join(clean)
+            };
             blocks.push(json!({
                 "type": "resource_link",
                 "uri": file_uri(&path),
@@ -633,28 +681,42 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         let locations = permission::location_strings(&tool["locations"]);
         let options = params.get("options").cloned().unwrap_or(Value::Null);
 
-        if let Some(cached) = self.perm_cache.lock().unwrap().get(kind) {
-            let opt = permission::pick_option_id(
-                &options,
-                if cached { "allow_always" } else { "reject_always" },
-            );
-            return Ok(permission_result(id, opt.as_deref()));
-        }
-
-        if permission::evaluate_policy(&self.policy, kind, &locations, &self.cwd) == Some(true) {
-            let opt = permission::pick_option_id(&options, "allow_once");
-            return Ok(permission_result(id, opt.as_deref()));
-        }
+        let paths_in_scope = locations
+            .iter()
+            .all(|loc| permission::path_inside_root(loc, &self.cwd));
 
         let cmd_str = if !title.is_empty() {
             title.to_string()
         } else {
             format!("{kind} {}", locations.join(" "))
         };
-        let choice = self
-            .ask_user_permission(kind, &cmd_str, &format!("Agent 请求执行 {kind}"))
-            .await?;
-        self.perm_cache.lock().unwrap().record(kind.to_string(), &choice);
+        let key = permission::cache_key(&self.session_id, &self.cwd, kind, &cmd_str);
+
+        if paths_in_scope {
+            if let Some(cached) = self.perm_cache.lock().unwrap().get(&key) {
+                let opt = permission::pick_option_id(
+                    &options,
+                    if cached { "allow_always" } else { "reject_always" },
+                );
+                return Ok(permission_result(id, opt.as_deref()));
+            }
+
+            if permission::evaluate_policy(&self.policy, kind, &locations, &self.cwd) == Some(true)
+            {
+                let opt = permission::pick_option_id(&options, "allow_once");
+                return Ok(permission_result(id, opt.as_deref()));
+            }
+        }
+
+        let reason = if paths_in_scope {
+            format!("Agent 请求执行 {kind}")
+        } else {
+            format!("警告：目标路径超出工作目录！Agent 请求执行 {kind}")
+        };
+        let choice = self.ask_user_permission(kind, &cmd_str, &reason).await?;
+        if paths_in_scope {
+            self.perm_cache.lock().unwrap().record(key, &choice);
+        }
         let opt = permission::pick_option_id(&options, &choice);
         Ok(permission_result(id, opt.as_deref()))
     }
@@ -726,6 +788,11 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         } else {
             self.cwd.join(raw_path)
         };
+        if let Ok(meta) = tokio::fs::metadata(&target).await {
+            if meta.len() > 2 * 1024 * 1024 {
+                return Ok(json_err(id, -32002, "文件超过 2MB 上限，拒绝整文件读取"));
+            }
+        }
         match tokio::fs::read_to_string(&target).await {
             Ok(content) => Ok(json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } })),
             Err(e) => Ok(json_err(id, -32002, &format!("读取失败：{e}"))),
@@ -784,6 +851,7 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command::configure_child_group(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Ok(json_err(id, -32002, &format!("启动命令失败：{e}"))),
@@ -888,8 +956,10 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
 
     fn handle_term_kill(&mut self, id: Value, params: &Value) -> Value {
         let tid = params["terminalId"].as_str().unwrap_or("");
-        if let Some(t) = self.terminals.get_mut(tid) {
-            let _ = t.child.start_kill();
+        if let Some(mut t) = self.terminals.remove(tid) {
+            tokio::spawn(async move {
+                command::kill_child_tree(&mut t.child).await;
+            });
         }
         json!({ "jsonrpc": "2.0", "id": id, "result": {} })
     }

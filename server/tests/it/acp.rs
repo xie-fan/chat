@@ -442,7 +442,18 @@ async fn acp_host_lifecycle_rpc_prompt_and_permissions() {
     }
     assert!(done_ok, "bootstrap should persist completed session and turns");
 
-    // 9. 设备登出应踢掉所属 ACP 宿主 WS 连接
+    // 9. 设备登出应踢掉所属 ACP 宿主 WS 连接并使主机离线
+    let u_watch: Value = http()
+        .post(format!("{base}/v1/auth/login"))
+        .json(&json!({ "username": u.username, "password": "secret123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let watch_access = u_watch["access_token"].as_str().unwrap().to_string();
+
     let logout_res = http()
         .post(format!("{base}/v1/auth/logout"))
         .json(&json!({ "refresh_token": u.refresh }))
@@ -452,4 +463,285 @@ async fn acp_host_lifecycle_rpc_prompt_and_permissions() {
     assert_eq!(logout_res.status(), 204);
     let kicked = next_of(&mut host_ws, "force_logout").await;
     assert_eq!(kicked["type"], "force_logout");
+    drop(host_ws);
+
+    let mut offline_ok = false;
+    for _ in 0..20 {
+        let bs: Value = http()
+            .get(format!("{base}/v1/acp/bootstrap"))
+            .header("authorization", authz(&watch_access))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if bs["hosts"][0]["online"] == false {
+            offline_ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(offline_ok, "host should become offline after logout kick");
+}
+
+#[tokio::test]
+async fn acp_security_concurrency_pairing_and_cleanup() {
+    let base = spawn().await;
+    let u = register(&base, &format!("acps_{}", uniq())).await;
+
+    // 1. 一次性配对码生成、兑换及重放拒绝
+    let pc_res = http()
+        .post(format!("{base}/v1/acp/hosts/pair-code"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pc_res.status(), 200);
+    let pc_json: Value = pc_res.json().await.unwrap();
+    let pair_code = pc_json["code"].as_str().unwrap().to_string();
+    assert!(pair_code.starts_with("ACP-"));
+
+    let pair_ok = http()
+        .post(format!("{base}/v1/acp/hosts/pair"))
+        .json(&json!({ "code": pair_code, "host_name": "PairedNode" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pair_ok.status(), 200);
+    let pair_tokens: Value = pair_ok.json().await.unwrap();
+    let paired_access = pair_tokens["access_token"].as_str().unwrap().to_string();
+
+    let pair_replay = http()
+        .post(format!("{base}/v1/acp/hosts/pair"))
+        .json(&json!({ "code": pair_code, "host_name": "ReplayNode" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pair_replay.status(), 401);
+
+    // 用配对兑换的 token 获取 WS ticket 建立模拟宿主
+    let paired_user = TestUser {
+        id: u.id.clone(),
+        username: u.username.clone(),
+        access: paired_access,
+        refresh: pair_tokens["refresh_token"].as_str().unwrap().into(),
+    };
+    let mut host_ws = host_ws_connect(&base, &paired_user).await;
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "host_hello",
+                "install_id": Uuid::new_v4(),
+                "name": "PairedNode",
+                "os": "Linux",
+                "ip": "127.0.0.1",
+                "roots": ["/tmp"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ready = next_of(&mut host_ws, "host_ready").await;
+    let host_id = ready["host_id"].as_str().unwrap().to_string();
+
+    // 2. 超长 Agent 名 + 工作区名默认标题截断 (<= 160 chars) 与 env 脱敏/保留
+    let long_agent = "A".repeat(110);
+    let long_ws = "W".repeat(110);
+    let ag_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        let long_agent = long_agent.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/acp/agents"))
+                .header("authorization", authz(&access))
+                .json(&json!({
+                    "host_id": host_id,
+                    "preset": "custom",
+                    "name": long_agent,
+                    "cmd": "echo",
+                    "env": { "API_SECRET": "super-secret-val" }
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    let probe_ag = next_of(&mut host_ws, "rpc_call").await;
+    assert_eq!(probe_ag["method"], "probe_agent");
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "rpc_result",
+                "req_id": probe_ag["req_id"],
+                "ok": true,
+                "data": { "ok": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ag_res = ag_req.await.unwrap();
+    assert_eq!(ag_res.status(), 200);
+    let ag_json: Value = ag_res.json().await.unwrap();
+    let agent_id = ag_json["id"].as_str().unwrap().to_string();
+    assert_eq!(ag_json["env"]["API_SECRET"], "••••••••");
+
+    let bs: Value = http()
+        .get(format!("{base}/v1/acp/bootstrap"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bs["agents"][0]["env"]["API_SECRET"], "••••••••");
+
+    // 带占位符 "••••••••" 更新 env 应保留原密钥
+    let ag_patch: Value = http()
+        .patch(format!("{base}/v1/acp/agents/{agent_id}"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "env": { "API_SECRET": "••••••••", "PUBLIC_TAG": "v1" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ag_patch["env"]["API_SECRET"], "••••••••");
+    assert_eq!(ag_patch["env"]["PUBLIC_TAG"], "••••••••");
+
+    let ws_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        let long_ws = long_ws.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/acp/workspaces"))
+                .header("authorization", authz(&access))
+                .json(&json!({
+                    "host_id": host_id,
+                    "cwd": "/tmp/w",
+                    "name": long_ws
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    let probe_ws = next_of(&mut host_ws, "rpc_call").await;
+    assert_eq!(probe_ws["method"], "probe_workspace");
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "rpc_result",
+                "req_id": probe_ws["req_id"],
+                "ok": true,
+                "data": { "cwd": "/tmp/w", "branch": "main", "branches": ["main"] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ws_json: Value = ws_req.await.unwrap().json().await.unwrap();
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+
+    // 留空标题新建会话：默认拼接截断至 160 字符内并创建成功
+    let sess_res = http()
+        .post(format!("{base}/v1/acp/sessions"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "workspace_id": ws_id,
+            "agent_id": agent_id
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sess_res.status(), 200);
+    let sess_json: Value = sess_res.json().await.unwrap();
+    let sess_id = sess_json["id"].as_str().unwrap().to_string();
+    assert_eq!(sess_json["title"].as_str().unwrap().chars().count(), 160);
+
+    // 3. 上传附件 + 并发 send_prompt 互斥（一个 200 一个 409）+ 原始 env 下发
+    let part = Part::bytes(b"cleanup-bytes".to_vec())
+        .file_name("c.txt")
+        .mime_str("text/plain")
+        .unwrap();
+    let att_json: Value = http()
+        .post(format!("{base}/v1/acp/files"))
+        .header("authorization", authz(&u.access))
+        .multipart(Form::new().text("session_id", sess_id.clone()).part("file", part))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let att_id = att_json["id"].as_str().unwrap().to_string();
+    let st_before: Value = http()
+        .get(format!("{base}/v1/users/me/storage"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(st_before["used_bytes"].as_i64().unwrap() >= 13);
+
+    let req1 = http()
+        .post(format!("{base}/v1/acp/sessions/{sess_id}/prompts"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "text": "one", "attachment_ids": [att_id] }))
+        .send();
+    let req2 = http()
+        .post(format!("{base}/v1/acp/sessions/{sess_id}/prompts"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "text": "two" }))
+        .send();
+    let (r1, r2) = tokio::join!(req1, req2);
+    let mut statuses = vec![r1.unwrap().status().as_u16(), r2.unwrap().status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, vec![200, 409]);
+
+    let start = next_of(&mut host_ws, "prompt_start").await;
+    assert_eq!(start["agent"]["env"]["API_SECRET"], "super-secret-val");
+    assert_eq!(start["agent"]["env"]["PUBLIC_TAG"], "v1");
+
+    // 4. 删除会话应清理关联附件物理文件与配额统计
+    let del_res = http()
+        .delete(format!("{base}/v1/acp/sessions/{sess_id}"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap();
+    assert!(del_res.status().is_success());
+
+    let att_after = http()
+        .get(format!("{base}/v1/acp/files/{att_id}"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(att_after.status(), 404);
+
+    let st_after: Value = http()
+        .get(format!("{base}/v1/users/me/storage"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_after["used_bytes"], 0);
 }

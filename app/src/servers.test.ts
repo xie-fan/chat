@@ -16,6 +16,8 @@ import {
   resolveServerInput,
   removeServerData,
   removeServerEntry,
+  removeUserServerData,
+  updateSavedAccountTokens,
   upsertServer,
   writeAuth,
   accountIdOf,
@@ -518,5 +520,66 @@ describe("multi-account chat_accounts_v1", () => {
   it("ignores malformed account storage JSON", () => {
     const st = memStorage({ chat_accounts_v1: "{bad" });
     expect(listSavedAccounts(st)).toEqual([]);
+  });
+
+  it("updateSavedAccountTokens updates credentials in place without reordering", () => {
+    const st = memStorage();
+    upsertSavedAccount(st, {
+      serverUrl: "https://a.example",
+      access: "a1",
+      refresh: "r1",
+      user: user("u1"),
+      updatedAt: 100,
+    });
+    upsertSavedAccount(st, {
+      serverUrl: "https://a.example",
+      access: "a2",
+      refresh: "r2",
+      user: user("u2"),
+      updatedAt: 200,
+    });
+    updateSavedAccountTokens(st, accountIdOf("https://a.example", "u1"), {
+      access: "a1-new",
+      refresh: "r1-new",
+    });
+    const list = listSavedAccounts(st);
+    expect(list.map((a) => a.user.id)).toEqual(["u2", "u1"]);
+    expect(list[1].access).toBe("a1-new");
+    expect(list[1].refresh).toBe("r1-new");
+    expect(list[1].updatedAt).toBe(100);
+  });
+});
+
+describe("removeUserServerData", () => {
+  it("cleans target user cache/outbox/reedit and strips draft reuse without harming sibling users on same server", () => {
+    const scope = encServer("https://a.example");
+    const st = memStorage({
+      [authKey(scope)]: "{}",
+      [`chat_cache:${scope}:u1`]: "c1",
+      [`chat_outbox:${scope}:u1`]: "o1",
+      [`chat_reedit:${scope}:u1`]: "r1",
+      [`chat_drafts:${scope}:u1`]: JSON.stringify({
+        c1: { text: "keep plain", reuse: { attachment_id: "att1", file_name: "f", mime: "text/plain", size: 1, kind: "file", conversation_id: "c1" } },
+        c2: { text: "", reuse: { attachment_id: "att2", file_name: "f2", mime: "text/plain", size: 2, kind: "file", conversation_id: "c2" } },
+      }),
+      [`chat_cache:${scope}:u2`]: "c2-sibling",
+      [`chat_outbox:${scope}:u2`]: "o2-sibling",
+      [`chat_reedit:${scope}:u2`]: "r2-sibling",
+      [`chat_drafts:${scope}:u2`]: JSON.stringify({ c9: { text: "sib", reuse: { attachment_id: "att9", file_name: "s", mime: "text/plain", size: 3, kind: "file", conversation_id: "c9" } } }),
+    });
+
+    removeUserServerData(st, scope, "u1");
+
+    expect(st.raw.get(`chat_cache:${scope}:u1`)).toBeUndefined();
+    expect(st.raw.get(`chat_outbox:${scope}:u1`)).toBeUndefined();
+    expect(st.raw.get(`chat_reedit:${scope}:u1`)).toBeUndefined();
+    expect(JSON.parse(st.raw.get(`chat_drafts:${scope}:u1`)!)).toEqual({ c1: "keep plain" });
+
+    // Sibling u2 data + reuse chip remain completely untouched
+    expect(st.raw.get(`chat_cache:${scope}:u2`)).toBe("c2-sibling");
+    expect(st.raw.get(`chat_outbox:${scope}:u2`)).toBe("o2-sibling");
+    expect(st.raw.get(`chat_reedit:${scope}:u2`)).toBe("r2-sibling");
+    expect(JSON.parse(st.raw.get(`chat_drafts:${scope}:u2`)!).c9.reuse.attachment_id).toBe("att9");
+    expect(st.raw.get(authKey(scope))).toBe("{}");
   });
 });

@@ -23,6 +23,22 @@ impl PermissionCache {
     }
 }
 
+pub fn cache_key(session_id: &str, cwd: &Path, tool_kind: &str, cmd_or_title: &str) -> String {
+    let canon_cwd = resolve_path(cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| cwd.to_string_lossy().to_string());
+    let kind = tool_kind.to_ascii_lowercase();
+    let extra = if matches!(
+        kind.as_str(),
+        "execute" | "terminal/run" | "bash" | "shell" | "command"
+    ) {
+        cmd_or_title.split_whitespace().next().unwrap_or("")
+    } else {
+        ""
+    };
+    format!("{session_id}|{canon_cwd}|{kind}|{extra}")
+}
+
 pub fn evaluate_policy(
     policy: &str,
     tool_kind: &str,
@@ -33,9 +49,6 @@ pub fn evaluate_policy(
         return Some(true);
     }
     let kind = tool_kind.to_ascii_lowercase();
-    if kind == "think" {
-        return Some(true);
-    }
     if policy == "auto_read"
         && READ_KINDS.contains(&kind.as_str())
         && !locations.is_empty()
@@ -47,22 +60,40 @@ pub fn evaluate_policy(
 }
 
 pub fn path_inside_root(raw: &str, root: &Path) -> bool {
-    let p = Path::new(raw.trim());
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let p = Path::new(trimmed);
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
         root.join(p)
     };
-    let Some(norm_p) = normalize(&joined) else {
+    let Some(norm_p) = resolve_path(&joined) else {
         return false;
     };
-    let Some(norm_root) = normalize(root) else {
+    let Some(norm_root) = resolve_path(root) else {
         return false;
     };
+    if super::dirs::is_sensitive_path(&norm_p) {
+        return false;
+    }
     norm_p.starts_with(norm_root)
 }
 
-fn normalize(p: &Path) -> Option<PathBuf> {
+fn strip_win_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix("\\\\?\\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    p
+}
+
+fn lexical_clean(p: &Path) -> Option<PathBuf> {
     let mut stack = PathBuf::new();
     for comp in p.components() {
         match comp {
@@ -84,15 +115,27 @@ fn normalize(p: &Path) -> Option<PathBuf> {
             Component::Normal(x) => stack.push(x),
         }
     }
-    if let Ok(canon) = stack.canonicalize() {
-        let s = canon.to_string_lossy();
-        #[cfg(windows)]
-        if let Some(stripped) = s.strip_prefix("\\\\?\\") {
-            return Some(PathBuf::from(stripped));
-        }
-        return Some(canon);
-    }
     Some(stack)
+}
+
+/// 沿父目录向上寻找已存在祖先并 canonicalize，再拼接不存在的尾部相对路径，
+/// 防止通过工作区内指向外部的符号链接逃逸写新文件。
+pub fn resolve_path(p: &Path) -> Option<PathBuf> {
+    let clean = lexical_clean(p)?;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = clean.as_path();
+    loop {
+        if probe.exists() {
+            let mut base = strip_win_prefix(probe.canonicalize().ok()?);
+            for seg in tail.into_iter().rev() {
+                base.push(seg);
+            }
+            return Some(base);
+        }
+        let name = probe.file_name()?;
+        tail.push(name.to_os_string());
+        probe = probe.parent()?;
+    }
 }
 
 pub fn location_strings(v: &Value) -> Vec<String> {
@@ -166,5 +209,61 @@ mod tests {
         ]);
         assert_eq!(pick_option_id(&opts, "allow_once").as_deref(), Some("opt-allow"));
         assert_eq!(pick_option_id(&opts, "reject_always").as_deref(), Some("opt-deny"));
+    }
+
+    #[test]
+    fn think_tool_is_not_auto_allowed_under_ask_or_auto_read() {
+        let root = std::env::temp_dir().join(format!("acp_think_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(evaluate_policy("ask", "think", &[], &root), None);
+        assert_eq!(evaluate_policy("auto_read", "think", &[], &root), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_key_is_scoped_by_session_cwd_and_command() {
+        let base = cache_key("s1", Path::new("/tmp/a"), "terminal/run", "cargo test");
+        assert_ne!(
+            base,
+            cache_key("s2", Path::new("/tmp/a"), "terminal/run", "cargo test")
+        );
+        assert_ne!(
+            base,
+            cache_key("s1", Path::new("/tmp/b"), "terminal/run", "cargo test")
+        );
+        assert_ne!(
+            base,
+            cache_key("s1", Path::new("/tmp/a"), "terminal/run", "rm -rf /")
+        );
+    }
+
+    #[test]
+    fn path_inside_root_blocks_symlink_escape_for_nonexistent_file() {
+        let uid = uuid::Uuid::new_v4();
+        let inside = std::env::temp_dir().join(format!("acp_inside_{uid}"));
+        let outside = std::env::temp_dir().join(format!("acp_outside_{uid}"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let link = inside.join("escape");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J should succeed");
+        }
+
+        assert!(!path_inside_root("escape/new.txt", &inside));
+        assert!(path_inside_root("sub/new.txt", &inside));
+
+        let _ = std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link));
+        let _ = std::fs::remove_dir_all(&inside);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
-import { acp, getServer, inTauri, serverScope } from "../../api";
+import { acp, getServer, inTauri } from "../../api";
 import { copyPlainText } from "../../clipboard";
-import { readAuth } from "../../servers";
 import { setState, useApp } from "../../store";
 import type { AcpDirListing, AcpWorkspace } from "../../types";
 import {
@@ -446,10 +445,33 @@ export function AttachAgentModal({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [copied, setCopied] = useState(false);
+  const [pairCode, setPairCode] = useState("");
+  const [pairExpires, setPairExpires] = useState<number | null>(null);
+  const [pairBusy, setPairBusy] = useState(false);
 
-  const token = readAuth(localStorage, serverScope())?.access ?? "<YOUR_ACCESS_TOKEN>";
   const srv = getServer() || (typeof window !== "undefined" ? window.location.origin : "");
-  const cliCmd = `chat-app --acp-host --server "${srv}" --token "${token}" --name "dev-node"`;
+  const cliCmd = `chat-app --acp-host --server "${srv}" --pair "${pairCode || "<PAIR_CODE>"}" --name "dev-node"`;
+
+  const generatePairCode = async () => {
+    setPairBusy(true);
+    setErr("");
+    try {
+      const res = await acp.createPairCode();
+      setPairCode(res.code);
+      setPairExpires(res.expires_in);
+    } catch (ex) {
+      setErr(ex instanceof Error ? ex.message : "生成配对码失败");
+    } finally {
+      setPairBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab === "host" && !pairCode && !pairBusy) {
+      void generatePairCode();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   const applyPreset = (id: string) => {
     setPreset(id);
@@ -619,36 +641,50 @@ export function AttachAgentModal({
               </div>
               <p className="muted" style={{ margin: 0, fontSize: 12.5, lineHeight: 1.6 }}>
                 {inTauri()
-                  ? "你正在使用桌面客户端，本机已在登录后自动通过 ACP 宿主通道上线。若需接入其他 Linux / macOS / GPU 服务器，请在目标机器运行以下命令："
-                  : "Web 端无法直接启动本机进程。请下载桌面端登录后自动接入本机，或在任意服务器终端运行以下命令以无头守护进程接入："}
+                  ? "你正在使用桌面客户端，本机已在登录后自动通过 ACP 宿主通道上线。若需接入其他 Linux / macOS / GPU 服务器，请在目标机器运行以下一次性配对命令（5 分钟内单次有效，无头模式可按需附加 --trust-agents 与 --allow-cwd <DIR>）："
+                  : "Web 端无法直接启动本机进程。请下载桌面端登录后自动接入本机，或在任意服务器终端运行以下一次性配对命令以无头守护进程接入（5 分钟内单次有效，可按需附加 --trust-agents 与 --allow-cwd <DIR>）："}
               </p>
               <pre className="acp-term-pre" style={{ userSelect: "all" }}>
                 {cliCmd}
               </pre>
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              {err && <div className="auth-err">{err}</div>}
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
                 <span className="muted" style={{ fontSize: 11.5 }}>
-                  连接成功后将自动出现在左上角 @Host 列表
+                  {pairCode
+                    ? `配对码有效期 ${Math.round((pairExpires ?? 300) / 60)} 分钟（单次兑换后自动失效）`
+                    : "点击右侧生成一次性配对码后再复制命令"}
                 </span>
-                <button
-                  type="button"
-                  className="btn-accent"
-                  onClick={() => {
-                    void copyPlainText(cliCmd).then((ok) => {
-                      if (ok) {
-                        setCopied(true);
-                        setTimeout(() => setCopied(false), 1800);
-                      }
-                    });
-                  }}
-                >
-                  {copied ? (
-                    <>
-                      <CheckIcon size={14} /> 已复制
-                    </>
-                  ) : (
-                    "复制命令"
-                  )}
-                </button>
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={pairBusy}
+                    onClick={() => void generatePairCode()}
+                  >
+                    {pairBusy ? "生成中…" : pairCode ? "重新生成配对码" : "生成一次性配对码"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-accent"
+                    disabled={!pairCode}
+                    onClick={() => {
+                      void copyPlainText(cliCmd).then((ok) => {
+                        if (ok) {
+                          setCopied(true);
+                          setTimeout(() => setCopied(false), 1800);
+                        }
+                      });
+                    }}
+                  >
+                    {copied ? (
+                      <>
+                        <CheckIcon size={14} /> 已复制
+                      </>
+                    ) : (
+                      "复制命令"
+                    )}
+                  </button>
+                </div>
               </div>
             </div>
 

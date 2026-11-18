@@ -238,7 +238,7 @@ pub(crate) async fn call_host_rpc(
 
     let req_id = Uuid::new_v4();
     let (wait_tx, wait_rx) = oneshot::channel();
-    st.acp_rpc_wait.insert(req_id, wait_tx);
+    st.acp_rpc_wait.insert(req_id, (host_id, wait_tx));
     let payload = json!({
         "type": "rpc_call",
         "req_id": req_id,
@@ -319,7 +319,23 @@ fn json_string_vec(v: Value) -> Vec<String> {
     serde_json::from_value(v).unwrap_or_default()
 }
 
-fn agent_from_row(row: &sqlx::postgres::PgRow) -> AcpAgentView {
+fn mask_env_secrets(raw: Value) -> Value {
+    let Some(obj) = raw.as_object() else {
+        return json!({});
+    };
+    let mut masked = serde_json::Map::with_capacity(obj.len());
+    for (k, v) in obj {
+        let s = v.as_str().unwrap_or("");
+        masked.insert(
+            k.clone(),
+            json!(if s.is_empty() { "" } else { "••••••••" }),
+        );
+    }
+    Value::Object(masked)
+}
+
+fn agent_from_row_inner(row: &sqlx::postgres::PgRow, mask_env: bool) -> AcpAgentView {
+    let raw_env: Value = row.get("env_json");
     AcpAgentView {
         id: row.get("id"),
         host_id: row.get("acp_host_id"),
@@ -327,7 +343,7 @@ fn agent_from_row(row: &sqlx::postgres::PgRow) -> AcpAgentView {
         name: row.get("name"),
         adapter: row.get("adapter"),
         cmd: row.get("cmd"),
-        env: row.get("env_json"),
+        env: if mask_env { mask_env_secrets(raw_env) } else { raw_env },
         short_tag: row.get("short_tag"),
         badge_bg: row.get("badge_bg"),
         default_model: row.get("default_model"),
@@ -338,6 +354,87 @@ fn agent_from_row(row: &sqlx::postgres::PgRow) -> AcpAgentView {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+fn agent_from_row(row: &sqlx::postgres::PgRow) -> AcpAgentView {
+    agent_from_row_inner(row, true)
+}
+
+pub(crate) async fn load_agent_raw(
+    pool: &PgPool,
+    uid: Uuid,
+    agent_id: Uuid,
+) -> AppResult<AcpAgentView> {
+    let row = sqlx::query(
+        "SELECT id, acp_host_id, preset, name, adapter, cmd, env_json, short_tag, badge_bg,
+                default_model, model_options, permission_override, capabilities, status,
+                created_at, updated_at
+           FROM acp_agents WHERE id = $1 AND user_id = $2",
+    )
+    .bind(agent_id)
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("agent not found"))?;
+    Ok(agent_from_row_inner(&row, false))
+}
+
+pub(crate) async fn load_agent_env_map(
+    pool: &PgPool,
+    uid: Uuid,
+    agent_id: Uuid,
+) -> AppResult<Value> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT env_json FROM acp_agents WHERE id = $1 AND user_id = $2",
+    )
+    .bind(agent_id)
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("agent not found"))
+}
+
+pub(crate) async fn delete_acp_attachment_files(files_dir: &str, paths: &[String]) {
+    for p in paths {
+        if !p.starts_with("acp-") {
+            continue;
+        }
+        let fp = crate::api::stored_file_path(files_dir, p);
+        let _ = tokio::fs::remove_file(fp).await;
+    }
+}
+
+pub async fn reset_stale_acp_state(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE acp_hosts SET online = false, latency_ms = 0 WHERE online = true")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE acp_sessions SET running = false WHERE running = true")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE acp_turns
+            SET status = 'rejected',
+                payload = jsonb_set(payload, '{chosen_option}', '\"server_restarted\"'::jsonb),
+                updated_at = now()
+          WHERE role = 'permission' AND status = 'pending'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn sweep_orphan_acp_attachments(pool: &PgPool, files_dir: &str) -> Result<usize, sqlx::Error> {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM acp_attachments
+          WHERE acp_session_id IS NULL
+            AND created_at < now() - interval '24 hours'
+          RETURNING storage_path",
+    )
+    .fetch_all(pool)
+    .await?;
+    let count = paths.len();
+    delete_acp_attachment_files(files_dir, &paths).await;
+    Ok(count)
 }
 
 pub(crate) async fn load_agent(

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { auth, getServer, loadSession, serverScope } from "./api";
+import { auth, clearSkipAutoLogin, getServer, hasSkipAutoLogin, loadSession, serverScope } from "./api";
 import { startAcpHost, stopAcpHost } from "./acpHost";
-import { readDrafts } from "./drafts";
-import { purgeReedits } from "./reedit";
+import { draftsKey, readDrafts } from "./drafts";
+import { clearReedits, purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
 import { syncWindowTitle, unreadTitle } from "./notify";
 import { flushDrafts, getState, resetSessionState, setState, useApp } from "./store";
@@ -13,8 +13,12 @@ import { DialogHost, dismissAllDialogs } from "./ui/Modal";
 
 export default function App() {
   const s = useApp();
-  const [booting, setBooting] = useState(() => loadSession() !== null);
+  const [booting, setBooting] = useState(() => !hasSkipAutoLogin() && loadSession() !== null);
   const [bootSeq, setBootSeq] = useState(0);
+
+  useEffect(() => {
+    clearSkipAutoLogin();
+  }, []);
 
   // 未读消息数同步窗口标题
   useEffect(() => {
@@ -28,34 +32,54 @@ export default function App() {
     } else {
       void stopAcpHost();
     }
-  }, [s.me?.id]);
+  }, [s.me?.id, bootSeq]);
 
-  // 401/403 或手动登出：停 WS/ACP、丢内存态回 AuthScreen
+  // 401/403 或手动登出：清敏感暂存与复用附件 chip；切账号仅切换视图态并保留多账号隔离数据
   useEffect(() => {
-    const clearClient = () => {
+    const onBeforeSwitch = () => {
       flushDrafts();
-      const uid = getState().me?.id;
-      if (uid) purgeReedits(localStorage, serverScope(), uid);
+    };
+    const onSwitch = () => {
       clearRecent();
       dismissAllDialogs();
       stopWs();
       void stopAcpHost();
       setState(resetSessionState());
-    };
-    const onLogout = () => {
-      clearClient();
-      setBooting(false);
-    };
-    const onSwitch = () => {
-      clearClient();
       setBooting(loadSession() !== null);
       setBootSeq((n) => n + 1);
     };
-    window.addEventListener("chat:logout", onLogout);
+    const onLogout = () => {
+      const { me, drafts } = getState();
+      const scope = serverScope();
+      const clean = Object.fromEntries(
+        Object.entries(drafts)
+          .filter(([, e]) => e.text)
+          .map(([k, e]) => [k, { text: e.text }]),
+      );
+      setState({ drafts: clean });
+      flushDrafts();
+      if (me?.id) {
+        clearReedits(localStorage, scope, me.id);
+        if (Object.keys(clean).length === 0) {
+          try {
+            localStorage.removeItem(draftsKey(scope, me.id));
+          } catch {}
+        }
+      }
+      clearRecent();
+      dismissAllDialogs();
+      stopWs();
+      void stopAcpHost();
+      setState(resetSessionState());
+      setBooting(false);
+    };
+    window.addEventListener("chat:before-switch-account", onBeforeSwitch);
     window.addEventListener("chat:switch-account", onSwitch);
+    window.addEventListener("chat:logout", onLogout);
     return () => {
-      window.removeEventListener("chat:logout", onLogout);
+      window.removeEventListener("chat:before-switch-account", onBeforeSwitch);
       window.removeEventListener("chat:switch-account", onSwitch);
+      window.removeEventListener("chat:logout", onLogout);
     };
   }, []);
 

@@ -38,7 +38,10 @@ pub fn run() {
             updater::install_update,
             acp_host::acp_host_start,
             acp_host::acp_host_ticket,
-            acp_host::acp_host_stop
+            acp_host::acp_host_stop,
+            acp_host::acp_host_confirm_exec,
+            acp_host::acp_host_local_policy,
+            acp_host::acp_host_set_local_allow_all
         ])
         .setup(|app| {
             tray::install(app.handle())?;

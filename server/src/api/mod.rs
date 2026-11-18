@@ -294,7 +294,7 @@ async fn push_presence(st: &SharedState, from: Uuid, to: Uuid) {
 }
 /// 限流用的客户端 IP。TRUST_PROXY 时取 X-Forwarded-For 最右一跳（代理自己追加的那个），
 /// 否则就是 TCP 对端——挂在代理后面却不开，所有人会共用代理的 IP 和同一个限流窗口。
-fn client_ip(st: &SharedState, headers: &HeaderMap, addr: SocketAddr) -> std::net::IpAddr {
+pub(crate) fn client_ip(st: &SharedState, headers: &HeaderMap, addr: SocketAddr) -> std::net::IpAddr {
     st.cfg
         .trust_proxy
         .then(|| forwarded_ip(headers))
