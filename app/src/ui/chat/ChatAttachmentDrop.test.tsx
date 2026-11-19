@@ -55,6 +55,15 @@ it("cancels URI-only drags on Linux Tauri but not in a web browser", () => {
   const uninstall = installFileDropGuard(window);
   const data = new DataTransfer();
   data.setData("text/uri-list", "");
+  const protectedLink = new DataTransfer();
+  protectedLink.setData("text/uri-list", "");
+  protectedLink.setData("text/plain", "");
+  protectedLink.setData("text/html", "");
+  const readableLink = new DataTransfer();
+  readableLink.setData("text/uri-list", "https://example.org/chat");
+  const readableFile = new DataTransfer();
+  readableFile.setData("text/uri-list", "# file\r\nfile:///home/test.txt\r\n");
+  readableFile.setData("text/plain", "file:///home/test.txt");
   const input = document.createElement("input");
   input.type = "file";
   document.body.appendChild(input);
@@ -66,7 +75,10 @@ it("cancels URI-only drags on Linux Tauri but not in a web browser", () => {
     for (const type of ["dragover", "drop"]) {
       expect(document.body.dispatchEvent(dragEvent(type, data))).toBe(false);
       expect(input.dispatchEvent(dragEvent(type, data))).toBe(true);
+      expect(document.body.dispatchEvent(dragEvent(type, protectedLink))).toBe(true);
     }
+    expect(document.body.dispatchEvent(dragEvent("drop", readableLink))).toBe(true);
+    expect(document.body.dispatchEvent(dragEvent("drop", readableFile))).toBe(false);
   } finally {
     uninstall();
     input.remove();
@@ -117,6 +129,10 @@ it("stages files from the chat header and composer without sending them", async 
     const uriDrag = new DataTransfer();
     Object.defineProperty(uriDrag, "types", { value: ["text/uri-list", "text/html"] });
     const body = host.querySelector(".msg-scroll")!;
+    const linkDrag = new DataTransfer();
+    Object.defineProperty(linkDrag, "types", { value: ["text/plain", "text/html", "text/uri-list"] });
+    expect(body.dispatchEvent(dragEvent("dragenter", linkDrag))).toBe(true);
+    expect(body.dispatchEvent(dragEvent("dragover", linkDrag))).toBe(true);
     expect(nativeInput.hidden).toBe(true);
     body.dispatchEvent(dragEvent("dragenter", uriDrag));
     expect(nativeInput.hidden).toBe(false);
