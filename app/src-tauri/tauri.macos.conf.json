@@ -1,0 +1,6 @@
+{
+  "identifier": "com.chat.desktop",
+  "bundle": {
+    "targets": ["dmg"]
+  }
+}

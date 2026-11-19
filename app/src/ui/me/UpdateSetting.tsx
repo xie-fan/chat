@@ -81,30 +81,42 @@ const UNINSTALL_ONCE = "若安装失败请先卸载旧版再装（仅此一次�
 const OR_BROWSER = "；可重试，或用浏览器下载";
 
 function ShellUpdate() {
-  const android = /Android/i.test(navigator.userAgent);
+  const os = osOfUa(navigator.userAgent);
+  const android = os === "Android";
   const [current, setCurrent] = useState("");
   const [latest, setLatest] = useState<ClientLatest | null>(null);
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(true);
+  const [checked, setChecked] = useState(false);
   const [hint, setHint] = useState("");
   const [flow, setFlow] = useState<ApkFlow>({ phase: "idle" });
   const pollRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     void import("@tauri-apps/api/app").then((m) => m.getVersion()).then(setCurrent);
-    void fetchLatest().then(setLatest);
+    void fetchLatest().then((release) => {
+      setLatest(release);
+      setChecking(false);
+    });
     return () => window.clearInterval(pollRef.current);
   }, []);
 
   if (!current) return null;
   const newer = !!latest && isNewer(latest.version, current);
-  const hasNew =
-    newer &&
-    hasInstaller(
-      osOfUa(navigator.userAgent),
-      latest.assets.map((a) => a.name),
-    );
+  const names = latest?.assets.map((a) => a.name) ?? [];
+  const macPackage = os === "macOS" ? assetFor(os, names) : undefined;
+  const hasNew = newer && (os === "macOS" ? !!macPackage : hasInstaller(os, names));
   // tag 说明第一行常就是版本号，不重复显示
   const notes = latest?.notes.replace(new RegExp(`^v?${latest.version}\\s*\\n`), "").trim();
+
+  const checkUpdate = async () => {
+    setChecking(true);
+    setChecked(false);
+    setHint("");
+    setLatest(await fetchLatest());
+    setChecked(true);
+    setChecking(false);
+  };
 
   /** Browser Download Fallback：同一个 APK 地址交给系统浏览器 */
   const openInBrowser = async () => {
@@ -215,6 +227,9 @@ function ShellUpdate() {
           {/* 安装包还没传完的版本不算「有」 */}
           {latest && ` · 最新版本 ${hasNew ? latest.version : current}`}
           {hasNew && notes && <div style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
+          {checked && !hasNew && (
+            <div>{!latest ? "暂时无法获取更新信息" : newer ? "这个平台暂时没有可用的安装包" : "已是最新版本"}</div>
+          )}
           {android && flow.phase === "downloading" && (
             <div>
               {pct !== null && (
@@ -267,7 +282,22 @@ function ShellUpdate() {
         </>
       }
     >
+      {!android && (
+        <button disabled={checking || busy} onClick={() => void checkUpdate()}>
+          {checking ? "正在检查…" : "检查更新"}
+        </button>
+      )}
+      {hasNew && macPackage && (
+        <button className="primary" onClick={() => {
+          void import("@tauri-apps/plugin-opener")
+            .then(({ openUrl }) => openUrl(downloadUrl(macPackage)))
+            .catch((e) => setHint(errText(e)));
+        }}>
+          下载 macOS 版
+        </button>
+      )}
       {hasNew &&
+        !macPackage &&
         (android ? (
           flow.phase === "downloading" ? (
             <button className="primary" disabled>

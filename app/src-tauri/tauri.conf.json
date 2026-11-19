@@ -11,6 +11,7 @@
     "windows": [
       {
         "title": "Chat",
+        "dragDropEnabled": false,
         "width": 1080,
         "height": 720,
         "minWidth": 760,

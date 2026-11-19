@@ -232,7 +232,7 @@ function imgDim(att: AttachmentView): React.CSSProperties | undefined {
   if (att.width == null || att.height == null) return undefined;
   const d = imageBubbleSize(att.width, att.height);
   if (d.width === 0) return undefined;
-  return { width: d.width, height: d.height };
+  return { width: d.width, height: "auto", aspectRatio: `${att.width} / ${att.height}` };
 }
 
 export default function ChatView() {
@@ -1533,6 +1533,16 @@ export default function ChatView() {
   return (
     <main
       className="chat-view"
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = readonly || msMode || s.editingMessage ? "none" : "copy";
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.files.length) return;
+        e.preventDefault();
+        if (!readonly && !msMode && !s.editingMessage) addPending(e.dataTransfer.files);
+      }}
       // 全视图捕获 pointerType：lastPointer 供 contextmenu 来源判定与
       // openPreview 的幽灵点击豁免（触屏打开才豁免）使用，不限于气泡区域
       onPointerDownCapture={(e) => {
@@ -1998,7 +2008,14 @@ export default function ChatView() {
                             onErr={setMutErr}
                           />
                         ) : (
-                          showText(m) && <RichText text={m.content} mentions={!m.forwarded_from} />
+                          showText(m) && (
+                            <RichText
+                              text={m.content}
+                              mentions={m.forwarded_from || !m.mentions.length ? false : new Set(
+                                members.filter(({ user }) => m.mentions.includes(user.id)).map(({ user }) => user.username),
+                              )}
+                            />
+                          )
                         )}
                         {m.edited_at && <span className="edited-mark">（已编辑）</span>}
                       </div>

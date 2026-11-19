@@ -1236,9 +1236,6 @@ async fn upload_acp_file(
         &["session_id"],
     )
     .await?;
-    if rd.too_large {
-        return Err(AppError::bad_request("file too large"));
-    }
     if rd.over_quota {
         return Err(AppError::payload_too_large(quota_message(
             used_bytes, quota_mb,

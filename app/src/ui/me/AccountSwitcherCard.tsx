@@ -10,12 +10,14 @@ import {
   switchToAccount,
   type SavedAccount,
 } from "../../api";
+import { useApp } from "../../store";
 import Avatar from "../Avatar";
 import { confirmDialog } from "../Modal";
 import { PlusIcon, TrashIcon, XIcon } from "../icons";
 
 /** 账号与安全页的多账号切换卡片：支持同站或跨服务器添加多个账号，一键秒切。 */
 export default function AccountSwitcherCard() {
+  const { me } = useApp();
   const [accounts, setAccounts] = useState<SavedAccount[]>(() => savedAccounts());
   const curId = currentAccountId();
   const [modalOpen, setModalOpen] = useState(false);
@@ -94,21 +96,22 @@ export default function AccountSwitcherCard() {
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {accounts.map((acc) => {
           const active = acc.id === curId;
+          const user = active && me?.id === acc.user.id ? me : acc.user;
           const svLabel = acc.serverName || serverLabel(acc.serverUrl);
           return (
             <div key={acc.id} className={`account-card${active ? " active" : ""}`}>
               <Avatar
                 size="sm"
-                userId={acc.user.id}
-                name={acc.user.display_name}
-                avatarVersion={acc.user.avatar_version}
-                hasAvatar={acc.user.has_avatar}
+                userId={user.id}
+                name={user.display_name}
+                avatarVersion={user.avatar_version}
+                hasAvatar={user.has_avatar}
               />
               <div className="account-meta">
                 <div className="account-name">
-                  <span>{acc.user.display_name || acc.user.username}</span>
+                  <span>{user.display_name || user.username}</span>
                   <span className="muted" style={{ fontWeight: 400, fontSize: 12 }}>
-                    @{acc.user.username}
+                    @{user.username}
                   </span>
                   {active && <span className="account-tag">当前使用</span>}
                 </div>

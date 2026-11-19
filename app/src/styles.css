@@ -434,11 +434,11 @@ button.ctx-item:hover { background: var(--bg); }
 .bubble.pending { opacity: 0.6; }
 .send-fail { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--danger); }
 .send-fail button { font-size: 12px; padding: 1px 8px; }
-.msg-img { display: block; max-width: 240px; max-height: 240px; border-radius: 4px; cursor: zoom-in; }
+.msg-img { display: block; max-width: min(100%, 240px); max-height: 240px; border-radius: 4px; cursor: zoom-in; }
 /* 复用发送的乐观气泡：objectURL 未取回时的中性占位（不请求已撤回的公共 URL） */
 .msg-img-ph {
   display: flex; align-items: center; justify-content: center;
-  width: 160px; height: 100px; max-width: 240px; max-height: 240px;
+  width: 160px; height: 100px; max-width: min(100%, 240px); max-height: 240px;
   border-radius: 4px; background: var(--line); font-size: 26px; opacity: 0.7;
 }
 .msg-file {

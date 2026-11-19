@@ -94,7 +94,6 @@ pub(crate) struct UploadRead {
     pub file_name: String,
     pub mime: String,
     pub file: Option<TempUpload>,
-    pub too_large: bool,
     pub over_quota: bool,
 }
 
@@ -115,18 +114,31 @@ pub(crate) async fn read_upload(
     text_fields: &[&'static str],
 ) -> AppResult<UploadRead> {
     use tokio::io::AsyncWriteExt;
+    let size_error = || {
+        AppError::payload_too_large(format!(
+            "文件大小不能超过 {} MB",
+            max_bytes / (1024 * 1024)
+        ))
+    };
+    let multipart_error = |e: axum::extract::multipart::MultipartError| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            size_error()
+        } else {
+            AppError::bad_request("无效的上传表单")
+        }
+    };
+    let mut too_large = false;
     let mut rd = UploadRead {
         fields: std::collections::HashMap::new(),
         file_name: "file".to_string(),
         mime: "application/octet-stream".to_string(),
         file: None,
-        too_large: false,
         over_quota: false,
     };
     while let Some(mut field) = mp
         .next_field()
         .await
-        .map_err(|e| AppError::bad_request(format!("bad multipart: {e}")))?
+        .map_err(multipart_error)?
     {
         let name = field.name().unwrap_or_default().to_string();
         if name == "file" && rd.file.is_none() {
@@ -148,15 +160,15 @@ pub(crate) async fn read_upload(
             while let Some(chunk) = field
                 .chunk()
                 .await
-                .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
+                .map_err(multipart_error)?
             {
-                if rd.too_large || rd.over_quota {
+                if too_large {
                     continue; // 排空剩余 body，保证错误响应能送达
                 }
                 tmp.size += chunk.len();
                 if tmp.size > max_bytes {
-                    rd.too_large = true;
-                } else if quota_bytes.is_some_and(|qb| used_bytes + tmp.size as i64 > qb) {
+                    too_large = true;
+                } else if rd.over_quota || quota_bytes.is_some_and(|qb| used_bytes + tmp.size as i64 > qb) {
                     rd.over_quota = true;
                 } else {
                     f.write_all(&chunk)
@@ -167,16 +179,19 @@ pub(crate) async fn read_upload(
             f.flush()
                 .await
                 .map_err(|e| AppError::internal(format!("store file: {e}")))?;
-            if !rd.too_large && !rd.over_quota {
+            if !too_large && !rd.over_quota {
                 rd.file = Some(tmp);
             }
         } else if text_fields.contains(&name.as_str()) {
             let v = field
                 .text()
                 .await
-                .map_err(|_| AppError::bad_request(format!("bad {name}")))?;
+                .map_err(multipart_error)?;
             rd.fields.insert(name, v);
         }
+    }
+    if too_large {
+        return Err(size_error());
     }
     Ok(rd)
 }
@@ -282,9 +297,6 @@ pub(super) async fn upload_file(
         &["conversation_id", "duration_ms"],
     )
     .await?;
-    if rd.too_large {
-        return Err(AppError::bad_request("file too large"));
-    }
     if rd.over_quota {
         return Err(AppError::payload_too_large(quota_message(
             used_bytes, quota_mb,

@@ -84,16 +84,19 @@ function splitInline(text: string): ({ t: "raw"; text: string } | Extract<Token,
   return out;
 }
 
-/** 最后切链接与 @（仅普通文本段）；withMentions=false 时 @ 按纯文本处理（MF2 记录/转发文本） */
-function splitRich(text: string, withMentions: boolean): Token[] {
+type MentionNames = boolean | ReadonlySet<string>;
+
+/** 最后切链接与 @（仅普通文本段）；mentions=false 时 @ 按纯文本处理（MF2 记录/转发文本） */
+function splitRich(text: string, mentions: MentionNames): Token[] {
   const out: Token[] = [];
   const pushMentions = (s: string) => {
-    if (!withMentions) {
+    if (mentions === false) {
       if (s) out.push({ t: "text", text: s });
       return;
     }
     let p = 0;
     for (const m of s.matchAll(RE_MENTION)) {
+      if (mentions !== true && !mentions.has(m[0].slice(1))) continue;
       if (m.index > p) out.push({ t: "text", text: s.slice(p, m.index) });
       out.push({ t: "mention", text: m[0] });
       p = m.index + m[0].length;
@@ -118,7 +121,7 @@ function splitRich(text: string, withMentions: boolean): Token[] {
   return out;
 }
 
-export function tokenize(text: string, opts: { mentions?: boolean } = {}): Token[] {
+export function tokenize(text: string, opts: { mentions?: MentionNames } = {}): Token[] {
   const out: Token[] = [];
   const push = (t: Token) => {
     const last = out[out.length - 1];
@@ -140,7 +143,7 @@ export function tokenize(text: string, opts: { mentions?: boolean } = {}): Token
         push(s2);
         continue;
       }
-      for (const s3 of splitRich(s2.text, opts.mentions !== false)) push(s3);
+      for (const s3 of splitRich(s2.text, opts.mentions ?? true)) push(s3);
     }
   }
   return out;
@@ -199,7 +202,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   );
 }
 
-export default function RichText({ text, mentions = true }: { text: string; mentions?: boolean }) {
+export default function RichText({ text, mentions = false }: { text: string; mentions?: MentionNames }) {
   return (
     <>
       {tokenize(text, { mentions }).map((tok, i) => {

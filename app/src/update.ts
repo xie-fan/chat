@@ -49,12 +49,13 @@ export function assetLabel(name: string): string | null {
   if (name.endsWith(".apk")) return "Android";
   if (name.endsWith(".deb")) return "Linux（deb）";
   if (name.endsWith(".AppImage")) return "Linux（AppImage）";
+  if (name.endsWith(".dmg")) return "macOS";
   return name;
 }
 
-/** 按 osOfUa 的结果挑推荐安装包；没有对应平台（macOS、iOS）→ undefined */
+/** 按 osOfUa 的结果挑推荐安装包；没有对应平台 → undefined */
 export function assetFor(os: string, names: string[]): string | undefined {
-  const suffix = ({ Windows: "-setup.exe", Android: ".apk", Linux: ".AppImage" } as Record<string, string>)[os];
+  const suffix = ({ Windows: "-setup.exe", Android: ".apk", Linux: ".AppImage", macOS: ".dmg" } as Record<string, string>)[os];
   return suffix ? names.find((n) => n.endsWith(suffix)) : undefined;
 }
 

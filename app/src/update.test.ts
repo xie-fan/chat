@@ -31,12 +31,13 @@ describe("安装包挑选", () => {
     "Chat_0.2.0_arm64.apk",
     "Chat_0.2.0_x64-setup.exe",
     "Chat_0.2.0_x64-setup.exe.sig",
+    "Chat_0.2.0_universal.dmg",
   ];
   it.each([
     ["Windows", "Chat_0.2.0_x64-setup.exe"],
     ["Android", "Chat_0.2.0_arm64.apk"],
     ["Linux", "Chat_0.2.0_amd64.AppImage"],
-    ["macOS", undefined],
+    ["macOS", "Chat_0.2.0_universal.dmg"],
     ["iOS", undefined],
   ])("%s → %s", (os, want) => {
     expect(assetFor(os, names)).toBe(want);
@@ -47,6 +48,7 @@ describe("安装包挑选", () => {
       "Linux（deb）",
       "Android",
       "Windows",
+      "macOS",
     ]);
   });
 });
@@ -58,6 +60,7 @@ describe("hasInstaller", () => {
     expect(hasInstaller("Windows", linuxOnly)).toBe(false);
     expect(hasInstaller("Windows", ["Chat_0.2.1_x64-setup.exe"])).toBe(false);
     expect(hasInstaller("Android", ["Chat_0.2.1.apk"])).toBe(true);
+    expect(hasInstaller("macOS", ["Chat_0.2.1_universal.dmg"])).toBe(false);
   });
 });
 

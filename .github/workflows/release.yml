@@ -461,9 +461,53 @@ jobs:
           b=app/src-tauri/target/release/bundle
           gh release upload "$TAG" $b/deb/*.deb $b/deb/*.deb.sig $b/appimage/*.AppImage $b/appimage/*.AppImage.sig --clobber
 
+  macos:
+    needs: [gate, draft]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' }}
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - name: macOS 通用安装包（DMG）
+        working-directory: app
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: pnpm tauri build --target universal-apple-darwin
+      - name: 上传 DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+          case "$is_draft" in
+            true) ;;
+            false) echo "::notice::Release $TAG 已发布，跳过上传"; exit 0 ;;
+            *) echo "::error::isDraft 返回异常值：$is_draft"; exit 1 ;;
+          esac
+          ver=${TAG#v}
+          b=app/src-tauri/target/universal-apple-darwin/release/bundle/dmg
+          gh release upload "$TAG" "$b/Chat_${ver}_universal.dmg" --clobber
+
   publish:
-    needs: [gate, draft, windows, android, linux]
-    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' && needs.windows.result == 'success' && needs.android.result == 'success' && needs.linux.result == 'success' }}
+    needs: [gate, draft, windows, android, linux, macos]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' && needs.windows.result == 'success' && needs.android.result == 'success' && needs.linux.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -472,7 +516,7 @@ jobs:
       # 本 job 不 checkout，gh 需要显式指定仓库
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: 七个产物齐了才公开
+      - name: 八个产物齐了才公开
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -495,7 +539,8 @@ jobs:
             "Chat_${ver}_amd64.deb" \
             "Chat_${ver}_amd64.deb.sig" \
             "Chat_${ver}_amd64.AppImage" \
-            "Chat_${ver}_amd64.AppImage.sig" | sort)
+            "Chat_${ver}_amd64.AppImage.sig" \
+            "Chat_${ver}_universal.dmg" | sort)
           missing=$(comm -23 <(echo "$want") <(echo "$have"))
           [ -z "$missing" ] || { echo "::error::Release 还缺这些文件：$missing"; exit 1; }
           # --latest 只给版本号最高的 Release；旧线 hotfix 发版不抢 latest

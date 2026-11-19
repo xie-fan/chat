@@ -93,6 +93,13 @@ describe("tokenize 链接", () => {
     ]);
   });
 
+  it("只高亮服务端确认的完整用户名", () => {
+    expect(tokenize("@bo @bobby @bob", { mentions: new Set(["bob"]) })).toEqual([
+      { t: "text", text: "@bo @bobby " },
+      { t: "mention", text: "@bob" },
+    ]);
+  });
+
   it("非 http/https 协议不产生链接", () => {
     expect(tokenize("javascript:alert(1)")).toEqual([
       { t: "text", text: "javascript:alert(1)" },

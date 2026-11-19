@@ -60,6 +60,7 @@ const UA = {
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
   windows:
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  linux: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 Safari/605.1.15",
 };
 
 let host: HTMLDivElement;
@@ -186,6 +187,27 @@ describe("Android UpdateSetting → In-app APK Installer", () => {
 });
 
 describe("非 Android 平台不变", () => {
+  it("Linux 没有更新时仍可检查，并可发现后来发布的安装包", async () => {
+    const appImage = "Chat_0.7.1_amd64.AppImage";
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...LATEST, version: "0.7.0" }),
+    } as Response);
+    await renderOn(UA.linux);
+    expect(btn("更新并重启")).toBeUndefined();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...LATEST,
+        assets: [appImage, `${appImage}.sig`].map((name) => ({ name, size: 1 })),
+      }),
+    } as Response);
+    click(btn("检查更新"));
+    await flush();
+    expect(btn("更新并重启")).toBeTruthy();
+    expect(callsOf("install_update")).toHaveLength(0);
+  });
+
   it("桌面端仍是「更新并重启」→ install_update", async () => {
     stubCommands();
     await renderOn(UA.windows);
@@ -193,5 +215,19 @@ describe("非 Android 平台不变", () => {
     await flush();
     expect(callsOf("install_update")).toHaveLength(1);
     expect(callsOf("download_update_apk")).toHaveLength(0);
+  });
+
+  it("macOS 提供 DMG 手动下载而不是自动安装", async () => {
+    const name = "Chat_0.7.1_universal.dmg";
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...LATEST, assets: [{ name, size: 1 }] }),
+    } as Response);
+    await renderOn("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)");
+    expect(btn("更新并重启")).toBeUndefined();
+    click(btn("下载 macOS 版"));
+    await flush();
+    expect(openUrl).toHaveBeenCalledWith(expect.stringContaining(`/v1/client/download/${name}`));
+    expect(callsOf("install_update")).toHaveLength(0);
   });
 });
