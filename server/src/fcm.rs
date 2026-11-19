@@ -1,0 +1,374 @@
+use crate::{
+    auth::require_auth,
+    error::{AppError, AppResult},
+    model::MessageView,
+    state::SharedState,
+};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
+
+#[derive(Deserialize)]
+struct ServiceAccount {
+    project_id: String,
+    client_email: String,
+    private_key: String,
+}
+
+pub(crate) struct Fcm {
+    project: String,
+    client_email: String,
+    key: EncodingKey,
+    client: reqwest::Client,
+    oauth: Mutex<Option<(String, Instant)>>,
+}
+
+#[derive(Serialize)]
+struct GoogleClaims<'a> {
+    iss: &'a str,
+    scope: &'static str,
+    aud: &'static str,
+    iat: i64,
+    exp: i64,
+}
+
+#[derive(Deserialize)]
+struct GoogleToken {
+    access_token: String,
+    expires_in: u64,
+}
+
+impl Fcm {
+    pub(crate) fn from_env() -> Option<Self> {
+        let path = std::env::var_os("CHAT_FCM_SERVICE_ACCOUNT_FILE")?;
+        let loaded = std::fs::read(path)
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .and_then(Self::new);
+        if loaded.is_none() {
+            tracing::warn!("invalid CHAT_FCM_SERVICE_ACCOUNT_FILE; Android push disabled");
+        }
+        loaded
+    }
+
+    fn new(account: ServiceAccount) -> Option<Self> {
+        if account.project_id.is_empty()
+            || !account
+                .project_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || account.client_email.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            project: account.project_id,
+            client_email: account.client_email,
+            key: EncodingKey::from_rsa_pem(account.private_key.as_bytes()).ok()?,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .build()
+                .ok()?,
+            oauth: Mutex::new(None),
+        })
+    }
+
+    async fn access_token(&self) -> Result<String, &'static str> {
+        let mut cache = self.oauth.lock().await;
+        if let Some((token, expires)) = &*cache {
+            if *expires > Instant::now() {
+                return Ok(token.clone());
+            }
+        }
+        let now = chrono::Utc::now().timestamp();
+        let assertion = jsonwebtoken::encode(
+            &Header::new(Algorithm::RS256),
+            &GoogleClaims {
+                iss: &self.client_email,
+                scope: FCM_SCOPE,
+                aud: TOKEN_URL,
+                iat: now,
+                exp: now + 3600,
+            },
+            &self.key,
+        )
+        .map_err(|_| "service-account JWT signing failed")?;
+        let response = self
+            .client
+            .post(TOKEN_URL)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", &assertion),
+            ])
+            .send()
+            .await
+            .map_err(|_| "Google OAuth request failed")?
+            .error_for_status()
+            .map_err(|_| "Google OAuth rejected the service account")?
+            .json::<GoogleToken>()
+            .await
+            .map_err(|_| "invalid Google OAuth response")?;
+        let ttl = response.expires_in.saturating_sub(60).min(3600);
+        let token = response.access_token;
+        *cache = Some((token.clone(), Instant::now() + Duration::from_secs(ttl)));
+        Ok(token)
+    }
+
+    async fn send(&self, payload: Value) -> Result<bool, &'static str> {
+        let access = self.access_token().await?;
+        let response = self
+            .client
+            .post(format!(
+                "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+                self.project
+            ))
+            .bearer_auth(access)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|_| "FCM send request failed")?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            *self.oauth.lock().await = None;
+        }
+        if status == StatusCode::NOT_FOUND
+            && response.json::<Value>().await.is_ok_and(|body| {
+                body["error"]["details"]
+                    .as_array()
+                    .is_some_and(|details| details.iter().any(|d| d["errorCode"] == "UNREGISTERED"))
+            })
+        {
+            return Ok(false);
+        }
+        Err("FCM rejected the push request")
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Registration {
+    token: String,
+    binding: Uuid,
+    project: String,
+}
+
+pub(crate) async fn register(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<Registration>,
+) -> AppResult<StatusCode> {
+    let auth = require_auth(&st, &headers).await?;
+    let sid = auth
+        .sid
+        .ok_or_else(|| AppError::unauthorized("please login again"))?;
+    if st.fcm.as_ref().is_none_or(|fcm| fcm.project != req.project) {
+        return Err(AppError::not_found("Android push unavailable"));
+    }
+    if req.token.is_empty()
+        || req.token.len() > 1024
+        || !req.token.bytes().all(|b| b.is_ascii_graphic())
+        || req.binding.is_nil()
+    {
+        return Err(AppError::bad_request("invalid Android push registration"));
+    }
+    save_registration(&st.pool, sid, &req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn save_registration(pool: &sqlx::PgPool, sid: Uuid, req: &Registration) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    let active = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM sessions WHERE id = $1 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(sid)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if active.is_none() {
+        return Err(AppError::unauthorized("session revoked"));
+    }
+    sqlx::query("DELETE FROM android_fcm_devices WHERE session_id = $1 AND token <> $2")
+        .bind(sid)
+        .bind(&req.token)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO android_fcm_devices (token, session_id, binding) VALUES ($1, $2, $3)
+         ON CONFLICT (token) DO UPDATE SET session_id = EXCLUDED.session_id, binding = EXCLUDED.binding",
+    )
+    .bind(&req.token)
+    .bind(sid)
+    .bind(req.binding)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) fn schedule(st: &SharedState, msg: &MessageView) {
+    if st.fcm.is_none() {
+        return;
+    }
+    let (st, msg) = (st.clone(), msg.clone());
+    tokio::spawn(async move {
+        if dispatch(&st, &msg).await.is_err() {
+            tracing::warn!("could not query Android push recipients");
+        }
+    });
+}
+
+async fn dispatch(st: &SharedState, msg: &MessageView) -> AppResult<()> {
+    let Some(fcm) = &st.fcm else { return Ok(()) };
+    let devices = recipients(&st.pool, msg.conversation_id, msg.sender_id, msg.seq).await?;
+    for (token, sid, binding) in devices {
+        match fcm
+            .send(payload(&token, binding, msg.conversation_id, msg.id))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                sqlx::query(
+                    "DELETE FROM android_fcm_devices WHERE token = $1 AND session_id = $2 AND binding = $3",
+                )
+                .bind(&token)
+                .bind(sid)
+                .bind(binding)
+                .execute(&st.pool)
+                .await?;
+            }
+            Err(error) => tracing::warn!(error, "Android push failed"),
+        }
+    }
+    Ok(())
+}
+
+async fn recipients(
+    pool: &sqlx::PgPool,
+    conv: Uuid,
+    sender: Uuid,
+    seq: i64,
+) -> sqlx::Result<Vec<(String, Uuid, Uuid)>> {
+    sqlx::query_as(
+        "SELECT d.token, d.session_id, d.binding
+           FROM android_fcm_devices d
+           JOIN sessions s ON s.id = d.session_id AND s.revoked_at IS NULL
+           JOIN users u ON u.id = s.user_id AND u.disabled_at IS NULL
+           JOIN memberships m ON m.user_id = s.user_id AND m.conversation_id = $1
+           JOIN conversations c ON c.id = m.conversation_id AND c.type = 'dm'
+           LEFT JOIN conversation_preferences p
+             ON p.conversation_id = m.conversation_id AND p.user_id = m.user_id
+          WHERE m.user_id <> $2 AND m.last_read_seq < $3
+            AND NOT COALESCE(p.mute_forever, false)
+            AND (p.muted_until IS NULL OR p.muted_until <= now())
+            AND EXISTS (
+                 SELECT 1 FROM refresh_tokens r WHERE r.session_id = s.id
+                   AND r.revoked_at IS NULL AND r.expires_at > now())",
+    )
+    .bind(conv)
+    .bind(sender)
+    .bind(seq)
+    .fetch_all(pool)
+    .await
+}
+
+fn payload(token: &str, binding: Uuid, conv_id: Uuid, msg_id: Uuid) -> Value {
+    json!({
+        "message": {
+            "token": token,
+            "data": {
+                "binding": binding.to_string(),
+                "convId": conv_id.to_string(),
+                "messageId": msg_id.to_string(),
+            },
+            "android": { "priority": "HIGH", "ttl": "300s" },
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn sends_only_to_eligible_dm_sessions_and_replaces_refreshed_tokens(pool: sqlx::PgPool) {
+        let uid: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (username, display_name, password_hash)
+             VALUES ('fcm_test', 'Test', 'unused') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let sid: Uuid =
+            sqlx::query_scalar("INSERT INTO sessions (user_id) VALUES ($1) RETURNING id")
+                .bind(uid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO refresh_tokens (user_id, session_id, token_hash, expires_at)
+                     VALUES ($1, $2, 'unused', now() + interval '1 hour')",
+        )
+        .bind(uid)
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let conv: Uuid =
+            sqlx::query_scalar("INSERT INTO conversations (type) VALUES ('dm') RETURNING id")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO memberships (conversation_id, user_id) VALUES ($1, $2)")
+            .bind(conv)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut reg = Registration {
+            token: "first".into(),
+            binding: Uuid::new_v4(),
+            project: "test".into(),
+        };
+        save_registration(&pool, sid, &reg).await.unwrap();
+        reg.token = "second".into();
+        save_registration(&pool, sid, &reg).await.unwrap();
+        let sender = Uuid::new_v4();
+        assert_eq!(
+            recipients(&pool, conv, sender, 1).await.unwrap(),
+            vec![(reg.token, sid, reg.binding)]
+        );
+        assert!(recipients(&pool, conv, uid, 1).await.unwrap().is_empty());
+        assert!(recipients(&pool, conv, sender, 0).await.unwrap().is_empty());
+        sqlx::query("UPDATE sessions SET revoked_at = now() WHERE id = $1")
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(recipients(&pool, conv, sender, 1).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_message_keeps_notification_rendering_and_content_on_device() {
+        let (binding, conv, msg) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let data = payload("token", binding, conv, msg);
+        let message = &data["message"];
+        assert_eq!(message["android"]["priority"], "HIGH");
+        assert!(message.get("notification").is_none());
+        assert_eq!(
+            message["data"],
+            json!({"binding": binding.to_string(), "convId": conv.to_string(), "messageId": msg.to_string()})
+        );
+    }
+}

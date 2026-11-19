@@ -59,6 +59,8 @@ git pull --ff-only && docker compose up -d --build  # 更新
 
 环境变量（compose 自动读本目录 `.env`，全部字段见 [.env.example](.env.example)）：`DATABASE_URL`、`JWT_SECRET`（必填，至少 32 个字符；不设置服务端拒绝启动。换掉后已登录的设备会自动刷新凭据，不用重新登录）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。挂在 nginx / Caddy 等反向代理后面时设 `TRUST_PROXY=1`，登录 / 注册限流按 `X-Forwarded-For` 认客户端 IP；直接对外时不要设，否则谁都能伪造这个头绕过限流。
 
+Android FCM 后台私聊通知（可选）：将 [Firebase 服务账号 JSON 密钥](docs/release-runners.md#androidfcm-后台私聊通知可选) 存在仓库外（例如 `/etc/chat/secrets/chat-fcm-service-account.json`），在 `.env` 设置 `CHAT_FCM_SERVICE_ACCOUNT_HOST_FILE` 为该宿主机绝对路径，`CHAT_FCM_SERVICE_ACCOUNT_FILE=/run/secrets/chat-fcm-service-account.json` 为容器内路径。复制 `docker-compose.override.yml.example` 到 `docker-compose.override.yml`（Git 忽略），就会把该文件只读挂载给服务端。直接运行 `./scripts/run.sh` 或 `docker compose up -d --build`，Compose 会自动加载该覆盖文件。不启用 FCM 时，不设置这些变量，也不创建覆盖文件；原有部署无需改动。
+
 ## 开发
 
 ```bash

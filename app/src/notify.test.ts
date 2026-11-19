@@ -256,11 +256,13 @@ describe("本机通知设置", () => {
   });
 
   it("defaults on in the native app and remembers an explicit opt-out", () => {
-    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {}, dispatchEvent });
     expect(notifyEnabled()).toBe(true);
     setNotifyEnabled(false);
     expect(localStorage.getItem("chat_notify_enabled")).toBe("0");
     expect(notifyEnabled()).toBe(false);
+    expect(dispatchEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "chat:android-push-settings" }));
   });
 
   it("localStorage 异常时读写不抛、回落默认值", () => {
@@ -330,6 +332,7 @@ describe("native notifications", () => {
       body: "Other: hello",
       target: { convId: "c", session: session() },
       androidAccount: accountIdOf(getServer(), me.id),
+      androidMessageId: "m1",
     });
   });
 

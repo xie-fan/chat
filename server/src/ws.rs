@@ -313,6 +313,7 @@ pub async fn broadcast_posted_push(
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
         if with_push {
             crate::push::schedule(st, conv, posted);
+            crate::fcm::schedule(st, &posted.message);
         }
         crate::api::dispatch_bots(st, conv, &posted.message);
     }

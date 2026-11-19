@@ -60,6 +60,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub cfg: Config,
     pub(crate) client_latest: tokio::sync::Mutex<Option<crate::client_update::CachedLatest>>,
+    pub(crate) fcm: Option<crate::fcm::Fcm>,
     pub conns: ConnMap,
     /// ACP 宿主节点在线连接：host_id -> AcpHostConn
     pub acp_hosts: DashMap<Uuid, AcpHostConn>,
@@ -95,10 +96,15 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(pool: PgPool, cfg: Config) -> SharedState {
+        Self::new_with_fcm(pool, cfg, None)
+    }
+
+    pub(crate) fn new_with_fcm(pool: PgPool, cfg: Config, fcm: Option<crate::fcm::Fcm>) -> SharedState {
         Arc::new(Self {
             pool,
             cfg,
             client_latest: Default::default(),
+            fcm,
             conns: DashMap::new(),
             acp_hosts: DashMap::new(),
             acp_rpc_wait: DashMap::new(),

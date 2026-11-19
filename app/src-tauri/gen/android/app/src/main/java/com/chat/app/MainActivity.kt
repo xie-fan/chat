@@ -12,8 +12,7 @@ class MainActivity : TauriActivity() {
   private var pendingNotification: NotificationOpen? = null
   private var notificationListener: Pair<String, Channel>? = null
 
-  var chatResumed = false
-    private set
+  private var chatResumed = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
@@ -58,11 +57,18 @@ class MainActivity : TauriActivity() {
   override fun onResume() {
     super.onResume()
     chatResumed = true
+    ChatSystemNotification.foreground = hasWindowFocus()
   }
 
   override fun onPause() {
     chatResumed = false
+    ChatSystemNotification.foreground = false
     super.onPause()
+  }
+
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+    super.onWindowFocusChanged(hasFocus)
+    ChatSystemNotification.foreground = chatResumed && hasFocus
   }
 }
 

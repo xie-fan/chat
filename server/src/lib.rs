@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod error;
+mod fcm;
 pub mod media;
 pub mod model;
 pub mod push;
@@ -95,7 +96,7 @@ pub async fn run() {
         tracing::warn!(error = %e, "failed to reset stale acp state on startup");
     }
 
-    let state = AppState::new(pool.clone(), cfg.clone());
+    let state = AppState::new_with_fcm(pool.clone(), cfg.clone(), fcm::Fcm::from_env());
     let app = build_router(state, &cfg);
 
     // 撤回附件 & 未关联的过期 ACP 附件定时清扫（默认每小时）：
