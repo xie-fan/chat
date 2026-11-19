@@ -2,9 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { watchIdentity } from "./api";
+import { installFileDropGuard } from "./fileDrop";
 import { flushDrafts } from "./store";
 import { applyAccent, applyTheme, readAccentChoice, readThemeChoice } from "./theme";
 import "./styles.css";
+
+installFileDropGuard(window);
 
 // 主题在 React 渲染前应用，避免先白后黑闪一下（system = 不设 data-theme，媒体查询接管）
 applyTheme(readThemeChoice(localStorage));

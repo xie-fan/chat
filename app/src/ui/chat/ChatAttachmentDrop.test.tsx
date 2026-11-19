@@ -2,11 +2,37 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
+import { installFileDropGuard } from "../../fileDrop";
 import { resetSessionState, setState } from "../../store";
 import type { ConversationView } from "../../types";
 import ChatView from "./ChatView";
 
-it("stages files dropped onto an open chat without sending them", async () => {
+function dragEvent(type: string, dataTransfer: DataTransfer) {
+  return Object.assign(
+    new Event(type, { bubbles: true, cancelable: true }),
+    { dataTransfer },
+  );
+}
+
+it("prevents browser file handling outside chat before mounting React, without canceling text drags", () => {
+  const uninstall = installFileDropGuard(window);
+  const fileDrag = new DataTransfer();
+  Object.defineProperty(fileDrag, "types", { value: ["Files"] });
+  const fileDrop = new DataTransfer();
+  fileDrop.items.add(new File(["hi"], "outside.txt"));
+  const textDrag = new DataTransfer();
+  textDrag.setData("text/plain", "text");
+  try {
+    for (const [type, data] of [["dragover", fileDrag], ["drop", fileDrop]] as const) {
+      expect(document.body.dispatchEvent(dragEvent(type, data))).toBe(false);
+      expect(document.body.dispatchEvent(dragEvent(type, textDrag))).toBe(true);
+    }
+  } finally {
+    uninstall();
+  }
+});
+
+it("stages files from the chat header and composer without sending them", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL) =>
     Response.json(String(url).endsWith("/pins") ? [] : {}),
@@ -16,32 +42,38 @@ it("stages files dropped onto an open chat without sending them", async () => {
     last_seq: 0, unread_count: 0, has_mention: false, last_message: null, created_at: "",
   };
   const host = document.createElement("div");
+  document.body.appendChild(host);
   const root = createRoot(host);
+  const uninstall = installFileDropGuard(window);
   try {
     await act(async () => {
       setState({ activeConv: conv.id, conversations: [conv], historyLoaded: { [conv.id]: true } });
       root.render(<ChatView />);
     });
-    const chat = host.querySelector(".chat-view")!;
-    const data = new DataTransfer();
-    data.items.add(new File(["hi"], "dropped.txt", { type: "text/plain" }));
-    Object.defineProperty(data, "types", { value: ["Files"] });
-    const dragEvent = (type: string) => Object.assign(
-      new Event(type, { bubbles: true, cancelable: true }),
-      { dataTransfer: data },
-    );
-    const dragOver = dragEvent("dragover");
-    const drop = dragEvent("drop");
+    const names = ["header.txt", "composer.txt"];
+    const targets = [".chat-head .chat-head-main", ".composer textarea"];
     act(() => {
-      chat.dispatchEvent(dragOver);
-      chat.dispatchEvent(drop);
+      for (const [i, selector] of targets.entries()) {
+        const target = host.querySelector(selector)!;
+        const data = new DataTransfer();
+        const liveFiles = [new File(["hi"], names[i])];
+        Object.defineProperties(data, {
+          types: { value: ["Files"] },
+          files: { value: liveFiles },
+        });
+        expect(target.dispatchEvent(dragEvent("dragover", data))).toBe(false);
+        expect(data.dropEffect).toBe("copy");
+        expect(target.dispatchEvent(dragEvent("drop", data))).toBe(false);
+        liveFiles.length = 0;
+      }
     });
-    expect(dragOver.defaultPrevented).toBe(true);
-    expect(drop.defaultPrevented).toBe(true);
-    expect(host.querySelector(".pending-files .pf-name")?.textContent).toBe("dropped.txt");
+    expect(Array.from(host.querySelectorAll(".pending-files .pf-name"), (el) => el.textContent))
+      .toEqual(names);
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith("/v1/files"))).toBe(false);
   } finally {
     act(() => root.unmount());
+    host.remove();
+    uninstall();
     setState(resetSessionState());
     vi.unstubAllGlobals();
   }

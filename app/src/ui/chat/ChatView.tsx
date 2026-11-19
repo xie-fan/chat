@@ -20,6 +20,7 @@ import {
 import { copyPlainText } from "../../clipboard";
 import { saveAttachment } from "../../download";
 import { unsentText, type DraftReuse } from "../../drafts";
+import { isFileDrag } from "../../fileDrop";
 import {
   REEDIT_WINDOW_MS,
   patchReedit,
@@ -1393,7 +1394,8 @@ export default function ChatView() {
   };
 
   const addPending = (list: Iterable<File>) => {
-    setPendingFiles((p) => [...p, ...Array.from(list)]);
+    const picked = Array.from(list);
+    setPendingFiles((p) => [...p, ...picked]);
   };
 
   // @补全：群成员（用户名前缀或昵称包含）
@@ -1533,12 +1535,12 @@ export default function ChatView() {
   return (
     <main
       className="chat-view"
-      onDragOver={(e) => {
-        if (!e.dataTransfer.types.includes("Files")) return;
+      onDragOverCapture={(e) => {
+        if (!isFileDrag(e.dataTransfer)) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = readonly || msMode || s.editingMessage ? "none" : "copy";
       }}
-      onDrop={(e) => {
+      onDropCapture={(e) => {
         if (!e.dataTransfer.files.length) return;
         e.preventDefault();
         if (!readonly && !msMode && !s.editingMessage) addPending(e.dataTransfer.files);
