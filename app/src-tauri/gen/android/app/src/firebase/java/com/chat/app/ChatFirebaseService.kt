@@ -7,7 +7,7 @@ import com.google.firebase.messaging.RemoteMessage
 
 class ChatFirebaseService : FirebaseMessagingService() {
   override fun onNewToken(token: String) {
-    FirebasePushToken.refreshed(token)
+    FirebasePushToken.refreshed(this, token)
   }
 
   override fun onMessageReceived(message: RemoteMessage) {

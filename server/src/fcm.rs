@@ -159,10 +159,13 @@ impl Fcm {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Registration {
     token: String,
     binding: Uuid,
     project: String,
+    rotation_key: String,
+    generation: i64,
 }
 
 pub(crate) async fn register(
@@ -174,6 +177,29 @@ pub(crate) async fn register(
     let sid = auth
         .sid
         .ok_or_else(|| AppError::unauthorized("please login again"))?;
+    validate_registration(&st, &req)?;
+    save_registration(&st.pool, sid, &req, false).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn rotate(
+    State(st): State<SharedState>,
+    Json(req): Json<Registration>,
+) -> AppResult<StatusCode> {
+    validate_registration(&st, &req)?;
+    let sid = sqlx::query_scalar::<_, Uuid>(
+        "SELECT session_id FROM android_fcm_devices WHERE binding = $1 AND key_hash = $2",
+    )
+    .bind(req.binding)
+    .bind(crate::auth::refresh_hash(&req.rotation_key))
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::unauthorized("invalid push binding"))?;
+    save_registration(&st.pool, sid, &req, true).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_registration(st: &SharedState, req: &Registration) -> AppResult<()> {
     if st.fcm.as_ref().is_none_or(|fcm| fcm.project != req.project) {
         return Err(AppError::not_found("Android push unavailable"));
     }
@@ -181,17 +207,28 @@ pub(crate) async fn register(
         || req.token.len() > 1024
         || !req.token.bytes().all(|b| b.is_ascii_graphic())
         || req.binding.is_nil()
+        || req.rotation_key.len() != 64
+        || !req.rotation_key.bytes().all(|b| b.is_ascii_hexdigit())
+        || req.generation <= 0
     {
         return Err(AppError::bad_request("invalid Android push registration"));
     }
-    save_registration(&st.pool, sid, &req).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
-async fn save_registration(pool: &sqlx::PgPool, sid: Uuid, req: &Registration) -> AppResult<()> {
+async fn save_registration(
+    pool: &sqlx::PgPool,
+    sid: Uuid,
+    req: &Registration,
+    rotation: bool,
+) -> AppResult<()> {
     let mut tx = pool.begin().await?;
     let active = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM sessions WHERE id = $1 AND revoked_at IS NULL FOR UPDATE",
+        "SELECT s.id FROM sessions s JOIN users u ON u.id = s.user_id
+          WHERE s.id = $1 AND s.revoked_at IS NULL AND u.disabled_at IS NULL
+            AND EXISTS (SELECT 1 FROM refresh_tokens r WHERE r.session_id = s.id
+                          AND r.revoked_at IS NULL AND r.expires_at > now())
+          FOR UPDATE OF s",
     )
     .bind(sid)
     .fetch_optional(&mut *tx)
@@ -199,18 +236,40 @@ async fn save_registration(pool: &sqlx::PgPool, sid: Uuid, req: &Registration) -
     if active.is_none() {
         return Err(AppError::unauthorized("session revoked"));
     }
-    sqlx::query("DELETE FROM android_fcm_devices WHERE session_id = $1 AND token <> $2")
-        .bind(sid)
-        .bind(&req.token)
-        .execute(&mut *tx)
-        .await?;
+    let hash = crate::auth::refresh_hash(&req.rotation_key);
+    let device = sqlx::query_as::<_, (Uuid, String, i64)>(
+        "SELECT binding, key_hash, generation FROM android_fcm_devices WHERE session_id = $1",
+    )
+    .bind(sid)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match device {
+        Some((binding, key, generation)) if binding == req.binding && key == hash => {
+            if generation >= req.generation {
+                return Ok(());
+            }
+        }
+        _ if rotation => return Err(AppError::unauthorized("invalid push binding")),
+        _ => {}
+    }
+    if !rotation {
+        sqlx::query("DELETE FROM android_fcm_devices WHERE session_id <> $1 AND token = $2")
+            .bind(sid)
+            .bind(&req.token)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query(
-        "INSERT INTO android_fcm_devices (token, session_id, binding) VALUES ($1, $2, $3)
-         ON CONFLICT (token) DO UPDATE SET session_id = EXCLUDED.session_id, binding = EXCLUDED.binding",
+        "INSERT INTO android_fcm_devices (token, session_id, binding, key_hash, generation)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (session_id) DO UPDATE SET token = EXCLUDED.token, binding = EXCLUDED.binding,
+                                              key_hash = EXCLUDED.key_hash, generation = EXCLUDED.generation",
     )
     .bind(&req.token)
     .bind(sid)
     .bind(req.binding)
+    .bind(hash)
+    .bind(req.generation)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -240,7 +299,7 @@ async fn dispatch(st: &SharedState, msg: &MessageView) -> AppResult<()> {
             Ok(true) => {}
             Ok(false) => {
                 sqlx::query(
-                    "DELETE FROM android_fcm_devices WHERE token = $1 AND session_id = $2 AND binding = $3",
+                    "UPDATE android_fcm_devices SET token = NULL WHERE token = $1 AND session_id = $2 AND binding = $3",
                 )
                 .bind(&token)
                 .bind(sid)
@@ -269,7 +328,7 @@ async fn recipients(
            JOIN conversations c ON c.id = m.conversation_id AND c.type = 'dm'
            LEFT JOIN conversation_preferences p
              ON p.conversation_id = m.conversation_id AND p.user_id = m.user_id
-          WHERE m.user_id <> $2 AND m.last_read_seq < $3
+          WHERE d.token IS NOT NULL AND m.user_id <> $2 AND m.last_read_seq < $3
             AND NOT COALESCE(p.mute_forever, false)
             AND (p.muted_until IS NULL OR p.muted_until <= now())
             AND EXISTS (
@@ -340,14 +399,24 @@ mod tests {
             token: "first".into(),
             binding: Uuid::new_v4(),
             project: "test".into(),
+            rotation_key: "a".repeat(64),
+            generation: 1,
         };
-        save_registration(&pool, sid, &reg).await.unwrap();
+        assert!(save_registration(&pool, sid, &reg, true).await.is_err());
+        save_registration(&pool, sid, &reg, false).await.unwrap();
+        reg.generation = 2;
         reg.token = "second".into();
-        save_registration(&pool, sid, &reg).await.unwrap();
+        reg.rotation_key = "b".repeat(64);
+        assert!(save_registration(&pool, sid, &reg, true).await.is_err());
+        reg.rotation_key = "a".repeat(64);
+        save_registration(&pool, sid, &reg, true).await.unwrap();
+        reg.generation = 1;
+        reg.token = "first".into();
+        save_registration(&pool, sid, &reg, false).await.unwrap();
         let sender = Uuid::new_v4();
         assert_eq!(
             recipients(&pool, conv, sender, 1).await.unwrap(),
-            vec![(reg.token, sid, reg.binding)]
+            vec![("second".into(), sid, reg.binding)]
         );
         assert!(recipients(&pool, conv, uid, 1).await.unwrap().is_empty());
         assert!(recipients(&pool, conv, sender, 0).await.unwrap().is_empty());
@@ -357,6 +426,8 @@ mod tests {
             .await
             .unwrap();
         assert!(recipients(&pool, conv, sender, 1).await.unwrap().is_empty());
+        reg.generation = 3;
+        assert!(save_registration(&pool, sid, &reg, true).await.is_err());
     }
 
     #[test]

@@ -748,7 +748,9 @@ const put = <T>(p: string, body?: unknown) =>
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
-export type AndroidPushRegistration = { token: string; project: string; binding: string };
+export type AndroidPushRegistration = {
+  token: string; project: string; binding: string; rotationKey: string; generation: number;
+};
 export const registerAndroidPush = (registration: AndroidPushRegistration) =>
   put<void>("/users/me/push/android", registration);
 

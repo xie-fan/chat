@@ -154,6 +154,7 @@ pub async fn show_chat_notification(
 pub async fn android_push_registration(
     app: AppHandle,
     account: Option<String>,
+    server: Option<String>,
     enabled: bool,
 ) -> Result<Option<serde_json::Value>, String> {
     use tauri::Manager;
@@ -161,7 +162,7 @@ pub async fn android_push_registration(
         .0
         .run_mobile_plugin_async(
             "androidPushRegistration",
-            serde_json::json!({ "account": account, "enabled": enabled }),
+            serde_json::json!({ "account": account, "server": server, "enabled": enabled }),
         )
         .await
         .map_err(|e| e.to_string())

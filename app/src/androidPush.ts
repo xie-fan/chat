@@ -1,4 +1,4 @@
-import { currentAccountId, isDesktopShell, registerAndroidPush, session, type AndroidPushRegistration } from "./api";
+import { currentAccountId, getServer, isDesktopShell, registerAndroidPush, session, type AndroidPushRegistration } from "./api";
 import { notifyEnabled } from "./notify";
 
 function android() {
@@ -6,8 +6,9 @@ function android() {
 }
 
 async function registration(account: string | null, enabled: boolean) {
+  const server = account === null ? null : getServer();
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<AndroidPushRegistration | null>("android_push_registration", { account, enabled });
+  return invoke<AndroidPushRegistration | null>("android_push_registration", { account, server, enabled });
 }
 
 export function clearAndroidPush() {
@@ -33,7 +34,7 @@ export function watchAndroidPush(): (() => void) | undefined {
       }
       sending = sending.then(async () => {
         if (disposed || current !== request || gen !== session()) return;
-        if (last?.token === device.token && last.binding === device.binding && last.project === device.project) return;
+        if (last?.binding === device.binding && last.generation === device.generation) return;
         await registerAndroidPush(device);
         if (!disposed && current === request && gen === session()) last = device;
       }).catch(() => {});

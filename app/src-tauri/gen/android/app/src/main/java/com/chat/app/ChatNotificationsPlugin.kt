@@ -28,6 +28,7 @@ class ChatNotificationArgs {
 @InvokeArg
 class AndroidPushArgs {
   var account: String? = null
+  var server: String? = null
   var enabled: Boolean = false
 }
 
@@ -87,15 +88,15 @@ class ChatNotificationsPlugin(private val activity: Activity) : Plugin(activity)
     }
     val args = invoke.parseArgs(AndroidPushArgs::class.java)
     activity.runOnUiThread {
-      val binding = AndroidPushBinding.update(activity, args.account, args.enabled)
+      val binding = AndroidPushBinding.update(activity, args.account, args.server, args.enabled)
       if (binding == null) {
         invoke.resolve()
         return@runOnUiThread
       }
       try {
-        FirebasePushToken.read(activity) { project, token ->
-          if (project == null || token == null) invoke.resolve()
-          else invoke.resolveObject(mapOf("token" to token, "project" to project, "binding" to binding))
+        FirebasePushToken.read(activity, binding) { rotation ->
+          if (rotation == null) invoke.resolve()
+          else invoke.resolveObject(rotation.registration())
         }
       } catch (_: IllegalStateException) {
         invoke.resolve()
