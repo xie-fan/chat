@@ -5,5 +5,19 @@
         "installerHooks": "nsis-hooks.nsh"
       }
     }
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Chat",
+        "dragDropEnabled": false,
+        "visible": false,
+        "backgroundColor": "#f8fafc",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 520
+      }
+    ]
   }
 }

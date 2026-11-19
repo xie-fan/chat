@@ -3,9 +3,14 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { installFileDropGuard } from "../../fileDrop";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { resetSessionState, setState } from "../../store";
 import type { ConversationView } from "../../types";
 import ChatView from "./ChatView";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: vi.fn() }));
 
 function dragEvent(type: string, dataTransfer: DataTransfer) {
   return Object.assign(
@@ -50,43 +55,21 @@ it("leaves native file selection enabled for a file input", () => {
   }
 });
 
-it("cancels URI-only drags on Linux Tauri but not in a web browser", () => {
-  vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15" });
+it("does not intercept HTML5 URI text drags", () => {
   const uninstall = installFileDropGuard(window);
   const data = new DataTransfer();
   data.setData("text/uri-list", "");
-  const protectedLink = new DataTransfer();
-  protectedLink.setData("text/uri-list", "");
-  protectedLink.setData("text/plain", "");
-  protectedLink.setData("text/html", "");
-  const readableLink = new DataTransfer();
-  readableLink.setData("text/uri-list", "https://example.org/chat");
-  const readableFile = new DataTransfer();
-  readableFile.setData("text/uri-list", "# file\r\nfile:///home/test.txt\r\n");
-  readableFile.setData("text/plain", "file:///home/test.txt");
-  const input = document.createElement("input");
-  input.type = "file";
-  document.body.appendChild(input);
+  data.setData("text/plain", "https://example.org/chat");
   try {
     for (const type of ["dragover", "drop"]) {
       expect(document.body.dispatchEvent(dragEvent(type, data))).toBe(true);
     }
-    vi.stubGlobal("__TAURI_INTERNALS__", {});
-    for (const type of ["dragover", "drop"]) {
-      expect(document.body.dispatchEvent(dragEvent(type, data))).toBe(false);
-      expect(input.dispatchEvent(dragEvent(type, data))).toBe(true);
-      expect(document.body.dispatchEvent(dragEvent(type, protectedLink))).toBe(true);
-    }
-    expect(document.body.dispatchEvent(dragEvent("drop", readableLink))).toBe(true);
-    expect(document.body.dispatchEvent(dragEvent("drop", readableFile))).toBe(false);
   } finally {
     uninstall();
-    input.remove();
-    vi.unstubAllGlobals();
   }
 });
 
-it("stages files from the chat header and composer without sending them", async () => {
+it.each(["html", "linux"] as const)("stages files without sending them (%s)", async (platform) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL) =>
     Response.json(String(url).endsWith("/pins") ? [] : {}),
@@ -99,6 +82,22 @@ it("stages files from the chat header and composer without sending them", async 
   document.body.appendChild(host);
   const root = createRoot(host);
   const uninstall = installFileDropGuard(window);
+  const unlisten = vi.fn();
+  let emit: (payload: DragDropEvent) => void = () => {};
+  if (platform === "linux") {
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15" });
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    vi.mocked(getCurrentWebview, { partial: true }).mockReturnValue({
+      onDragDropEvent: async (callback) => {
+        emit = (payload) => callback({ event: "tauri://drag-drop", id: 1, payload });
+        return unlisten;
+      },
+    });
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+      if ((args as { path?: string }).path?.endsWith("large.txt")) throw "文件大小不能超过 25 MB";
+      return new TextEncoder().encode("text/plain\0hi").buffer;
+    });
+  }
   try {
     await act(async () => {
       setState({ activeConv: conv.id, conversations: [conv], historyLoaded: { [conv.id]: true } });
@@ -106,7 +105,7 @@ it("stages files from the chat header and composer without sending them", async 
     });
     const names = ["header.txt", "composer.txt"];
     const targets = [".chat-head .chat-head-main", ".composer textarea"];
-    act(() => {
+    if (platform === "html") act(() => {
       for (const [i, selector] of targets.entries()) {
         const target = host.querySelector(selector)!;
         const data = new DataTransfer();
@@ -121,44 +120,34 @@ it("stages files from the chat header and composer without sending them", async 
         liveFiles.length = 0;
       }
     });
+    else {
+      await vi.waitFor(() => expect(getCurrentWebview).toHaveBeenCalled());
+      const dropTargets = [document.body, ...targets.map((selector) => host.querySelector(selector)!)];
+      vi.spyOn(document, "elementFromPoint").mockImplementation((x) => dropTargets[x]);
+      const drop = (x: number, ...paths: string[]) => emit({
+        type: "drop", paths, position: { x, y: 10 },
+      } as DragDropEvent);
+      await act(async () => drop(0, "/tmp/outside.txt"));
+      expect(invoke).not.toHaveBeenCalled();
+      for (const [i, name] of names.entries()) {
+        await act(async () => drop(i + 1, `/tmp/${name}`));
+      }
+      await act(async () => drop(1, "/tmp/large.txt"));
+      expect(host.textContent).not.toContain("large.txt");
+      await act(async () => drop(2, "https://example.org/chat"));
+      expect(host.querySelector("textarea")?.value).toBe("https://example.org/chat");
+      expect(invoke).toHaveBeenCalledTimes(3);
+    }
     expect(Array.from(host.querySelectorAll(".pending-files .pf-name"), (el) => el.textContent))
       .toEqual(names);
-    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15" });
-    vi.stubGlobal("__TAURI_INTERNALS__", {});
-    const nativeInput = host.querySelector<HTMLInputElement>(".chat-drop-input")!;
-    const uriDrag = new DataTransfer();
-    Object.defineProperty(uriDrag, "types", { value: ["text/uri-list", "text/html"] });
-    const body = host.querySelector(".msg-scroll")!;
-    const linkDrag = new DataTransfer();
-    Object.defineProperty(linkDrag, "types", { value: ["text/plain", "text/html", "text/uri-list"] });
-    expect(body.dispatchEvent(dragEvent("dragenter", linkDrag))).toBe(true);
-    expect(body.dispatchEvent(dragEvent("dragover", linkDrag))).toBe(true);
-    expect(nativeInput.hidden).toBe(true);
-    body.dispatchEvent(dragEvent("dragenter", uriDrag));
-    expect(nativeInput.hidden).toBe(false);
-    body.dispatchEvent(dragEvent("dragleave", uriDrag));
-    expect(nativeInput.hidden).toBe(true);
-    body.dispatchEvent(dragEvent("dragenter", uriDrag));
-    nativeInput.dispatchEvent(dragEvent("dragenter", uriDrag));
-    body.dispatchEvent(dragEvent("dragleave", uriDrag));
-    expect(nativeInput.hidden).toBe(false);
-    nativeInput.dispatchEvent(dragEvent("dragleave", uriDrag));
-    expect(nativeInput.hidden).toBe(true);
-    body.dispatchEvent(dragEvent("dragenter", uriDrag));
-    expect(nativeInput.dispatchEvent(dragEvent("drop", uriDrag))).toBe(true);
-    const nativeFiles = new DataTransfer();
-    nativeFiles.items.add(new File(["hi"], "dolphin.txt"));
-    Object.defineProperty(nativeInput, "files", { value: nativeFiles.files });
-    act(() => nativeInput.dispatchEvent(new Event("change", { bubbles: true })));
-    expect(nativeInput.hidden).toBe(true);
-    expect(Array.from(host.querySelectorAll(".pending-files .pf-name"), (el) => el.textContent))
-      .toEqual([...names, "dolphin.txt"]);
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith("/v1/files"))).toBe(false);
   } finally {
-    act(() => root.unmount());
+    await act(async () => root.unmount());
+    if (platform === "linux") expect(unlisten).toHaveBeenCalled();
     host.remove();
     uninstall();
     setState(resetSessionState());
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   }
 });

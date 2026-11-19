@@ -26,6 +26,12 @@
   </head>
   <body>
     <div id="root"><div id="startup" role="status">正在启动 Chat…</div></div>
+    <script>
+      // Hidden desktop webviews can suspend animation frames.
+      if (!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+        window.__TAURI_INTERNALS__?.invoke("show_startup_window").catch(() => {});
+      }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

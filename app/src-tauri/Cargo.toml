@@ -37,7 +37,9 @@ base64 = "0.22"
 dirs = "6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gio = "0.18"
 ksni = "0.3.7"
+libc = "0.2"
 notify-rust = "4.18"
 
 [target.'cfg(target_os = "macos")'.dependencies]
