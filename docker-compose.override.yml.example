@@ -1,9 +1,0 @@
-services:
-  server:
-    volumes:
-      - type: bind
-        source: ${CHAT_FCM_SERVICE_ACCOUNT_HOST_FILE:?Set CHAT_FCM_SERVICE_ACCOUNT_HOST_FILE in .env}
-        target: ${CHAT_FCM_SERVICE_ACCOUNT_FILE:?Set CHAT_FCM_SERVICE_ACCOUNT_FILE in .env}
-        read_only: true
-        bind:
-          create_host_path: false

@@ -107,8 +107,9 @@ GitHub 每个组只保留**一个**排队中的 run：一个 release run 正在�
    设置 `CHAT_ANDROID_GOOGLE_SERVICES_JSON`，值为原始 JSON 文本（不是 base64）。不要提交文件。
 3. 在 [Google Cloud IAM](https://console.cloud.google.com/iam-admin/serviceaccounts) 创建专用
    服务账号，在同一 Firebase 项目授予 `roles/firebasecloudmessaging.admin` 并下载 JSON 密钥。
-   服务端将其只读挂载到例如 `/run/secrets/chat-fcm-service-account.json`，设置
-   `CHAT_FCM_SERVICE_ACCOUNT_FILE=/run/secrets/chat-fcm-service-account.json` 后重启。
+   Docker Compose 部署：把密钥存为与 `docker-compose.yml` 同级的 `secrets/fcm.json`，
+   然后运行 `docker compose up -d`，无需改 `.env` 或添加覆盖文件。
+   非 Compose 部署可用 `CHAT_FCM_SERVICE_ACCOUNT_FILE` 指定服务端可读的 JSON 路径。
    不需要旧版 FCM server key；服务账号密钥只放服务端，勿用作 APK 构建 secret。
 
 未配置时沿用 WebSocket 通知。FCM 只发私聊的会话和消息标识，不上传消息内容或发件人信息。

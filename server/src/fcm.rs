@@ -12,7 +12,11 @@ use axum::{
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -26,7 +30,7 @@ struct ServiceAccount {
     private_key: String,
 }
 
-pub(crate) struct Fcm {
+struct Fcm {
     project: String,
     client_email: String,
     key: EncodingKey,
@@ -49,19 +53,63 @@ struct GoogleToken {
     expires_in: u64,
 }
 
-impl Fcm {
+pub(crate) struct FcmFile {
+    path: PathBuf,
+    cached: Mutex<Option<CachedFcm>>,
+}
+
+struct CachedFcm {
+    modified: SystemTime,
+    len: u64,
+    client: Option<Arc<Fcm>>,
+}
+
+impl FcmFile {
     pub(crate) fn from_env() -> Option<Self> {
         let path = std::env::var_os("CHAT_FCM_SERVICE_ACCOUNT_FILE")?;
-        let loaded = std::fs::read(path)
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .and_then(Self::new);
-        if loaded.is_none() {
-            tracing::warn!("invalid CHAT_FCM_SERVICE_ACCOUNT_FILE; Android push disabled");
-        }
-        loaded
+        Some(Self {
+            path: path.into(),
+            cached: Mutex::new(None),
+        })
     }
 
+    async fn client(&self) -> Option<Arc<Fcm>> {
+        let mut cached = self.cached.lock().await;
+        let Ok(meta) = tokio::fs::metadata(&self.path).await else {
+            *cached = None;
+            return None;
+        };
+        if !meta.is_file() {
+            *cached = None;
+            return None;
+        }
+        let modified = meta.modified().ok()?;
+        let len = meta.len();
+        if let Some(entry) = cached
+            .as_ref()
+            .filter(|e| e.modified == modified && e.len == len)
+        {
+            return entry.client.clone();
+        }
+        let client = tokio::fs::read(&self.path)
+            .await
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .and_then(Fcm::new)
+            .map(Arc::new);
+        if client.is_none() {
+            tracing::warn!("invalid CHAT_FCM_SERVICE_ACCOUNT_FILE; Android push disabled");
+        }
+        *cached = Some(CachedFcm {
+            modified,
+            len,
+            client: client.clone(),
+        });
+        client
+    }
+}
+
+impl Fcm {
     fn new(account: ServiceAccount) -> Option<Self> {
         if account.project_id.is_empty()
             || !account
@@ -177,7 +225,7 @@ pub(crate) async fn register(
     let sid = auth
         .sid
         .ok_or_else(|| AppError::unauthorized("please login again"))?;
-    validate_registration(&st, &req)?;
+    validate_registration(&st, &req).await?;
     save_registration(&st.pool, sid, &req, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -186,7 +234,7 @@ pub(crate) async fn rotate(
     State(st): State<SharedState>,
     Json(req): Json<Registration>,
 ) -> AppResult<StatusCode> {
-    validate_registration(&st, &req)?;
+    validate_registration(&st, &req).await?;
     let sid = sqlx::query_scalar::<_, Uuid>(
         "SELECT session_id FROM android_fcm_devices WHERE binding = $1 AND key_hash = $2",
     )
@@ -199,8 +247,11 @@ pub(crate) async fn rotate(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn validate_registration(st: &SharedState, req: &Registration) -> AppResult<()> {
-    if st.fcm.as_ref().is_none_or(|fcm| fcm.project != req.project) {
+async fn validate_registration(st: &SharedState, req: &Registration) -> AppResult<()> {
+    if android_push_client(st)
+        .await
+        .is_none_or(|fcm| fcm.project != req.project)
+    {
         return Err(AppError::not_found("Android push unavailable"));
     }
     if req.token.is_empty()
@@ -289,7 +340,9 @@ pub(crate) fn schedule(st: &SharedState, msg: &MessageView) {
 }
 
 async fn dispatch(st: &SharedState, msg: &MessageView) -> AppResult<()> {
-    let Some(fcm) = &st.fcm else { return Ok(()) };
+    let Some(fcm) = android_push_client(st).await else {
+        return Ok(());
+    };
     let devices = recipients(&st.pool, msg.conversation_id, msg.sender_id, msg.seq).await?;
     for (token, sid, binding) in devices {
         match fcm
@@ -311,6 +364,10 @@ async fn dispatch(st: &SharedState, msg: &MessageView) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+async fn android_push_client(st: &SharedState) -> Option<Arc<Fcm>> {
+    st.fcm.as_ref()?.client().await
 }
 
 async fn recipients(
@@ -359,6 +416,33 @@ fn payload(token: &str, binding: Uuid, conv_id: Uuid, msg_id: Uuid) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn loads_a_service_account_added_after_startup_and_disables_it_on_removal() {
+        let path = std::env::temp_dir().join(format!("chat-fcm-{}.json", Uuid::new_v4()));
+        let source = FcmFile {
+            path: path.clone(),
+            cached: Mutex::new(None),
+        };
+        assert!(source.client().await.is_none());
+
+        std::fs::write(&path, "{}").unwrap();
+        assert!(source.client().await.is_none());
+
+        let account = json!({
+            "project_id": "test-project",
+            "client_email": "service@example.invalid",
+            // Toy RSA parameters; the test only parses the key.
+            "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMB0CAQACAgyhAgERAgIKwQIBPQIBNQIBNQIBMQIBJg==\n-----END RSA PRIVATE KEY-----",
+        });
+        std::fs::write(&path, account.to_string()).unwrap();
+        let client = source.client().await.unwrap();
+        assert_eq!(client.project, "test-project");
+        assert!(Arc::ptr_eq(&client, &source.client().await.unwrap()));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(source.client().await.is_none());
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn sends_only_to_eligible_dm_sessions_and_replaces_refreshed_tokens(pool: sqlx::PgPool) {

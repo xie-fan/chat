@@ -30,8 +30,8 @@ services:
       UPLOAD_MAX_MB: ${UPLOAD_MAX_MB:-25}
       # 挂在反向代理后面才设 1（见 README）
       TRUST_PROXY: ${TRUST_PROXY:-}
-      # 可选：容器内的 FCM 服务账号 JSON 路径；挂载示例见 docker-compose.override.yml.example
-      CHAT_FCM_SERVICE_ACCOUNT_FILE:
+      # 可选：默认读取下方只读挂载中的 secrets/fcm.json
+      CHAT_FCM_SERVICE_ACCOUNT_FILE: ${CHAT_FCM_SERVICE_ACCOUNT_FILE:-/run/chat-secrets/fcm.json}
       # 客户端在线更新：默认 xie-fan/chat（GitHub Release）；"off" 关闭；后台设置里也能改
       CLIENT_UPDATE_REPO: ${CLIENT_UPDATE_REPO:-}
       # 可选：读 GitHub release 用的 token / 更新请求走的代理
@@ -44,6 +44,7 @@ services:
       # （显式设为空 = 更新下载地址按请求 Host 拼）
     volumes:
       - chat-files:/data/files
+      - ./secrets:/run/chat-secrets:ro
     ports:
       - "28080:8080"
     depends_on:

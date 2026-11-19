@@ -96,7 +96,7 @@ pub async fn run() {
         tracing::warn!(error = %e, "failed to reset stale acp state on startup");
     }
 
-    let state = AppState::new_with_fcm(pool.clone(), cfg.clone(), fcm::Fcm::from_env());
+    let state = AppState::new_with_fcm(pool.clone(), cfg.clone(), fcm::FcmFile::from_env());
     let app = build_router(state, &cfg);
 
     // 撤回附件 & 未关联的过期 ACP 附件定时清扫（默认每小时）：
