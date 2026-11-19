@@ -65,7 +65,7 @@ describe("好友搜索结果行", () => {
 describe("contacts friendship authority", () => {
   const dm: ConversationView = { id: "c", kind: "dm", peer: user("u1"), name: null, owner_id: null, member_count: 2, last_seq: 0, unread_count: 0, has_mention: false, last_message: null, created_at: "2026-01-01" };
 
-  it.each([[], [friend("u1")]])("makes a successful contacts refresh authoritative: %j", async (list) => {
+  it.each([{ list: [] }, { list: [friend("u1")] }])("makes a successful contacts refresh authoritative: %j", async ({ list }) => {
     setState({ friends: [friend("u1")], friendsLoaded: false });
     vi.spyOn(friends, "list").mockResolvedValue(list);
     vi.spyOn(friends, "requests").mockResolvedValue({ incoming: [], outgoing: [] });
