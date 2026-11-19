@@ -4,12 +4,13 @@ export function isLinuxDesktop(): boolean {
   return isDesktopShell() && osOfUa(navigator.userAgent) === "Linux";
 }
 
-export async function listenForNativeDrops(onDrop: (paths: string[], x: number, y: number) => void) {
+export async function listenForNativeDrops(onDrop: (paths: string[], target: Element) => void) {
   const { getCurrentWebview } = await import("@tauri-apps/api/webview");
   return getCurrentWebview().onDragDropEvent(({ payload }) => {
     if (payload.type === "drop") {
       // Wry forwards GTK widget coordinates in logical pixels on Linux.
-      onDrop(payload.paths, payload.position.x, payload.position.y);
+      const target = document.elementFromPoint(payload.position.x, payload.position.y);
+      if (target) onDrop(payload.paths, target);
     }
   });
 }

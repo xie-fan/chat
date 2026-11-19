@@ -15,6 +15,12 @@ const UNREADABLE: &str = "无法读取拖入的文件";
 #[derive(Default)]
 pub struct DroppedFiles(Mutex<HashSet<PathBuf>>);
 
+impl DroppedFiles {
+    pub fn take(&self, window: &Window, path: &Path) -> bool {
+        window.label() == "main" && self.0.lock().unwrap().remove(path)
+    }
+}
+
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if window.label() != "main" {
         return;
@@ -31,7 +37,7 @@ pub async fn read_dropped_file(
     dropped: State<'_, DroppedFiles>,
     path: PathBuf,
 ) -> Result<Response, String> {
-    if window.label() != "main" || !dropped.0.lock().unwrap().remove(&path) {
+    if !dropped.take(&window, &path) {
         return Err(UNREADABLE.into());
     }
     let bytes = tauri::async_runtime::spawn_blocking(move || {
@@ -48,7 +54,7 @@ pub async fn read_dropped_file(
     Ok(Response::new(bytes))
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, &'static str> {
+pub fn open_regular_file(path: &Path) -> Result<(File, u64), &'static str> {
     if !path.is_file() {
         return Err(UNREADABLE);
     }
@@ -61,7 +67,12 @@ fn read_file(path: &Path) -> Result<Vec<u8>, &'static str> {
     if !metadata.is_file() {
         return Err(UNREADABLE);
     }
-    if metadata.len() > MAX_BYTES {
+    Ok((file, metadata.len()))
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>, &'static str> {
+    let (file, len) = open_regular_file(path)?;
+    if len > MAX_BYTES {
         return Err(TOO_LARGE);
     }
     let mut bytes = Vec::new();

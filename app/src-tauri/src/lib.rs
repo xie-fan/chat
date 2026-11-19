@@ -14,6 +14,8 @@ mod apk_installer;
 mod notifications;
 #[cfg(target_os = "linux")]
 mod file_drop;
+#[cfg(target_os = "linux")]
+mod restore_drop;
 
 #[cfg(desktop)]
 pub fn maybe_run_cli() -> bool {
@@ -55,6 +57,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let builder = builder
         .manage(file_drop::DroppedFiles::default())
+        .manage(restore_drop::SelectedBackup::default())
         .on_window_event(file_drop::on_window_event);
     #[cfg(desktop)]
     let builder = builder
@@ -66,6 +69,10 @@ pub fn run() {
             updater::install_update,
             #[cfg(target_os = "linux")]
             file_drop::read_dropped_file,
+            #[cfg(target_os = "linux")]
+            restore_drop::select_dropped_backup,
+            #[cfg(target_os = "linux")]
+            restore_drop::restore_dropped_backup,
             startup::show_startup_window,
             acp_host::acp_host_start,
             acp_host::acp_host_ticket,

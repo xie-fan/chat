@@ -706,10 +706,9 @@ export default function ChatView() {
     if (!conv || !isLinuxDesktop()) return;
     let disposed = false;
     const stillActive = () => !disposed && gen === session() && getState().activeConv === conv.id;
-    const subscription = listenForNativeDrops(async (paths, x, y) => {
+    const subscription = listenForNativeDrops(async (paths, target) => {
       if (!stillActive()) return;
-      const target = document.elementFromPoint(x, y);
-      if (!target || !chatView.current?.contains(target)) return;
+      if (!chatView.current?.contains(target)) return;
       const localPaths = paths.filter((path) => path.startsWith("/"));
       if (!localPaths.length) {
         const input = taRef.current;

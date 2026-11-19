@@ -3,6 +3,7 @@
 // 恢复 = 上传 tar.gz + 键入 RESTORE 确认 → 服务端整库回灌（所有人被登出）。
 import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, clearSession, getServer, serverScope } from "../../api";
+import { isLinuxDesktop, listenForNativeDrops } from "../../fileDrop";
 import { kickReasonKey } from "../../servers";
 import { getState } from "../../store";
 import { stopWs } from "../../ws";
@@ -25,10 +26,11 @@ export default function BackupPanel() {
   const [inProgress, setInProgress] = useState(false);
   const [busy, setBusy] = useState<string | null>(null); // backup | restore | <name>
   const [err, setErr] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const [file, setFile] = useState<File | { id: string; name: string } | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [pct, setPct] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const fileRevision = useRef(0);
 
   const load = useCallback(async () => {
     try {
@@ -44,6 +46,33 @@ export default function BackupPanel() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!isLinuxDesktop() || busy) return;
+    let disposed = false;
+    const subscription = listenForNativeDrops(async (paths, target) => {
+      const input = fileRef.current;
+      const path = paths.find((path) => path.startsWith("/"));
+      if (disposed || !path || !input || input.disabled || target !== input) return;
+      const current = ++fileRevision.current;
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        if (disposed || current !== fileRevision.current) return;
+        const id = await invoke<string>("select_dropped_backup", { path });
+        if (disposed || current !== fileRevision.current) return;
+        input.value = "";
+        setErr("");
+        setFile({ id, name: path.slice(path.lastIndexOf("/") + 1) });
+      } catch (error) {
+        if (!disposed && current === fileRevision.current) setErr(String(error));
+      }
+    });
+    void subscription.catch(() => {});
+    return () => {
+      disposed = true;
+      void subscription.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [busy]);
 
   // 生成中约每 2s 轮询，完成后自动停（in_progress 翻 false 即最后一次已刷新）
   useEffect(() => {
@@ -107,7 +136,8 @@ export default function BackupPanel() {
     setPct(0);
     setErr("");
     try {
-      await admin.restore(file, setPct);
+      if ("id" in file) await admin.restoreDroppedBackup(file.id, setPct);
+      else await admin.restore(file, setPct);
       // 发起者会话的服务端连接在恢复期间被保留，正常走到这里时本页仍在线；
       // 若已被踢下线（极端时序），登录页已显示踢人提示，不再覆写以免残留到下次
       if (!getState().me) return;
@@ -184,8 +214,12 @@ export default function BackupPanel() {
             type="file"
             accept=".tar.gz,application/gzip"
             disabled={busy !== null}
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            onChange={(e) => {
+              fileRevision.current++;
+              setFile(e.target.files?.[0] ?? null);
+            }}
           />
+          {file && "id" in file && <span className="muted">{file.name}</span>}
         </div>
         <div className="row bk-confirm">
           <input
