@@ -286,7 +286,7 @@ fn parse_activation_url(raw: &str) -> Option<Option<Target>> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn handle_windows_args(app: &AppHandle, args: Vec<String>) {
+pub fn handle_windows_args(app: &AppHandle, args: Vec<String>) -> bool {
     for arg in args.into_iter().skip(1) {
         if let Some(target) = parse_activation_url(&arg) {
             let state = app.state::<WindowsActivation>();
@@ -298,9 +298,10 @@ pub fn handle_windows_args(app: &AppHandle, args: Vec<String>) {
                 state.1 = Some(target);
                 crate::tray::reveal(app);
             }
-            break;
+            return true;
         }
     }
+    false
 }
 
 #[cfg(desktop)]

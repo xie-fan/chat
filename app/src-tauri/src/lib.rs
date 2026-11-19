@@ -35,7 +35,9 @@ pub fn run() {
     let builder = builder
         .manage(notifications::WindowsActivation::default())
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
-            notifications::handle_windows_args(app, args);
+            if !notifications::handle_windows_args(app, args) {
+                tray::reveal(app);
+            }
         }));
     #[cfg(desktop)]
     let builder = builder
