@@ -488,8 +488,22 @@ jobs:
       - name: macOS 通用安装包（DMG）
         working-directory: app
         env:
-          APPLE_SIGNING_IDENTITY: "-"
-        run: pnpm tauri build --target universal-apple-darwin
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" ||
+                -z "$APPLE_SIGNING_IDENTITY" || -z "$APPLE_ID" ||
+                -z "$APPLE_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+            echo "::warning::Apple 签名或公证凭据不全：使用临时签名，安装时可能被 Gatekeeper 拦截"
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+            export APPLE_SIGNING_IDENTITY="-"
+          fi
+          pnpm tauri build --target universal-apple-darwin
       - name: 上传 DMG
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
