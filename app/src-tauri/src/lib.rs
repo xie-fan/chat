@@ -57,6 +57,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let builder = builder
         .manage(file_drop::DroppedFiles::default())
+        .manage(file_drop::DroppedLinks::default())
         .manage(restore_drop::SelectedBackup::default())
         .on_window_event(file_drop::on_window_event);
     #[cfg(desktop)]
@@ -69,6 +70,8 @@ pub fn run() {
             updater::install_update,
             #[cfg(target_os = "linux")]
             file_drop::read_dropped_file,
+            #[cfg(target_os = "linux")]
+            file_drop::take_dropped_link,
             #[cfg(target_os = "linux")]
             restore_drop::select_dropped_backup,
             #[cfg(target_os = "linux")]
@@ -85,6 +88,8 @@ pub fn run() {
             tray::install(app.handle())?;
             #[cfg(target_os = "windows")]
             notifications::handle_windows_args(app.handle(), std::env::args().collect());
+            #[cfg(target_os = "linux")]
+            file_drop::listen_for_link_uris(app.handle())?;
             startup::schedule_fallback(app.handle());
             Ok(())
         })

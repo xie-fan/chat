@@ -9,6 +9,9 @@ import { resetSessionState, setState } from "../../store";
 import type { ConversationView } from "../../types";
 import ChatView from "./ChatView";
 
+const escapedLink = "https://example.org/?q=one%26two%23three#section";
+const wryLink = "https://example.org/?q=one&two#three#section";
+
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: vi.fn() }));
 
@@ -93,7 +96,8 @@ it.each(["html", "linux"] as const)("stages files without sending them (%s)", as
         return unlisten;
       },
     });
-    vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd === "take_dropped_link") return escapedLink;
       if ((args as { path?: string }).path?.endsWith("large.txt")) throw "文件大小不能超过 25 MB";
       return new TextEncoder().encode("text/plain\0hi").buffer;
     });
@@ -134,9 +138,10 @@ it.each(["html", "linux"] as const)("stages files without sending them (%s)", as
       }
       await act(async () => drop(1, "/tmp/large.txt"));
       expect(host.textContent).not.toContain("large.txt");
-      await act(async () => drop(2, "https://example.org/chat"));
-      expect(host.querySelector("textarea")?.value).toBe("https://example.org/chat");
-      expect(invoke).toHaveBeenCalledTimes(3);
+      await act(async () => drop(2, wryLink));
+      expect(host.querySelector("textarea")?.value).toBe(escapedLink);
+      expect(invoke).toHaveBeenLastCalledWith("take_dropped_link", { path: wryLink });
+      expect(invoke).toHaveBeenCalledTimes(4);
     }
     expect(Array.from(host.querySelectorAll(".pending-files .pf-name"), (el) => el.textContent))
       .toEqual(names);

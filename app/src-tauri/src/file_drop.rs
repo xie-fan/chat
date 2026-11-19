@@ -1,12 +1,13 @@
+use gtk::prelude::WidgetExt;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::Read,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Mutex,
 };
-use tauri::{ipc::Response, DragDropEvent, Manager, State, Window, WindowEvent};
+use tauri::{ipc::Response, AppHandle, DragDropEvent, Manager, State, Window, WindowEvent};
 
 const MAX_BYTES: u64 = 25 * 1024 * 1024;
 const TOO_LARGE: &str = "文件大小不能超过 25 MB";
@@ -14,6 +15,45 @@ const UNREADABLE: &str = "无法读取拖入的文件";
 
 #[derive(Default)]
 pub struct DroppedFiles(Mutex<HashSet<PathBuf>>);
+
+#[derive(Default)]
+pub struct DroppedLinks {
+    pending: Mutex<HashMap<String, String>>,
+    dropped: Mutex<HashMap<String, String>>,
+}
+
+pub fn listen_for_link_uris(app: &AppHandle) -> tauri::Result<()> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    let app = app.clone();
+    window.with_webview(move |webview| {
+        webview
+            .inner()
+            .connect_drag_data_received(move |_, _, _, _, data, info, _| {
+                // Wry's URI-list GTK target is 2; it percent-decodes these URIs into paths.
+                if info == 2 {
+                    let links = data
+                        .uris()
+                        .into_iter()
+                        .filter_map(|uri| link_pair(&uri))
+                        .collect();
+                    *app.state::<DroppedLinks>().pending.lock().unwrap() = links;
+                }
+            });
+    })
+}
+
+fn link_pair(uri: &str) -> Option<(String, String)> {
+    let url = url::Url::parse(uri).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let decoded = percent_encoding::percent_decode_str(uri)
+        .decode_utf8_lossy()
+        .into_owned();
+    Some((decoded, uri.to_owned()))
+}
 
 impl DroppedFiles {
     pub fn take(&self, window: &Window, path: &Path) -> bool {
@@ -28,7 +68,37 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
         let state = window.state::<DroppedFiles>();
         *state.0.lock().unwrap() = paths.iter().filter(|p| p.is_absolute()).cloned().collect();
+        let links = window.state::<DroppedLinks>();
+        let mut pending = std::mem::take(&mut *links.pending.lock().unwrap());
+        *links.dropped.lock().unwrap() = paths
+            .iter()
+            .filter_map(|path| {
+                let decoded = path.to_str()?;
+                pending
+                    .remove(decoded)
+                    .map(|original| (decoded.to_owned(), original))
+            })
+            .collect();
+    } else if let WindowEvent::DragDrop(DragDropEvent::Leave) = event {
+        window
+            .state::<DroppedLinks>()
+            .pending
+            .lock()
+            .unwrap()
+            .clear();
     }
+}
+
+#[tauri::command]
+pub fn take_dropped_link(
+    window: Window,
+    links: State<'_, DroppedLinks>,
+    path: String,
+) -> Option<String> {
+    if window.label() != "main" {
+        return None;
+    }
+    links.dropped.lock().unwrap().remove(&path)
 }
 
 #[tauri::command]
@@ -88,6 +158,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_escaped_url_delimiters_separately_from_the_wry_path() {
+        let raw = "https://example.org/?q=one%26two%23three#section";
+        let (decoded, original) = link_pair(raw).unwrap();
+        assert_eq!(decoded, "https://example.org/?q=one&two#three#section");
+        assert_eq!(original, raw);
+        assert!(link_pair("file:///tmp/backup.tar.gz").is_none());
+    }
 
     #[test]
     fn reads_regular_files_and_rejects_oversized_files() {

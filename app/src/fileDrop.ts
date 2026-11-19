@@ -23,6 +23,11 @@ export async function readNativeDropFile(path: string): Promise<File> {
   return new File([bytes.subarray(separator + 1)], path.slice(path.lastIndexOf("/") + 1), { type });
 }
 
+export async function takeNativeDropLink(path: string): Promise<string | null> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string | null>("take_dropped_link", { path });
+}
+
 export function isManagedFileDrag({ target, dataTransfer }: Pick<DragEvent, "target" | "dataTransfer">): boolean {
   if (!dataTransfer || (!dataTransfer.types.includes("Files") && !dataTransfer.files.length)) {
     return false;

@@ -20,7 +20,7 @@ import {
 import { copyPlainText } from "../../clipboard";
 import { saveAttachment } from "../../download";
 import { unsentText, type DraftReuse } from "../../drafts";
-import { isLinuxDesktop, isManagedFileDrag, listenForNativeDrops, readNativeDropFile } from "../../fileDrop";
+import { isLinuxDesktop, isManagedFileDrag, listenForNativeDrops, readNativeDropFile, takeNativeDropLink } from "../../fileDrop";
 import {
   REEDIT_WINDOW_MS,
   patchReedit,
@@ -712,12 +712,13 @@ export default function ChatView() {
       const localPaths = paths.filter((path) => path.startsWith("/"));
       if (!localPaths.length) {
         const input = taRef.current;
-        const link = paths.find((path) => /^https?:\/\//i.test(path));
-        if (link && input && target === input && !input.disabled && !input.readOnly) {
-          input.focus();
-          input.setRangeText(link, input.selectionStart, input.selectionEnd, "end");
-          input.dispatchEvent(new Event("input", { bubbles: true }));
-        }
+        const path = paths.find((path) => /^https?:\/\//i.test(path));
+        if (!path || !input || target !== input || input.disabled || input.readOnly) return;
+        const link = await takeNativeDropLink(path).catch(() => null);
+        if (!link || !stillActive() || input !== taRef.current || input.disabled || input.readOnly) return;
+        input.focus();
+        input.setRangeText(link, input.selectionStart, input.selectionEnd, "end");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
         return;
       }
       if (fileDropBlocked || target.closest('input[type="file"]')) return;
