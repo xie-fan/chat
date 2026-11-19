@@ -1,16 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Chat",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "identifier": "com.chat.app",
   "build": {
     "frontendDist": "../dist",
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Chat",
+        "dragDropEnabled": false,
         "width": 1080,
         "height": 720,
         "minWidth": 760,

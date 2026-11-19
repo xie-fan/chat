@@ -1,0 +1,16 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Chat",
+        "dragDropEnabled": true,
+        "visible": false,
+        "backgroundColor": "#f8fafc",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 520
+      }
+    ]
+  }
+}

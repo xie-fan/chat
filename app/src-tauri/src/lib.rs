@@ -5,11 +5,17 @@ mod acp_host;
 mod tray;
 #[cfg(desktop)]
 mod updater;
+#[cfg(desktop)]
+mod startup;
 // MM4：附件直存下载目录（桌面走 reqwest，Android 走 Kotlin MediaStore 插件）
 mod download;
 // AS2：Android 应用内 APK 安装（缓存 + FileProvider + 系统安装器，与附件下载分离）
 mod apk_installer;
 mod notifications;
+#[cfg(target_os = "linux")]
+mod file_drop;
+#[cfg(target_os = "linux")]
+mod restore_drop;
 
 #[cfg(desktop)]
 pub fn maybe_run_cli() -> bool {
@@ -48,6 +54,12 @@ pub fn run() {
         ));
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    #[cfg(target_os = "linux")]
+    let builder = builder
+        .manage(file_drop::DroppedFiles::default())
+        .manage(file_drop::DroppedLinks::default())
+        .manage(restore_drop::SelectedBackup::default())
+        .on_window_event(file_drop::on_window_event);
     #[cfg(desktop)]
     let builder = builder
         .invoke_handler(tauri::generate_handler![
@@ -56,6 +68,15 @@ pub fn run() {
             notifications::notification_ready,
             download::download_to_downloads,
             updater::install_update,
+            #[cfg(target_os = "linux")]
+            file_drop::read_dropped_file,
+            #[cfg(target_os = "linux")]
+            file_drop::take_dropped_link,
+            #[cfg(target_os = "linux")]
+            restore_drop::select_dropped_backup,
+            #[cfg(target_os = "linux")]
+            restore_drop::restore_dropped_backup,
+            startup::show_startup_window,
             acp_host::acp_host_start,
             acp_host::acp_host_ticket,
             acp_host::acp_host_stop,
@@ -67,6 +88,9 @@ pub fn run() {
             tray::install(app.handle())?;
             #[cfg(target_os = "windows")]
             notifications::handle_windows_args(app.handle(), std::env::args().collect());
+            #[cfg(target_os = "linux")]
+            file_drop::listen_for_link_uris(app.handle())?;
+            startup::schedule_fallback(app.handle());
             Ok(())
         })
         .on_window_event(tray::on_window_event);

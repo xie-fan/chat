@@ -20,6 +20,7 @@ import {
 import { copyPlainText } from "../../clipboard";
 import { saveAttachment } from "../../download";
 import { unsentText, type DraftReuse } from "../../drafts";
+import { isLinuxDesktop, isManagedFileDrag, listenForNativeDrops, readNativeDropFile, takeNativeDropLink } from "../../fileDrop";
 import {
   REEDIT_WINDOW_MS,
   patchReedit,
@@ -232,7 +233,7 @@ function imgDim(att: AttachmentView): React.CSSProperties | undefined {
   if (att.width == null || att.height == null) return undefined;
   const d = imageBubbleSize(att.width, att.height);
   if (d.width === 0) return undefined;
-  return { width: d.width, height: d.height };
+  return { width: d.width, height: "auto", aspectRatio: `${att.width} / ${att.height}` };
 }
 
 export default function ChatView() {
@@ -248,6 +249,7 @@ export default function ChatView() {
   const stickBottom = useRef(true);
   const lastTypingSent = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
+  const chatView = useRef<HTMLElement>(null);
   const imgInput = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const [showEmoji, setShowEmoji] = useState(false);
@@ -331,6 +333,8 @@ export default function ChatView() {
   const hasMore = conv ? (s.hasMore[conv.id] ?? false) : false;
   // MF2：多选态只在本会话生效；recordView 的最外层消息（撤回监听、附件转发的 outerId）
   const msMode = !!ms && !!conv && ms.convId === conv.id;
+  const readonly = !!conv && isReadonlyDm(conv, s);
+  const fileDropBlocked = !!(readonly || msMode || s.editingMessage);
   const recordDead = (outerId: string) => !!msgs.find((x) => x.id === outerId)?.deleted_at;
   const current = (token: object | null) => token != null && token === viewOwner.current && gen === session() && getState().activeConv === conv?.id;
 
@@ -693,6 +697,47 @@ export default function ChatView() {
     return () => document.removeEventListener("keydown", onKey, true);
   });
 
+  const addPending = (list: Iterable<File>) => {
+    const picked = Array.from(list);
+    setPendingFiles((p) => [...p, ...picked]);
+  };
+
+  useEffect(() => {
+    if (!conv || !isLinuxDesktop()) return;
+    let disposed = false;
+    const stillActive = () => !disposed && gen === session() && getState().activeConv === conv.id;
+    const subscription = listenForNativeDrops(async (paths, target) => {
+      if (!stillActive()) return;
+      if (!chatView.current?.contains(target)) return;
+      const localPaths = paths.filter((path) => path.startsWith("/"));
+      if (!localPaths.length) {
+        const input = taRef.current;
+        const path = paths.find((path) => /^https?:\/\//i.test(path));
+        if (!path || !input || target !== input || input.disabled || input.readOnly) return;
+        const link = await takeNativeDropLink(path).catch(() => null);
+        if (!link || !stillActive() || input !== taRef.current || input.disabled || input.readOnly) return;
+        input.focus();
+        input.setRangeText(link, input.selectionStart, input.selectionEnd, "end");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        return;
+      }
+      if (fileDropBlocked || target.closest('input[type="file"]')) return;
+      const results = await Promise.allSettled(localPaths.map(readNativeDropFile));
+      if (!stillActive()) return;
+      const picked: File[] = [];
+      for (const result of results) {
+        if (result.status === "fulfilled") picked.push(result.value);
+        else pushToast({ title: "添加附件失败", text: String(result.reason) });
+      }
+      if (picked.length) addPending(picked);
+    });
+    void subscription.catch(() => {});
+    return () => {
+      disposed = true;
+      void subscription.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [conv?.id, fileDropBlocked, gen]);
+
   if (!conv) {
     return (
       <main className="chat-view empty">
@@ -705,7 +750,6 @@ export default function ChatView() {
   const peerOnline = conv.kind === "dm" && conv.peer ? !!s.online[conv.peer.id] : false;
   const typing = s.typing[conv.id];
   const typingFresh = typing && Date.now() - typing.ts < 5000;
-  const readonly = isReadonlyDm(conv, s);
 
   // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
   // —— 以下谓词服务已下线功能（feature flag 关闭），代码路径保留 ——
@@ -1392,10 +1436,6 @@ export default function ChatView() {
     }
   };
 
-  const addPending = (list: Iterable<File>) => {
-    setPendingFiles((p) => [...p, ...Array.from(list)]);
-  };
-
   // @补全：群成员（用户名前缀或昵称包含）
   const acItems: MemberView[] = ac
     ? members
@@ -1532,7 +1572,18 @@ export default function ChatView() {
 
   return (
     <main
+      ref={chatView}
       className="chat-view"
+      onDragOverCapture={(e) => {
+        if (!isManagedFileDrag(e)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = fileDropBlocked ? "none" : "copy";
+      }}
+      onDropCapture={(e) => {
+        if (!e.dataTransfer.files.length || !isManagedFileDrag(e)) return;
+        e.preventDefault();
+        if (!fileDropBlocked) addPending(e.dataTransfer.files);
+      }}
       // 全视图捕获 pointerType：lastPointer 供 contextmenu 来源判定与
       // openPreview 的幽灵点击豁免（触屏打开才豁免）使用，不限于气泡区域
       onPointerDownCapture={(e) => {
@@ -1998,7 +2049,14 @@ export default function ChatView() {
                             onErr={setMutErr}
                           />
                         ) : (
-                          showText(m) && <RichText text={m.content} mentions={!m.forwarded_from} />
+                          showText(m) && (
+                            <RichText
+                              text={m.content}
+                              mentions={m.forwarded_from || !m.mentions.length ? false : new Set(
+                                members.filter(({ user }) => m.mentions.includes(user.id)).map(({ user }) => user.username),
+                              )}
+                            />
+                          )
                         )}
                         {m.edited_at && <span className="edited-mark">（已编辑）</span>}
                       </div>

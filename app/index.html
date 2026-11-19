@@ -9,9 +9,29 @@
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#f3f5f9" />
     <title>Chat</title>
+    <style>
+      #startup {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        font: 14px system-ui, sans-serif;
+        color: #475569;
+        background: #f8fafc;
+      }
+      @media (prefers-color-scheme: dark) {
+        #startup { color: #94a3b8; background: #0f172a; }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><div id="startup" role="status">正在启动 Chat…</div></div>
+    <script>
+      // Hidden desktop webviews can suspend animation frames.
+      if (!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+        window.__TAURI_INTERNALS__?.invoke("show_startup_window").catch(() => {});
+      }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

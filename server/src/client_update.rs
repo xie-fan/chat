@@ -21,7 +21,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// update_repo_url / CLIENT_UPDATE_REPO 都为空时的默认仓库
 const DEFAULT_REPO: &str = "xie-fan/chat";
@@ -57,6 +57,7 @@ fn gitea_api_base(repo_url: &str) -> Option<String> {
 }
 
 /// 更新源：GitHub Releases 或 Gitea（api 为 .../api/v1/repos/o/r）
+#[derive(PartialEq, Eq)]
 pub enum UpdateRepo {
     GitHub { owner: String, repo: String },
     Gitea { api: String },
@@ -119,7 +120,7 @@ fn update_client() -> reqwest::Client {
 }
 
 /// GitHub/GitHub 兼容（Gitea 同名字段）的 Release 读模型
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Release {
     tag_name: String,
     #[serde(default)]
@@ -130,7 +131,7 @@ struct Release {
     assets: Vec<ReleaseAsset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ReleaseAsset {
     name: String,
     size: i64,
@@ -139,8 +140,16 @@ struct ReleaseAsset {
 
 async fn latest_release(st: &SharedState) -> AppResult<Release> {
     let s = settings::load(&st.pool).await?;
-    let repo = resolve_repo(&s.update_repo_url).ok_or_else(|| AppError::not_found("update_off"))?;
-    let req = match &repo {
+    let mut cache = st.client_latest.lock().await;
+    let Some(repo) = resolve_repo(&s.update_repo_url) else {
+        *cache = None;
+        return Err(AppError::not_found("update_off"));
+    };
+    cached_latest(&mut cache, repo).await
+}
+
+async fn fetch_release(repo: &UpdateRepo) -> AppResult<Release> {
+    let req = match repo {
         UpdateRepo::GitHub { owner, repo } => {
             let r = update_client()
                 .get(format!(
@@ -192,6 +201,22 @@ pub struct ClientLatest {
     pub assets: Vec<AssetView>,
 }
 
+const LATEST_TTL: Duration = Duration::from_secs(60);
+const LATEST_MAX_AGE: Duration = Duration::from_secs(600);
+const LATEST_RETRY_DELAY: Duration = Duration::from_secs(15);
+
+pub(crate) struct CachedLatest {
+    source: UpdateRepo,
+    value: CachedRelease,
+    retry_at: Instant,
+}
+
+enum CachedRelease {
+    Available { release: Release, fetched: Instant },
+    Missing,
+    Unavailable(String),
+}
+
 /// GET /client/latest：公共端点。功能关闭 / 还没有 Release → 404
 pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLatest>> {
     let r = latest_release(&st).await?;
@@ -208,6 +233,64 @@ pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLates
             })
             .collect(),
     }))
+}
+
+async fn cached_latest(cache: &mut Option<CachedLatest>, repo: UpdateRepo) -> AppResult<Release> {
+    if cache.as_ref().is_some_and(|entry| entry.source != repo) {
+        *cache = None;
+    }
+    if let Some(entry) = cache.as_ref() {
+        if Instant::now() < entry.retry_at {
+            match &entry.value {
+                CachedRelease::Available { release, fetched }
+                    if fetched.elapsed() < LATEST_MAX_AGE =>
+                {
+                    return Ok(release.clone());
+                }
+                CachedRelease::Missing => return Err(AppError::not_found("no_release")),
+                CachedRelease::Unavailable(message) => {
+                    return Err(AppError::bad_gateway(message.clone()));
+                }
+                CachedRelease::Available { .. } => {}
+            }
+        }
+    }
+    let result = fetch_release(&repo).await;
+    let now = Instant::now();
+    let (value, delay) = match &result {
+        Ok(release) => (
+            CachedRelease::Available {
+                release: release.clone(),
+                fetched: now,
+            },
+            LATEST_TTL,
+        ),
+        Err(AppError::BadGateway(message)) => {
+            if let Some(entry) = cache.as_mut() {
+                if let CachedRelease::Available { release, fetched } = &entry.value {
+                    if fetched.elapsed() < LATEST_MAX_AGE {
+                        entry.retry_at = now + LATEST_RETRY_DELAY;
+                        return Ok(release.clone());
+                    }
+                }
+            }
+            (
+                CachedRelease::Unavailable(message.clone()),
+                LATEST_RETRY_DELAY,
+            )
+        }
+        Err(AppError::NotFound(_)) => (CachedRelease::Missing, LATEST_RETRY_DELAY),
+        Err(_) => {
+            *cache = None;
+            return result;
+        }
+    };
+    *cache = Some(CachedLatest {
+        source: repo,
+        value,
+        retry_at: now + delay,
+    });
+    result
 }
 
 /// 本服务对外地址：优先后台配置的 public_url，否则按请求的 Host 拼
@@ -313,7 +396,84 @@ pub async fn download(
 
 #[cfg(test)]
 mod tests {
-    use super::{gitea_api_base, parse_repo, UpdateRepo};
+    use super::{
+        cached_latest, gitea_api_base, parse_repo, AppError, CachedRelease, Instant, UpdateRepo,
+        LATEST_MAX_AGE,
+    };
+    use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn latest_metadata_uses_fresh_cache_and_falls_back_to_recent_release() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let upstream = Router::new().route(
+            "/releases/latest",
+            get({
+                let requests = requests.clone();
+                move || {
+                    let call = requests.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        if call == 0 {
+                            Json(serde_json::json!({"tag_name": "v0.8.3"})).into_response()
+                        } else {
+                            StatusCode::FORBIDDEN.into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let repo = || UpdateRepo::Gitea { api: url.clone() };
+        let mut cache = None;
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
+        );
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        cache.as_mut().unwrap().retry_at = Instant::now();
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
+        );
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+
+        let CachedRelease::Available { fetched, .. } = &mut cache.as_mut().unwrap().value else {
+            panic!("expected cached release");
+        };
+        *fetched = Instant::now() - LATEST_MAX_AGE;
+        assert!(matches!(
+            cached_latest(&mut cache, repo()).await,
+            Err(AppError::BadGateway(_))
+        ));
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+
+        let cache = tokio::sync::Mutex::new(None);
+        let check = || async {
+            let mut entry = cache.lock().await;
+            cached_latest(&mut entry, repo()).await
+        };
+        let (a, b, c) = tokio::join!(check(), check(), check());
+        for result in [a, b, c] {
+            assert!(matches!(result, Err(AppError::BadGateway(_))));
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn repo_url_to_api() {

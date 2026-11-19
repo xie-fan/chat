@@ -51,12 +51,14 @@ struct MockApi {
     cdn_base: String,
     have_release: bool,
     auth: Arc<StdMutex<Vec<String>>>,
+    version: Arc<StdMutex<&'static str>>,
 }
 
 struct GhMock {
     api_base: String,
     api_auth: Arc<StdMutex<Vec<String>>>,
     cdn_auth: Arc<StdMutex<Vec<String>>>,
+    version: Arc<StdMutex<&'static str>>,
 }
 
 async fn gh_latest(AxState(m): AxState<MockApi>, h: AxHeaderMap) -> AxResponse {
@@ -64,7 +66,9 @@ async fn gh_latest(AxState(m): AxState<MockApi>, h: AxHeaderMap) -> AxResponse {
     if !m.have_release {
         return AxStatus::NOT_FOUND.into_response();
     }
+    let version = *m.version.lock().unwrap();
     let asset = |name: &str, size: i64| {
+        let name = name.replace("9.9.9", version);
         json!({
             "name": name,
             "size": size,
@@ -72,7 +76,7 @@ async fn gh_latest(AxState(m): AxState<MockApi>, h: AxHeaderMap) -> AxResponse {
         })
     };
     AxJson(json!({
-        "tag_name": "v9.9.9",
+        "tag_name": format!("v{version}"),
         "body": "更新说明 v9",
         "published_at": "2026-01-02T03:04:05Z",
         "assets": [
@@ -115,6 +119,7 @@ async fn cdn_file(
 async fn gh_mock(have_release: bool) -> GhMock {
     let api_auth = Arc::new(StdMutex::new(Vec::new()));
     let cdn_auth = Arc::new(StdMutex::new(Vec::new()));
+    let version = Arc::new(StdMutex::new("9.9.9"));
 
     let cdn_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cdn_base = format!("http://{}", cdn_listener.local_addr().unwrap());
@@ -130,6 +135,7 @@ async fn gh_mock(have_release: bool) -> GhMock {
         cdn_base,
         have_release,
         auth: api_auth.clone(),
+        version: version.clone(),
     };
     let api_app = AxRouter::new()
         .route("/repos/{o}/{r}/releases/latest", get(gh_latest))
@@ -142,6 +148,7 @@ async fn gh_mock(have_release: bool) -> GhMock {
         api_base,
         api_auth,
         cdn_auth,
+        version,
     }
 }
 
@@ -204,6 +211,7 @@ async fn github_release_flow() {
         .map(|a| a["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"Chat_9.9.9_x64-setup.exe"));
+    *mock.version.lock().unwrap() = "9.9.10";
 
     // /client/update：签名经 /dl → 302 → CDN 取回
     let r: Value = http()
@@ -234,9 +242,9 @@ async fn github_release_flow() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), &[1, 2, 3, 4, 5]);
 
-    // token 只到 API：API 三次请求都带 Bearer，CDN 两次下载都不带 Authorization
+    // token 只到 API；版本检查、更新和下载复用同一份 Release。
     let api_auth = mock.api_auth.lock().unwrap();
-    assert_eq!(api_auth.len(), 3);
+    assert_eq!(api_auth.len(), 1);
     assert!(api_auth.iter().all(|a| a == "Bearer tok-test"));
     let cdn_auth = mock.cdn_auth.lock().unwrap();
     assert_eq!(cdn_auth.len(), 2);

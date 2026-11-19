@@ -120,7 +120,7 @@ async fn attachment_download_hardened() {
         .starts_with("attachment"));
 }
 
-/// P1-5：UPLOAD_MAX_MB(25MB) 与 Axum body limit 一致。26MB 走流式检查拒掉，30MB 被 body limit 拦下。
+/// 文件和 multipart 请求各有大小上限，但错误提示相同。
 #[tokio::test]
 async fn upload_body_limit_consistent() {
     let base = spawn().await;
@@ -141,25 +141,22 @@ async fn upload_body_limit_consistent() {
             let form = reqwest::multipart::Form::new()
                 .text("conversation_id", conv)
                 .part("file", part);
-            match http()
+            let r = http()
                 .post(format!("{base}/v1/files"))
                 .header("authorization", authz(&at))
                 .multipart(form)
                 .send()
                 .await
-            {
-                Ok(r) => r.status().as_u16(),
-                // 中途断连（body limit 直接切断）同样视为拒绝
-                Err(_) => 0,
-            }
+                .unwrap();
+            (r.status().as_u16(), r.json::<serde_json::Value>().await.unwrap())
         }
     };
 
-    // 26MB：body limit(25MB+1MB 余量)放行，流式检查在 >25MB 处掐断，返回干净的 400
-    assert_eq!(up(26 * 1024 * 1024).await, 400);
-    // 30MB：超过 body limit 上限被拒（413/400/连接中止皆可，只要不落库）
-    let st = up(30 * 1024 * 1024).await;
-    assert!(st == 0 || st == 400 || st == 413, "unexpected status {st}");
+    for size in [25 * 1024 * 1024 + 1, 26 * 1024 * 1024] {
+        let (st, body) = up(size).await;
+        assert_eq!(st, 413);
+        assert_eq!(body["error"], "文件大小不能超过 25 MB");
+    }
 }
 
 /// P1-4：并发非法 refresh 不得拖垮连接池。全部 401，/users/me 仍即时响应。

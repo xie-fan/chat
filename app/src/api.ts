@@ -1196,6 +1196,22 @@ export const admin = {
       xhr.onerror = () => reject(new ApiError(0, "网络错误"));
       xhr.send(fd);
     }),
+  restoreDroppedBackup: async (id: string, onProgress: (pct: number) => void) => {
+    const { Channel, invoke } = await import("@tauri-apps/api/core");
+    requireIdentity();
+    const progress = new Channel<number>();
+    progress.onmessage = onProgress;
+    try {
+      await invoke("restore_dropped_backup", {
+        id,
+        server: getServer(),
+        access: readAuth(localStorage, serverScope())?.access ?? "",
+        progress,
+      });
+    } catch (e) {
+      throw new Error(String(e));
+    }
+  },
 };
 
 // ---------- ACP Agent Workspace ----------

@@ -11,7 +11,7 @@
   就是客户端看到的更新说明。
 
 链路：gate 查重 → 复用 [ci.yml](../.github/workflows/ci.yml) 的测试 → 需要时建 tag →
-建草稿 Release → 三台机器并行打包、上传到草稿 → 验齐 7 个产物后自动转公开。
+建草稿 Release → 四台机器并行打包、上传到草稿 → 验齐 8 个产物后自动转公开。
 
 | job | runner | 产物 |
 |---|---|---|
@@ -22,11 +22,25 @@
 | windows | windows-latest | `Chat_X_x64-setup.exe` + `.sig`（NSIS，Tauri 签名） |
 | android | ubuntu-latest | `Chat_X_arm64.apk`（Fixed Debug Keystore 签名；缺 secret 直接红，签名指纹对不上不上传） |
 | linux | ubuntu-22.04 | `Chat_X_amd64.deb` + `.sig`、`Chat_X_amd64.AppImage` + `.sig` |
-| publish | ubuntu-latest | 7 个产物齐了才 `gh release edit --draft=false`；仅最高版本带 `--latest` |
+| macos | macos-15 | `Chat_X_universal.dmg`（Apple Silicon / Intel，手动安装） |
+| publish | ubuntu-latest | 8 个产物齐了才 `gh release edit --draft=false`；仅最高版本带 `--latest` |
 
 全部用免费托管 runner，不花钱、不需要自备机器。草稿对外不可见（`/releases/latest` 忽略草稿），
 所以打坏一半也不会被客户端看到；修好到 Actions 页 **Re-run failed jobs** 即可，tag 和草稿
 都会被沿用，已发布的 Release 绝不会再被覆盖上传。
+
+macOS DMG 不提供应用内自动安装。配置下文全部 Apple secrets 后，Tauri 使用 Developer ID
+签名并提交 Apple 公证；缺少任一项时使用临时签名（ad-hoc），不公证。macOS 专用 bundle ID
+由 `com.chat.app` 改为 `com.chat.desktop`；旧手动安装版的本地数据不会自动迁移，
+可能需要重新登录，服务端消息不受影响。其他平台的 ID 保持不变。
+
+临时签名的安装包可能被 Gatekeeper 拦截。确认 DMG 来自可信的官方 Release 后，将 Chat 拖进
+「应用程序」并尝试打开一次，再在「系统设置 → 隐私与安全性」中点「仍要打开」
+（Open Anyway）。也可仅移除这一个已安装应用的隔离属性：
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Chat.app
+```
 
 发版 run 全程串行（concurrency 组 `release-<repo>`，`cancel-in-progress: false`）。注意
 GitHub 每个组只保留**一个**排队中的 run：一个 release run 正在跑时又连续触发两次，先排队的
@@ -45,6 +59,19 @@ GitHub 每个组只保留**一个**排队中的 run：一个 release run 正在�
 把 `chat-updater.key`（与 `app/src-tauri/tauri.conf.json` 里的 updater pubkey 配对）和
 `debug.keystore` 备份到安全的地方。丢了私钥就再也推不了在线更新，只能让大家手动重装；
 丢了 keystore，Android 用户必须卸载重装。
+
+### macOS：Developer ID 签名与 Apple 公证（可选）
+
+配置以下六个 GitHub Actions secrets，缺一项就使用临时签名：
+
+| Secret | 内容 |
+|---|---|
+| `APPLE_CERTIFICATE` | Developer ID Application 证书及私钥（base64 编码的 `.p12`） |
+| `APPLE_CERTIFICATE_PASSWORD` | `.p12` 导出密码 |
+| `APPLE_SIGNING_IDENTITY` | Developer ID Application 签名身份 |
+| `APPLE_ID` | Apple 开发者账号 |
+| `APPLE_PASSWORD` | 该账号的 App 专用密码 |
+| `APPLE_TEAM_ID` | Apple Developer Team ID |
 
 ### Android：Fixed Debug Keystore 与签名指纹闸
 
