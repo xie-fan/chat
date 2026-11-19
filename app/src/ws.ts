@@ -82,6 +82,7 @@ function scheduleHeartbeat(sock: WebSocket) {
 
 function onOnline() {
   if (stopped || getState().wsReady) return;
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
   if (reconnectTimer != null) clearTimeout(reconnectTimer);
   reconnectTimer = null;
   attempts = 0;
@@ -266,6 +267,11 @@ async function connect() {
     return;
   }
   if (stopped || gen !== wsGen || gen !== session() || attempt !== connectionAttempt) return; // ticket 落地前会话已换代 → 丢弃
+  if (ws) {
+    clearHeartbeat();
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    ws.close();
+  }
   const sock = new WebSocket(`${wsBase()}/v1/ws?ticket=${ticket}`);
   ws = sock;
 

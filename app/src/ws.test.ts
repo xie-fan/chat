@@ -8,6 +8,7 @@ const me = { id: "me", username: "me", display_name: "Me", role: "user" as const
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
 const conversation = (): ConversationView => ({ id: "c", kind: "group", name: "C", owner_id: "me", member_count: 2, peer: null, last_seq: 0, unread_count: 0, has_mention: false, last_message: null, created_at: "2026-01-01T00:00:00Z" });
 class Socket {
+  static CONNECTING = 0;
   static OPEN = 1;
   static all: Socket[] = [];
   readyState = 1;
@@ -152,6 +153,31 @@ describe("WebSocket delivery", () => {
     second.onopen?.();
     await vi.advanceTimersByTimeAsync(0);
     expect(getState().wsReady).toBe(true);
+  });
+
+  it("does not orphan a reconnect socket still connecting when the browser goes online", async () => {
+    const first = await open();
+    first.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const reconnect = Socket.all[Socket.all.length - 1];
+    reconnect.readyState = Socket.CONNECTING;
+    const count = Socket.all.length;
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(Socket.all).toHaveLength(count);
+    stopWs();
+    expect(Socket.all.every((socket) => socket.readyState === 3)).toBe(true);
+  });
+
+  it("closes and detaches any previous socket before replacing it", async () => {
+    await startWs();
+    const first = Socket.all[Socket.all.length - 1];
+    first.readyState = Socket.CONNECTING;
+    await startWs();
+    expect(first.readyState).toBe(3);
+    expect([first.onopen, first.onmessage, first.onclose, first.onerror]).toEqual([null, null, null, null]);
+    stopWs();
+    expect(Socket.all.every((socket) => socket.readyState === 3)).toBe(true);
   });
 
   it("does not treat a failed startup friendship fetch as a confirmed removal", async () => {
