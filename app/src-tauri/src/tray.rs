@@ -9,6 +9,8 @@ use tauri::{AppHandle, Manager, Window, WindowEvent};
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static RAISE_ON_NOTIFICATION_FOCUS: AtomicBool = AtomicBool::new(false);
 
 const TRAY_HINT: &str = "Chat 已最小化到托盘，会继续接收消息";
 
@@ -91,6 +93,52 @@ pub(crate) fn reveal(app: &AppHandle) {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn reveal_notification(app: &AppHandle) {
+    use gtk::prelude::*;
+
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Ok(gtk_window) = window.gtk_window() {
+        if !gtk_window.is_mapped() {
+            RAISE_ON_NOTIFICATION_FOCUS.store(true, Ordering::Relaxed);
+            gtk_window.show_all();
+            gtk_window.deiconify();
+            gtk::glib::idle_add_local_once(move || {
+                if gtk_window.is_mapped() {
+                    if gtk_window.is_active() {
+                        raise_on_notification_focus(&gtk_window);
+                    } else {
+                        gtk_window.set_urgency_hint(true);
+                        gtk_window.present();
+                    }
+                }
+            });
+            return;
+        }
+    }
+    if matches!(window.is_focused(), Ok(false)) {
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+    reveal(app);
+}
+
+#[cfg(target_os = "linux")]
+fn raise_on_notification_focus(window: &gtk::ApplicationWindow) {
+    use gtk::prelude::*;
+
+    if let Some(native) = window.window() {
+        // KWin can focus a remapped window without raising it.
+        if window.is_mapped()
+            && window.is_active()
+            && RAISE_ON_NOTIFICATION_FOCUS.swap(false, Ordering::Relaxed)
+        {
+            native.raise();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct LinuxTray(AppHandle);
 
 #[cfg(target_os = "linux")]
@@ -160,6 +208,11 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     #[cfg(target_os = "linux")]
     if window.label() == "main" && matches!(event, WindowEvent::Focused(true)) {
         let _ = window.request_user_attention(None);
+        if RAISE_ON_NOTIFICATION_FOCUS.load(Ordering::Relaxed) {
+            if let Ok(gtk_window) = window.gtk_window() {
+                raise_on_notification_focus(&gtk_window);
+            }
+        }
     }
     let WindowEvent::CloseRequested { api, .. } = event else {
         return;
@@ -168,6 +221,8 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
         return;
     }
     api.prevent_close();
+    #[cfg(target_os = "linux")]
+    RAISE_ON_NOTIFICATION_FOCUS.store(false, Ordering::Relaxed);
     let _ = window.hide();
     if TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst) {
         return;
