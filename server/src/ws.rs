@@ -356,6 +356,10 @@ async fn on_text(
     }
     let parsed: Result<WsIn, _> = serde_json::from_str(text);
     let (res, client_msg_id) = match parsed {
+        Ok(WsIn::Ping) => {
+            let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::Pong)));
+            (Ok(()), None)
+        }
         Ok(WsIn::SendMessage {
             conversation_id,
             client_msg_id,

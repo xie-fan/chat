@@ -4,7 +4,7 @@
 // 服务端暂时连不上时回放（会话列表 + 最近打开会话的最后 50 条消息），登出/换号清除。
 // 读写都吞异常（隐私模式/损坏数据按空处理），总量约 1MB，超限丢最旧。
 
-import type { ConversationView, MessageView } from "./types";
+import type { ConversationView, FriendView, MessageView } from "./types";
 
 export interface CacheStorage {
   getItem(key: string): string | null;
@@ -16,6 +16,7 @@ export interface CacheStorage {
 }
 
 export interface LocalCacheData {
+  friends?: FriendView[];
   conversations: ConversationView[];
   /** 最近打开过的会话（新→旧），messages 只为它们保留 */
   recent: string[];
@@ -48,6 +49,7 @@ export function readLocalCache(storage: CacheStorage, key: string): LocalCacheDa
       if (Array.isArray(list)) messages[id] = list as MessageView[];
     }
     return {
+      ...(Array.isArray(o.friends) ? { friends: o.friends } : {}),
       conversations: o.conversations,
       recent: Array.isArray(o.recent)
         ? o.recent.filter((x): x is string => typeof x === "string")
@@ -71,6 +73,7 @@ export function writeLocalCache(
     let recent = data.recent.slice(0, MAX_CACHED_CONVS);
     let conversations = data.conversations;
     const pack = () => ({
+      friends: data.friends,
       conversations,
       recent,
       messages: Object.fromEntries(

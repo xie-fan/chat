@@ -87,6 +87,14 @@ export default function App() {
     if (!booting) return;
     let cancelled = false;
     (async () => {
+      const cached = loadSession()?.user;
+      if (cached) {
+        const snap = readLocalCache(localStorage, cacheKey(serverScope(), cached.id));
+        if (snap) {
+          seedRecent(snap.recent);
+          setState({ conversations: snap.conversations, messages: snap.messages, friends: snap.friends ?? [], friendsLoaded: false });
+        }
+      }
       try {
         const me = await auth.me();
         if (cancelled) return;
@@ -105,6 +113,8 @@ export default function App() {
             drafts: readDrafts(localStorage, serverScope(), cached.id),
             conversations: snap?.conversations ?? [],
             messages: snap?.messages ?? {},
+            friends: snap?.friends ?? [],
+            friendsLoaded: false,
           });
           void startWs();
         }

@@ -71,6 +71,11 @@ export function FoundUserRow({
   );
 }
 
+export async function reloadContacts() {
+  const [f, r] = await Promise.all([friends.list(), friends.requests()]);
+  setState({ friends: f, friendsLoaded: true, requests: r });
+}
+
 export default function ContactsPanel() {
   const s = useApp();
   const [q, setQ] = useState("");
@@ -80,11 +85,6 @@ export default function ContactsPanel() {
   const [hint, setHint] = useState("");
   const [searching, setSearching] = useState(false);
   const [activeLetter, setActiveLetter] = useState<string | null>(null);
-
-  const reload = async () => {
-    const [f, r] = await Promise.all([friends.list(), friends.requests()]);
-    setState({ friends: f, requests: r });
-  };
 
   const search = async () => {
     setResults(null);
@@ -112,7 +112,7 @@ export default function ContactsPanel() {
       setResults(null);
       setQ("");
       setMsg("");
-      void reload();
+      void reloadContacts();
     } catch (e) {
       setHint(e instanceof Error ? e.message : "发送失败");
     }
@@ -133,7 +133,7 @@ export default function ContactsPanel() {
     )
       return;
     await friends.remove(u.id);
-    await reload();
+    await reloadContacts();
   };
 
   const groups = useMemo(() => groupFriendsByLetter(s.friends), [s.friends]);
@@ -230,11 +230,11 @@ export default function ContactsPanel() {
                   </div>
                   <button
                     className="primary"
-                    onClick={() => friends.accept(r.id).then(reload)}
+                    onClick={() => friends.accept(r.id).then(reloadContacts)}
                   >
                     接受
                   </button>
-                  <button onClick={() => friends.decline(r.id).then(reload)}>拒绝</button>
+                  <button onClick={() => friends.decline(r.id).then(reloadContacts)}>拒绝</button>
                 </div>
               ))}
               {s.requests.outgoing.map((r) => (

@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSession, saveSession } from "./api";
-import { getState, setState } from "./store";
+import { getState, isReadonlyDm, setState } from "./store";
 import type { ConversationView, MessageView } from "./types";
-import { discardSend, kickReasonText, leaveGroup, retrySend, sendChat, startWs, stopWs } from "./ws";
+import { discardSend, kickReasonText, leaveGroup, refreshCatalogs, retrySend, sendChat, startWs, stopWs } from "./ws";
 
 const me = { id: "me", username: "me", display_name: "Me", role: "user" as const, last_seen_at: null };
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
 const conversation = (): ConversationView => ({ id: "c", kind: "group", name: "C", owner_id: "me", member_count: 2, peer: null, last_seq: 0, unread_count: 0, has_mention: false, last_message: null, created_at: "2026-01-01T00:00:00Z" });
 class Socket {
+  static CONNECTING = 0;
   static OPEN = 1;
   static all: Socket[] = [];
   readyState = 1;
@@ -16,8 +17,13 @@ class Socket {
   onmessage: ((event: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: Record<string, unknown>[] = [];
+  respondPing = true;
   constructor() { Socket.all.push(this); }
-  send(data: string) { this.sent.push(JSON.parse(data)); }
+  send(data: string) {
+    const frame = JSON.parse(data);
+    this.sent.push(frame);
+    if (frame.type === "ping" && this.respondPing) queueMicrotask(() => this.frame({ type: "pong" }));
+  }
   close() { this.readyState = 3; this.onclose?.(); }
   frame(data: unknown) { this.onmessage?.({ data: JSON.stringify(data) }); }
 }
@@ -26,7 +32,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   const storage = new Map<string, string>();
   vi.stubGlobal("localStorage", { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) });
-  vi.stubGlobal("window", { setTimeout, dispatchEvent: vi.fn() });
+  const events = new EventTarget();
+  vi.stubGlobal("window", { setTimeout, dispatchEvent: events.dispatchEvent.bind(events), addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events) });
   vi.stubGlobal("location", { origin: "http://localhost" });
   vi.stubGlobal("WebSocket", Socket);
   Socket.all = [];
@@ -105,20 +112,84 @@ describe("WebSocket delivery", () => {
     expect(getState().messages.c).toEqual([]); // 删掉的不会被恢复
   });
 
-  it("marks a sent-but-unacked message as failed after the ack timeout and recovers on retry", async () => {
+  it("reconnects and auto-resends an ack timeout with the same id, converging duplicate acks", async () => {
     const sock = await open();
     sendChat("c", "lost-ack");
     const [frame] = sock.sent.filter((f) => f.type === "send_message");
     const cid = frame.client_msg_id as string;
-    // ack 丢失（服务端回包通道满等）：连接还在，什么帧都不回 → 不能永远「发送中」
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(getState().messages.c[0].send_error).toBe("发送超时，请检查网络后重试");
-    // 重试仍用同一 client_msg_id（服务端幂等），ack 到达后收敛为真身
-    retrySend(cid);
+    // 心跳正常但 ack 丢失，仍需重连重放。
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(getState().wsReady).toBe(false);
     expect(getState().messages.c[0].send_error).toBeUndefined();
-    expect(sock.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id)).toEqual([cid, cid]);
-    sock.frame({ type: "message_ack", client_msg_id: cid, message: { ...message(1), sender_id: "me", sender_name: "Me" } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = Socket.all[Socket.all.length - 1];
+    second.onopen?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(second.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id)).toEqual([cid]);
+    const ack = { type: "message_ack", client_msg_id: cid, message: { ...message(1), sender_id: "me", sender_name: "Me" } };
+    second.frame(ack);
+    second.frame(ack);
     expect(getState().messages.c.map((m) => m.id)).toEqual(["m1"]);
+  });
+
+  it("detects a silent dead socket within seven seconds even without sending a message", async () => {
+    const sock = await open();
+    sock.respondPing = false;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sock.sent).toContainEqual({ type: "ping" });
+    expect(getState().wsReady).toBe(true);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(getState().wsReady).toBe(false);
+    expect(sock.readyState).toBe(3);
+  });
+
+  it("responds immediately to browser offline and online events", async () => {
+    await open();
+    window.dispatchEvent(new Event("offline"));
+    expect(getState().wsReady).toBe(false);
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    const second = Socket.all[Socket.all.length - 1];
+    second.onopen?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getState().wsReady).toBe(true);
+  });
+
+  it("does not orphan a reconnect socket still connecting when the browser goes online", async () => {
+    const first = await open();
+    first.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const reconnect = Socket.all[Socket.all.length - 1];
+    reconnect.readyState = Socket.CONNECTING;
+    const count = Socket.all.length;
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(Socket.all).toHaveLength(count);
+    stopWs();
+    expect(Socket.all.every((socket) => socket.readyState === 3)).toBe(true);
+  });
+
+  it("closes and detaches any previous socket before replacing it", async () => {
+    await startWs();
+    const first = Socket.all[Socket.all.length - 1];
+    first.readyState = Socket.CONNECTING;
+    await startWs();
+    expect(first.readyState).toBe(3);
+    expect([first.onopen, first.onmessage, first.onclose, first.onerror]).toEqual([null, null, null, null]);
+    stopWs();
+    expect(Socket.all.every((socket) => socket.readyState === 3)).toBe(true);
+  });
+
+  it("does not treat a failed startup friendship fetch as a confirmed removal", async () => {
+    const peer = { ...me, id: "friend" };
+    const dm = { ...conversation(), kind: "dm", peer };
+    setState({ conversations: [dm], friends: [{ user: peer, since: "2026-01-01" }], friendsLoaded: false });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
+    await expect(refreshCatalogs()).rejects.toThrow("offline");
+    expect(isReadonlyDm(dm, getState())).toBe(false);
+    expect(getState().friends.map((f) => f.user.id)).toEqual([peer.id]);
+    sendChat("c", "queued offline");
+    expect(getState().messages.c[0].send_error).toBeUndefined();
   });
 
   it("resolves the optimistic bubble when the ack is lost but the message echoes via broadcast", async () => {

@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { FoundUserRow } from "./ContactsPanel";
-import type { FriendView, UserPublic } from "../types";
+import { FoundUserRow, reloadContacts } from "./ContactsPanel";
+import { friends } from "../api";
+import { getState, isReadonlyDm, resetSessionState, setState } from "../store";
+import type { ConversationView, FriendView, UserPublic } from "../types";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  setState(resetSessionState());
+});
 
 const user = (id: string): UserPublic => ({
   id,
@@ -52,5 +59,28 @@ describe("好友搜索结果行", () => {
     const html = renderRow({ u: user("u3"), picked: true });
     expect(html).toContain("发送");
     expect(html).not.toContain("加好友");
+  });
+});
+
+describe("contacts friendship authority", () => {
+  const dm: ConversationView = { id: "c", kind: "dm", peer: user("u1"), name: null, owner_id: null, member_count: 2, last_seq: 0, unread_count: 0, has_mention: false, last_message: null, created_at: "2026-01-01" };
+
+  it.each([{ list: [] }, { list: [friend("u1")] }])("makes a successful contacts refresh authoritative: %j", async ({ list }) => {
+    setState({ friends: [friend("u1")], friendsLoaded: false });
+    vi.spyOn(friends, "list").mockResolvedValue(list);
+    vi.spyOn(friends, "requests").mockResolvedValue({ incoming: [], outgoing: [] });
+    await reloadContacts();
+    expect(getState().friendsLoaded).toBe(true);
+    expect(isReadonlyDm(dm, getState())).toBe(list.length === 0);
+  });
+
+  it("keeps failed contacts loads unknown and cached DMs writable", async () => {
+    setState({ friends: [friend("u1")], friendsLoaded: false });
+    vi.spyOn(friends, "list").mockRejectedValue(new TypeError("offline"));
+    vi.spyOn(friends, "requests").mockResolvedValue({ incoming: [], outgoing: [] });
+    await expect(reloadContacts()).rejects.toThrow("offline");
+    expect(getState().friendsLoaded).toBe(false);
+    expect(getState().friends).toEqual([friend("u1")]);
+    expect(isReadonlyDm(dm, getState())).toBe(false);
   });
 });

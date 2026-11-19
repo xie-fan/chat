@@ -8,6 +8,7 @@ import {
   getState,
   fetchForward,
   isOwnMessage,
+  isReadonlyDm,
   prependMessages,
   pushToast,
   setDraft,
@@ -703,7 +704,7 @@ export default function ChatView() {
   const peerOnline = conv.kind === "dm" && conv.peer ? !!s.online[conv.peer.id] : false;
   const typing = s.typing[conv.id];
   const typingFresh = typing && Date.now() - typing.ts < 5000;
-  const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
+  const readonly = isReadonlyDm(conv, s);
 
   // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
   // —— 以下谓词服务已下线功能（feature flag 关闭），代码路径保留 ——

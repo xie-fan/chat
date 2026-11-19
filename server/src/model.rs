@@ -376,6 +376,7 @@ pub struct WsTicketQuery {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsIn {
+    Ping,
     SendMessage {
         conversation_id: Uuid,
         client_msg_id: Option<String>,
@@ -412,6 +413,7 @@ pub enum WsIn {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsOut {
+    Pong,
     Message {
         message: MessageView,
     },
