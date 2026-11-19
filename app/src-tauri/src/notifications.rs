@@ -191,11 +191,8 @@ fn activate(app: &AppHandle, target: Option<Target>) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         #[cfg(target_os = "linux")]
-        if let Some(window) = handle.get_webview_window("main") {
-            if matches!(window.is_focused(), Ok(false)) {
-                let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
-            }
-        }
+        crate::tray::reveal_notification(&handle);
+        #[cfg(not(target_os = "linux"))]
         crate::tray::reveal(&handle);
         if let Some(target) = target {
             if let Some(window) = handle.get_webview_window("main") {
