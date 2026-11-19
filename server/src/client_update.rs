@@ -120,7 +120,7 @@ fn update_client() -> reqwest::Client {
 }
 
 /// GitHub/GitHub 兼容（Gitea 同名字段）的 Release 读模型
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Release {
     tag_name: String,
     #[serde(default)]
@@ -131,7 +131,7 @@ struct Release {
     assets: Vec<ReleaseAsset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ReleaseAsset {
     name: String,
     size: i64,
@@ -140,8 +140,12 @@ struct ReleaseAsset {
 
 async fn latest_release(st: &SharedState) -> AppResult<Release> {
     let s = settings::load(&st.pool).await?;
-    let repo = resolve_repo(&s.update_repo_url).ok_or_else(|| AppError::not_found("update_off"))?;
-    fetch_release(&repo).await
+    let mut cache = st.client_latest.lock().await;
+    let Some(repo) = resolve_repo(&s.update_repo_url) else {
+        *cache = None;
+        return Err(AppError::not_found("update_off"));
+    };
+    cached_latest(&mut cache, repo).await
 }
 
 async fn fetch_release(repo: &UpdateRepo) -> AppResult<Release> {
@@ -182,13 +186,13 @@ fn version_of(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct AssetView {
     pub name: String,
     pub size: i64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct ClientLatest {
     pub version: String,
     pub notes: String,
@@ -203,26 +207,33 @@ const LATEST_RETRY_DELAY: Duration = Duration::from_secs(15);
 
 pub(crate) struct CachedLatest {
     source: UpdateRepo,
-    release: ClientLatest,
+    release: Release,
     fetched: Instant,
     retry_at: Instant,
 }
 
 /// GET /client/latest：公共端点。功能关闭 / 还没有 Release → 404
 pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLatest>> {
-    let s = settings::load(&st.pool).await?;
-    let mut cache = st.client_latest.lock().await;
-    let Some(repo) = resolve_repo(&s.update_repo_url) else {
-        *cache = None;
-        return Err(AppError::not_found("update_off"));
-    };
-    cached_latest(&mut cache, repo).await.map(Json)
+    let r = latest_release(&st).await?;
+    Ok(Json(ClientLatest {
+        version: version_of(&r.tag_name).to_string(),
+        notes: r.body,
+        published_at: r.published_at,
+        assets: r
+            .assets
+            .into_iter()
+            .map(|a| AssetView {
+                name: a.name,
+                size: a.size,
+            })
+            .collect(),
+    }))
 }
 
 async fn cached_latest(
     cache: &mut Option<CachedLatest>,
     repo: UpdateRepo,
-) -> AppResult<ClientLatest> {
+) -> AppResult<Release> {
     if cache.as_ref().is_some_and(|entry| entry.source != repo) {
         *cache = None;
     }
@@ -231,7 +242,7 @@ async fn cached_latest(
             return Ok(entry.release.clone());
         }
     }
-    let r = match fetch_release(&repo).await {
+    let release = match fetch_release(&repo).await {
         Ok(release) => release,
         Err(e) => {
             if matches!(e, AppError::BadGateway(_)) {
@@ -245,19 +256,6 @@ async fn cached_latest(
             *cache = None;
             return Err(e);
         }
-    };
-    let release = ClientLatest {
-        version: version_of(&r.tag_name).to_string(),
-        notes: r.body,
-        published_at: r.published_at,
-        assets: r
-            .assets
-            .into_iter()
-            .map(|a| AssetView {
-                name: a.name,
-                size: a.size,
-            })
-            .collect(),
     };
     let fetched = Instant::now();
     *cache = Some(CachedLatest {
@@ -408,23 +406,23 @@ mod tests {
         let repo = || UpdateRepo::Gitea { api: url.clone() };
         let mut cache = None;
         assert_eq!(
-            cached_latest(&mut cache, repo()).await.unwrap().version,
-            "0.8.3"
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
         );
         assert_eq!(
-            cached_latest(&mut cache, repo()).await.unwrap().version,
-            "0.8.3"
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
         );
         assert_eq!(requests.load(Ordering::Relaxed), 1);
 
         cache.as_mut().unwrap().retry_at = Instant::now();
         assert_eq!(
-            cached_latest(&mut cache, repo()).await.unwrap().version,
-            "0.8.3"
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
         );
         assert_eq!(
-            cached_latest(&mut cache, repo()).await.unwrap().version,
-            "0.8.3"
+            cached_latest(&mut cache, repo()).await.unwrap().tag_name,
+            "v0.8.3"
         );
         assert_eq!(requests.load(Ordering::Relaxed), 2);
 
