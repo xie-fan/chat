@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSession, saveSession } from "./api";
 import { getState, isReadonlyDm, setState } from "./store";
 import type { ConversationView, MessageView } from "./types";
-import { discardSend, kickReasonText, leaveGroup, refreshCatalogs, retrySend, sendChat, startWs, stopWs } from "./ws";
+import { discardSend, kickReasonText, leaveGroup, openConversationFromNotification, refreshCatalogs, retrySend, sendChat, startWs, stopWs } from "./ws";
 
 const me = { id: "me", username: "me", display_name: "Me", role: "user" as const, last_seen_at: null };
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
@@ -190,6 +190,23 @@ describe("WebSocket delivery", () => {
     expect(getState().friends.map((f) => f.user.id)).toEqual([peer.id]);
     sendChat("c", "queued offline");
     expect(getState().messages.c[0].send_error).toBeUndefined();
+  });
+
+  it.each([false, true])("marks a cold-start notification chat read after connecting (cached=%s)", async (cached) => {
+    const unread = { ...conversation(), last_seq: 7, unread_count: 1, has_mention: true };
+    setState({ conversations: cached ? [{ ...unread, last_seq: 6 }] : [], friendsLoaded: false });
+    const fetchBefore = fetch;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+      url.endsWith("/conversations") ? Response.json([unread]) : fetchBefore(url),
+    ));
+
+    openConversationFromNotification("c");
+    expect(getState().activeConv).toBe("c");
+    if (cached) expect(getState().conversations[0].unread_count).toBe(1);
+    const sock = await open();
+
+    expect(sock.sent.filter((f) => f.type === "read")).toEqual([{ type: "read", conversation_id: "c", seq: 7 }]);
+    expect(getState().conversations[0]).toMatchObject({ unread_count: 0, has_mention: false });
   });
 
   it("resolves the optimistic bubble when the ack is lost but the message echoes via broadcast", async () => {

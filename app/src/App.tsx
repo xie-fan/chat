@@ -6,7 +6,7 @@ import { clearReedits, purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
 import { listenForNotificationClicks, notificationReady, syncWindowTitle } from "./notify";
 import { flushDrafts, getState, resetSessionState, setState, useApp } from "./store";
-import { openConversation, startWs, stopWs } from "./ws";
+import { openConversationFromNotification, startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
 import ChatScreen from "./ui/ChatScreen";
 import { DialogHost, dismissAllDialogs } from "./ui/Modal";
@@ -30,7 +30,7 @@ export default function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenForNotificationClicks((id) => {
-      if (!disposed && getState().me) openConversation(id);
+      if (!disposed && getState().me) openConversationFromNotification(id);
     }).then((stop) => {
       if (disposed) stop?.();
       else {
