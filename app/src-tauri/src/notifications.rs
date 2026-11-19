@@ -53,7 +53,7 @@ pub async fn notification_permission(
     }
     #[cfg(target_os = "macos")]
     {
-        use mac_usernotifications::{get_notification_settings, request_auth, AuthorizationStatus};
+        use mac_usernotifications::{get_notification_settings, AuthorizationStatus};
         let _ = app;
         let settings = get_notification_settings()
             .await
@@ -64,7 +64,7 @@ pub async fn notification_permission(
             | AuthorizationStatus::Ephemeral => "granted",
             AuthorizationStatus::Denied => "denied",
             AuthorizationStatus::NotDetermined if request => {
-                if request_auth().await.map_err(|e| e.to_string())? {
+                if request_mac_auth().await? {
                     "granted"
                 } else {
                     "denied"
@@ -182,6 +182,29 @@ pub async fn show_desktop(
             .await;
     });
     Ok(())
+}
+
+// mac-usernotifications 只申请 Alert|Sound；不申请 Badge 时 Dock 角标不显示。
+#[cfg(target_os = "macos")]
+async fn request_mac_auth() -> Result<bool, String> {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::NSError;
+    use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    UNUserNotificationCenter::currentNotificationCenter()
+        .requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert
+                | UNAuthorizationOptions::Sound
+                | UNAuthorizationOptions::Badge,
+            &RcBlock::new(move |granted: Bool, _: *mut NSError| {
+                if let Some(tx) = tx.lock().ok().and_then(|mut tx| tx.take()) {
+                    let _ = tx.send(granted.as_bool());
+                }
+            }),
+        );
+    rx.await.map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]

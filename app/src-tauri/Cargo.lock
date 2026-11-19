@@ -493,11 +493,15 @@ name = "chat-app"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "block2",
  "dirs 6.0.0",
  "futures-util",
  "ksni",
  "mac-usernotifications",
  "notify-rust",
+ "objc2",
+ "objc2-foundation",
+ "objc2-user-notifications",
  "reqwest",
  "rustls",
  "serde",
