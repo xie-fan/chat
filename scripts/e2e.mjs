@@ -263,7 +263,8 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
   await wsb.waitType('invalidate', () => true, 3000).catch(() => {});
   wsb.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'g1', content: 'hello grp' });
   {
-    const gm = await wsa.waitType('message', (m) => m.message.conversation_id === gid);
+    // 建群会先广播一条「创建了群聊」系统消息，要跳过它等 B 的真实消息
+    const gm = await wsa.waitType('message', (m) => m.message.conversation_id === gid && m.message.kind !== 'system');
     ok('A receives group message from B', gm.message.content === 'hello grp' && gm.message.sender_id === B.user.id);
   }
 
