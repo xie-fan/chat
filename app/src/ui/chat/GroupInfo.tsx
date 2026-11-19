@@ -109,6 +109,14 @@ export default function GroupInfo({
     onClose();
   };
 
+  const kick = async (userId: string, name: string) => {
+    if (
+      !(await confirmDialog(`确定将「${name}」移出群聊？`, { danger: true, okText: "移出" }))
+    )
+      return;
+    await act(convs.kick(conv.id, userId));
+  };
+
   const dissolve = async () => {
     if (
       !(await confirmDialog(
@@ -359,7 +367,7 @@ export default function GroupInfo({
                         </button>
                         <button
                           className="danger"
-                          onClick={() => act(convs.kick(conv.id, m.user.id))}
+                          onClick={() => void kick(m.user.id, m.user.display_name)}
                         >
                           移出
                         </button>

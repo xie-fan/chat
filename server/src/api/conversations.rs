@@ -649,8 +649,25 @@ pub(super) async fn kick_member(
         return Err(AppError::not_found("member not found"));
     }
     let rest = domain::member_ids(&mut *tx, conv).await?;
+    // 先摘成员再写 group_removed：被移出者不再收到这条（与退群一致只广播给剩余成员）
+    let actor_name = domain::display_name(&mut *tx, uid).await?;
+    let target_name = domain::display_name(&mut *tx, target).await?;
+    let text = format!("{actor_name} 将 {target_name} 移出了群聊");
+    let content = domain::system_content(
+        domain::CODE_REMOVED,
+        &text,
+        domain::params_remove(&actor_name, &target_name),
+    );
+    let msg = domain::insert_system_in_tx(&mut tx, conv, uid, &content).await?;
+    let posted = domain::Posted {
+        message: msg,
+        inserted: true,
+        member_ids: rest.clone(),
+        unarchived: Vec::new(),
+    };
     tx.commit().await?;
 
+    ws::broadcast_posted(&st, conv, &posted).await;
     notify(&st, &rest, "conversations");
     notify(&st, &[target], "conversations");
     Ok(StatusCode::NO_CONTENT)

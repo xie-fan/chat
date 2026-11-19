@@ -1,6 +1,6 @@
 /**
  * 群系统消息（UI3）：kind=system，content 为 JSON
- * `{ code, text, actor_name?, group_name?, invitee_names? }`。
+ * `{ code, text, actor_name?, group_name?, invitee_names?, target_name? }`。
  * 客户端按 code 映射灰条文案；解析失败时回落 text / 原文。
  */
 
@@ -10,6 +10,7 @@ export const SYSTEM_CODES = [
   "group_announcement",
   "group_invited",
   "group_left",
+  "group_removed",
   "group_dissolved",
 ] as const;
 
@@ -21,6 +22,7 @@ export interface SystemPayload {
   actor_name?: string;
   group_name?: string;
   invitee_names?: string[];
+  target_name?: string;
 }
 
 export function isSystemCode(c: string): c is SystemCode {
@@ -45,6 +47,7 @@ export function parseSystemPayload(content: string): SystemPayload | null {
       actor_name: typeof o.actor_name === "string" ? o.actor_name : undefined,
       group_name: typeof o.group_name === "string" ? o.group_name : undefined,
       invitee_names,
+      target_name: typeof o.target_name === "string" ? o.target_name : undefined,
     };
   } catch {
     return null;
@@ -75,6 +78,10 @@ export function systemBarText(content: string): string {
     }
     case "group_left":
       return `${actor} 退出了群聊`;
+    case "group_removed": {
+      const target = (p.target_name ?? "").trim();
+      return target ? `${actor} 将 ${target} 移出了群聊` : `${actor} 移出了一名成员`;
+    }
     case "group_dissolved":
       return `${actor} 解散了群聊`;
     default:

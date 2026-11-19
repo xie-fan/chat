@@ -37,7 +37,7 @@ describe("重新编辑暂存（chat_reedit:<enc>:<uid>）", () => {
     expect(readReedits(st, A, "u1", NOW)).toEqual([entry({ text: "覆盖后" })]);
   });
 
-  it("10 分钟窗口：过期条目读取时剔除并落盘", () => {
+  it("15 分钟窗口：过期条目读取时剔除并落盘", () => {
     const st = memStorage();
     saveReedit(st, A, "u1", entry({ savedAt: NOW - REEDIT_WINDOW_MS }));
     saveReedit(st, A, "u1", entry({ message_id: "m2" }));

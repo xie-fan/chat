@@ -2,13 +2,13 @@
 // 「重新编辑」的本地原文暂存：服务端不保存已撤消息的正文，
 // 撤回前一刻由发起端自己把原文留到本机（明文，按设计如此——本机草稿同理）。
 // localStorage 键 chat_reedit:<enc(server)>:<userId> → ReeditEntry[]，
-// 按服务器 + 账号隔离；10 分钟窗口外读取时顺带清除；
+// 按服务器 + 账号隔离；15 分钟窗口外读取时顺带清除；
 // 登出由 clearReedits 整键删除；移除服务器由 servers.removeServerData 的键前缀统一清掉。
 
 import type { Stor } from "./servers";
 
-/** 「重新编辑」入口可见窗口：撤回后 10 分钟 */
-export const REEDIT_WINDOW_MS = 10 * 60 * 1000;
+/** 「重新编辑」入口可见窗口：撤回后 15 分钟（与编辑窗口 EDIT_WINDOW_MS 一致） */
+export const REEDIT_WINDOW_MS = 15 * 60 * 1000;
 
 export interface ReeditAttachment {
   id: string;

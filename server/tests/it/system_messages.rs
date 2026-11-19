@@ -199,3 +199,32 @@ async fn ui3_releave_returns_not_a_member() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["error"], "not a member of this conversation");
 }
+
+#[tokio::test]
+async fn kick_posts_group_removed_to_remaining_members() {
+    let base = spawn().await;
+    let a = register(&base, &format!("kick_a_{}", uniq())).await;
+    let b = register(&base, &format!("kick_b_{}", uniq())).await;
+    let c3 = register(&base, &format!("kick_c_{}", uniq())).await;
+    befriend(&base, &a, &b).await;
+    befriend(&base, &a, &c3).await;
+    let gid = mk_group(&base, &a, &[b.id.clone(), c3.id.clone()]).await;
+    let r = http()
+        .delete(format!("{base}/v1/conversations/{gid}/members/{}", b.id))
+        .header("authorization", authz(&a.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    for u in [&a, &c3] {
+        let msgs = msgs_of(&base, u, &gid).await;
+        let removed = msgs
+            .iter()
+            .find(|m| code_of(m) == "group_removed")
+            .expect("group_removed system message");
+        assert_eq!(removed["kind"], "system");
+        let payload: Value = serde_json::from_str(removed["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["target_name"], b.username.as_str());
+        assert!(payload["text"].as_str().unwrap().contains("移出了群聊"));
+    }
+}
