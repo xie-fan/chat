@@ -48,8 +48,9 @@ objc2-foundation = { version = "0.3", features = ["NSError"] }
 objc2-user-notifications = { version = "0.3", features = ["block2", "UNUserNotificationCenter"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+tauri-plugin-single-instance = "2"
 tauri-winrt-notification = "0.7.3"
-windows = { version = "0.61", features = ["UI_Notifications"] }
+windows = { version = "0.61", features = ["UI_Notifications", "Data_Xml_Dom", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

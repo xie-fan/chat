@@ -18,12 +18,25 @@ pub fn maybe_run_cli() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    if std::env::args().any(|arg| arg.to_ascii_lowercase().starts_with("chat://")) {
+        use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+        unsafe {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+    }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(download::init())
         .plugin(apk_installer::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(notifications::init());
+    #[cfg(target_os = "windows")]
+    let builder = builder
+        .manage(notifications::WindowsActivation::default())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            notifications::handle_windows_args(app, args);
+        }));
     #[cfg(desktop)]
     let builder = builder
         .manage(acp_host::AcpHostState::new())
@@ -38,6 +51,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             notifications::notification_permission,
             notifications::show_chat_notification,
+            notifications::notification_ready,
             download::download_to_downloads,
             updater::install_update,
             acp_host::acp_host_start,
@@ -49,6 +63,8 @@ pub fn run() {
         ])
         .setup(|app| {
             tray::install(app.handle())?;
+            #[cfg(target_os = "windows")]
+            notifications::handle_windows_args(app.handle(), std::env::args().collect());
             Ok(())
         })
         .on_window_event(tray::on_window_event);

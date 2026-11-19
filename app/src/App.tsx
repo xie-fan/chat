@@ -4,7 +4,7 @@ import { startAcpHost, stopAcpHost } from "./acpHost";
 import { draftsKey, readDrafts } from "./drafts";
 import { clearReedits, purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
-import { listenForNotificationClicks, syncWindowTitle } from "./notify";
+import { listenForNotificationClicks, notificationReady, syncWindowTitle } from "./notify";
 import { flushDrafts, getState, resetSessionState, setState, useApp } from "./store";
 import { openConversation, startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
@@ -26,19 +26,23 @@ export default function App() {
   }, [s.conversations]);
 
   useEffect(() => {
+    if (!s.me) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenForNotificationClicks((id) => {
       if (!disposed && getState().me) openConversation(id);
     }).then((stop) => {
       if (disposed) stop?.();
-      else unlisten = stop;
+      else {
+        unlisten = stop;
+        void notificationReady().catch(() => {});
+      }
     }).catch(() => {});
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [s.me?.id]);
 
   // 桌面壳登录/切换账号后自动接入本地 ACP 宿主；退出时关闭
   useEffect(() => {

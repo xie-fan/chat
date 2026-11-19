@@ -14,6 +14,7 @@ vi.mock("./notify", () => ({
   syncWindowTitle: vi.fn(),
   unreadTitle: vi.fn(),
   listenForNotificationClicks: vi.fn(async () => undefined),
+  notificationReady: vi.fn(async () => undefined),
 }));
 vi.mock("./ui/ChatScreen", () => ({ default: () => <div>chat</div> }));
 vi.mock("./ui/AuthScreen", () => ({ default: () => <div>auth</div> }));

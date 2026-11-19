@@ -269,3 +269,9 @@ export async function listenForNotificationClicks(onOpen: (convId: string) => vo
     if (payload.session === session()) onOpen(payload.convId);
   });
 }
+
+export async function notificationReady(): Promise<void> {
+  if (notifySupport() === "tauri" && /Windows/i.test(navigator.userAgent)) {
+    await invokeNotify("notification_ready", { session: session() });
+  }
+}

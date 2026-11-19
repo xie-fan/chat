@@ -7,6 +7,7 @@ import {
   notifyEnabled,
   notifyIncoming,
   notifyPermission,
+  notificationReady,
   notifyPreview,
   setNotifyEnabled,
   setNotifyPreview,
@@ -288,6 +289,22 @@ describe("messageLine", () => {
 describe("native notifications", () => {
   beforeEach(() => {
     vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+  });
+
+  it("releases pending Windows activation after the notification listener is ready", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Windows NT 10.0" });
+    invoke.mockResolvedValueOnce(undefined);
+    await notificationReady();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("notification_ready", { session: session() });
+  });
+
+  it("does not change activation startup on other platforms or the web", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Macintosh" });
+    await notificationReady();
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("navigator", { userAgent: "Windows NT 10.0" });
+    await notificationReady();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("queries current OS permission rather than the WebView's cached permission", async () => {

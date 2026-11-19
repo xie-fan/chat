@@ -246,6 +246,82 @@ fn windows_app_id(app: &AppHandle) -> &str {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Default)]
+pub struct WindowsActivation(std::sync::Mutex<(bool, Option<Option<Target>>)>);
+
+#[cfg(target_os = "windows")]
+fn activation_url(target: Option<&Target>) -> String {
+    let mut url = url::Url::parse("chat://open").unwrap();
+    if let Some(target) = target {
+        url.query_pairs_mut()
+            .append_pair("conv", &target.conv_id)
+            .append_pair("session", &target.session.to_string());
+    }
+    url.into()
+}
+
+#[cfg(target_os = "windows")]
+fn parse_activation_url(raw: &str) -> Option<Option<Target>> {
+    let url = url::Url::parse(raw).ok()?;
+    if url.scheme() != "chat" || url.host_str() != Some("open")
+        || !matches!(url.path(), "" | "/") || url.port().is_some()
+        || !url.username().is_empty() || url.password().is_some() || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut conv = None;
+    let mut session = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "conv" if conv.is_none() => conv = Some(uuid::Uuid::parse_str(&value).ok()?.to_string()),
+            "session" if session.is_none() => session = Some(value.parse::<u64>().ok()?),
+            _ => return None,
+        }
+    }
+    match (conv, session) {
+        (None, None) => Some(None),
+        (Some(conv_id), Some(session)) => Some(Some(Target { conv_id, session })),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn handle_windows_args(app: &AppHandle, args: Vec<String>) {
+    for arg in args.into_iter().skip(1) {
+        if let Some(target) = parse_activation_url(&arg) {
+            let state = app.state::<WindowsActivation>();
+            let mut state = state.0.lock().unwrap();
+            if state.0 {
+                drop(state);
+                activate(app, target);
+            } else {
+                state.1 = Some(target);
+                crate::tray::reveal(app);
+            }
+            break;
+        }
+    }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub fn notification_ready(app: AppHandle, session: u64) {
+    #[cfg(target_os = "windows")]
+    {
+        let state = app.state::<WindowsActivation>();
+        let mut state = state.0.lock().unwrap();
+        state.0 = true;
+        let pending = state.1.take();
+        drop(state);
+        if let Some(target) = pending {
+            activate(&app, target.map(|mut target| { target.session = session; target }));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (app, session);
+}
+
+#[cfg(target_os = "windows")]
 pub async fn show_desktop(
     app: AppHandle,
     title: String,
@@ -255,14 +331,37 @@ pub async fn show_desktop(
     if notification_permission(app.clone(), None).await? != "granted" {
         return Err("Notifications are disabled".into());
     }
-    let app_id = windows_app_id(&app).to_owned();
-    tauri_winrt_notification::Toast::new(&app_id)
-        .title(&title)
-        .text1(&body)
-        .on_activated(move |_| {
-            activate(&app, target.clone());
-            Ok(())
-        })
-        .show()
-        .map_err(|e| e.to_string())
+    use windows::{core::HSTRING, Data::Xml::Dom::XmlDocument, UI::Notifications::{ToastNotification, ToastNotificationManager}};
+    let show = || -> windows::core::Result<()> {
+        let xml = XmlDocument::new()?;
+        xml.LoadXml(&HSTRING::from("<toast activationType=\"protocol\"><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual></toast>"))?;
+        xml.DocumentElement()?.SetAttribute(&HSTRING::from("launch"), &HSTRING::from(activation_url(target.as_ref())))?;
+        let texts = xml.GetElementsByTagName(&HSTRING::from("text"))?;
+        texts.Item(0)?.AppendChild(&xml.CreateTextNode(&HSTRING::from(title))?)?;
+        texts.Item(1)?.AppendChild(&xml.CreateTextNode(&HSTRING::from(body))?)?;
+        let toast = ToastNotification::CreateToastNotification(&xml)?;
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(windows_app_id(&app)))?.Show(&toast)
+    };
+    show().map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_urls_round_trip() {
+        let target = Target { conv_id: "6ae4331a-e649-4f6a-95e5-8422dfe4ba80".into(), session: 42 };
+        let parsed = parse_activation_url(&activation_url(Some(&target))).unwrap().unwrap();
+        assert_eq!(parsed.conv_id, target.conv_id);
+        assert_eq!(parsed.session, target.session);
+        assert!(matches!(parse_activation_url(&activation_url(None)), Some(None)));
+    }
+
+    #[test]
+    fn rejects_invalid_activation_urls() {
+        for raw in ["", "https://open", "chat://other", "chat://open/path", "chat://open?conv=bad&session=1", "chat://open?session=1", "chat://open?session=x", "chat://open?session=1&session=2", "chat://open?extra=1", "chat://open#fragment", "chat://user@open"] {
+            assert!(parse_activation_url(raw).is_none(), "{raw}");
+        }
+    }
 }
