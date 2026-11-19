@@ -62,8 +62,11 @@ pub struct AppState {
     pub conns: ConnMap,
     /// ACP 宿主节点在线连接：host_id -> AcpHostConn
     pub acp_hosts: DashMap<Uuid, AcpHostConn>,
-    /// 待宿主响应的 ACP RPC 请求：req_id -> oneshot sender
-    pub acp_rpc_wait: DashMap<Uuid, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
+    /// 待宿主响应的 ACP RPC 请求：req_id -> (host_id, oneshot sender)
+    pub acp_rpc_wait:
+        DashMap<Uuid, (Uuid, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>)>,
+    /// 一次性 ACP headless host 配对码：code -> (uid, issued)
+    pub acp_pair_codes: DashMap<String, (Uuid, Instant)>,
     /// 一次性 WS ticket -> 授权信息
     pub tickets: DashMap<String, TicketGrant>,
     /// 简易限流：key -> 时间戳窗口
@@ -97,6 +100,7 @@ impl AppState {
             conns: DashMap::new(),
             acp_hosts: DashMap::new(),
             acp_rpc_wait: DashMap::new(),
+            acp_pair_codes: DashMap::new(),
             tickets: DashMap::new(),
             rate: DashMap::new(),
             epochs: DashMap::new(),
@@ -140,7 +144,24 @@ impl AppState {
             .is_some()
     }
 
+    /// 让指定宿主上仍在等待的 RPC 立即失败（避免等满 15 秒超时）。
+    pub fn fail_acp_host_rpcs(&self, host_id: Uuid) {
+        let req_ids: Vec<Uuid> = self
+            .acp_rpc_wait
+            .iter()
+            .filter(|e| e.value().0 == host_id)
+            .map(|e| *e.key())
+            .collect();
+        for req_id in req_ids {
+            if let Some((_, (_, tx))) = self.acp_rpc_wait.remove(&req_id) {
+                let _ = tx.send(Err("宿主机器已断开连接".to_string()));
+            }
+        }
+    }
+
     /// 踢掉满足条件的 ACP 宿主 WS 连接。
+    /// 不在此处移除 acp_hosts 条目，保留给 host_session 退出时的 unregister_acp_host，
+    /// 确保能触发 DB offline / running=false / pending 权限卡拒绝清理。
     pub fn kick_acp_hosts(&self, reason: &str, pred: impl Fn(&AcpHostConn) -> bool) {
         let host_ids: Vec<Uuid> = self
             .acp_hosts
@@ -157,9 +178,10 @@ impl AppState {
         })
         .to_string();
         for hid in host_ids {
-            if let Some((_, conn)) = self.acp_hosts.remove(&hid) {
+            if let Some(conn) = self.acp_hosts.get(&hid) {
                 let _ = conn.tx.try_send(ConnMsg::Shutdown(frame.clone()));
             }
+            self.fail_acp_host_rpcs(hid);
         }
     }
 

@@ -84,7 +84,6 @@ pub fn prepare(command: &str, args: &[String]) -> Command {
 
 pub fn prepare_in(command: &str, args: &[String], path_env: &str, pathext: &str) -> Command {
     let mut cmd = match resolve_in(command, path_env, pathext) {
-        Some(path) if is_batch(&path) => batch_command(&path, args),
         Some(path) => {
             let mut c = Command::new(path);
             c.args(args);
@@ -99,6 +98,32 @@ pub fn prepare_in(command: &str, args: &[String], path_env: &str, pathext: &str)
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
+}
+
+pub fn configure_child_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+pub async fn kill_child_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        #[cfg(windows)]
+        {
+            let mut tk = Command::new("taskkill");
+            tk.args(["/T", "/F", "/PID", &pid.to_string()]);
+            tk.creation_flags(CREATE_NO_WINDOW);
+            let _ = tk.status().await;
+        }
+        #[cfg(unix)]
+        {
+            let mut k = Command::new("kill");
+            k.args(["-KILL", &format!("-{pid}")]);
+            let _ = k.status().await;
+        }
+    }
+    let _ = child.kill().await;
 }
 
 fn default_pathext() -> String {
@@ -141,48 +166,6 @@ fn try_file(base: &Path, exts: &[String]) -> Option<PathBuf> {
     exact.is_file().then_some(exact)
 }
 
-fn is_batch(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("cmd" | "bat")
-    )
-}
-
-fn batch_command(script: &Path, args: &[String]) -> Command {
-    let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
-    #[cfg(windows)]
-    {
-        let mut line = String::from("/d /s /c \"");
-        line.push('"');
-        line.push_str(&script.display().to_string());
-        line.push('"');
-        for a in args {
-            line.push(' ');
-            line.push_str(&quote_cmd_arg(a));
-        }
-        line.push('"');
-        cmd.raw_arg(line);
-    }
-    #[cfg(not(windows))]
-    {
-        cmd.arg(script);
-        cmd.args(args);
-    }
-    cmd
-}
-
-#[cfg(windows)]
-fn quote_cmd_arg(a: &str) -> String {
-    if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
-        format!("\"{}\"", a.replace('"', "\\\""))
-    } else {
-        a.to_string()
-    }
-}
-
 pub fn probe_agent(cmd: &str) -> Value {
     let Ok((prog, _)) = split_cmdline(cmd) else {
         return json!({ "ok": false });
@@ -193,8 +176,29 @@ pub fn probe_agent(cmd: &str) -> Value {
     json!({ "ok": ok })
 }
 
+fn empty_hooks_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("chat-acp-empty-hooks");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn hardened_git_args(args: &[&str]) -> Vec<String> {
+    let hooks_arg = format!("core.hooksPath={}", empty_hooks_dir().display());
+    let mut out = vec![
+        "-c".to_string(),
+        hooks_arg,
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+    ];
+    for a in args {
+        out.push((*a).to_string());
+    }
+    out
+}
+
 async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = prepare("git", &args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let full_args = hardened_git_args(args);
+    let mut cmd = prepare("git", &full_args);
     cmd.current_dir(dir);
     let out = cmd.output().await.ok()?;
     if !out.status.success() {
@@ -227,6 +231,9 @@ pub async fn probe_workspace(raw_cwd: &str) -> Result<Value, String> {
         return Err(format!("工作目录不存在或不是文件夹：{}", dir.display()));
     }
     let canon = dir.canonicalize().unwrap_or(dir);
+    if super::dirs::is_sensitive_path(&canon) {
+        return Err("不允许将敏感凭证目录设为工作区".to_string());
+    }
     let cwd = clean_path_str(&canon);
     let (branch, branches) = git_info(&canon).await;
     Ok(json!({
@@ -242,10 +249,22 @@ pub async fn git_checkout(raw_cwd: &str, branch: &str) -> Result<Value, String> 
         return Err(format!("工作目录不存在：{}", dir.display()));
     }
     let b = branch.trim();
-    if b.is_empty() {
-        return Err("分支名不能为空".to_string());
+    if b.is_empty() || b.starts_with('-') {
+        return Err("分支名不合法".to_string());
     }
-    let mut cmd = prepare("git", &["checkout".into(), b.into()]);
+    let check_args = hardened_git_args(&["check-ref-format", "--branch", b]);
+    let mut check_cmd = prepare("git", &check_args);
+    check_cmd.current_dir(&dir);
+    let check_out = check_cmd
+        .output()
+        .await
+        .map_err(|e| format!("校验分支名失败：{e}"))?;
+    if !check_out.status.success() {
+        return Err("非法 Git 分支名".to_string());
+    }
+
+    let co_args = hardened_git_args(&["checkout", b, "--"]);
+    let mut cmd = prepare("git", &co_args);
     cmd.current_dir(&dir);
     let out = cmd
         .output()

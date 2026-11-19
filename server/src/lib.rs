@@ -91,11 +91,15 @@ pub async fn run() {
         .run(&pool)
         .await
         .expect("migrations failed");
+    if let Err(e) = acp::reset_stale_acp_state(&pool).await {
+        tracing::warn!(error = %e, "failed to reset stale acp state on startup");
+    }
 
     let state = AppState::new(pool.clone(), cfg.clone());
     let app = build_router(state, &cfg);
 
-    // 撤回附件定时清扫（默认每小时）：过保留期的附件行删除、无引用的物理文件清掉。
+    // 撤回附件 & 未关联的过期 ACP 附件定时清扫（默认每小时）：
+    // 过保留期的附件行删除、无引用的物理文件清掉。
     // 首轮立即执行——停机期间过期的行不该等到下一个整点。
     {
         let files_dir = cfg.files_dir.clone();
@@ -109,6 +113,11 @@ pub async fn run() {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(swept = n, "recalled attachments swept"),
                     Err(e) => tracing::error!(error = %e, "recalled attachment sweep failed"),
+                }
+                match acp::sweep_orphan_acp_attachments(&pool, &files_dir).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(swept = n, "orphan acp attachments swept"),
+                    Err(e) => tracing::error!(error = %e, "orphan acp attachment sweep failed"),
                 }
             }
         });

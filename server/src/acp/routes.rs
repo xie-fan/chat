@@ -1,7 +1,8 @@
 use super::{
-    base64_encode, broadcast_acp, call_host_rpc, derive_workspace_name, host_ws::insert_turn,
-    load_agent, load_bootstrap, load_host, load_session_meta, load_settings, load_workspace,
-    preset_defaults, turn_from_row, AcpAttachmentView, AcpBootstrapView, AcpSettingsView,
+    base64_encode, broadcast_acp, call_host_rpc, delete_acp_attachment_files, derive_workspace_name,
+    host_ws::insert_turn_tx, load_agent, load_agent_env_map, load_agent_raw, load_bootstrap,
+    load_host, load_session_meta, load_settings, load_workspace, preset_defaults, turn_from_row,
+    AcpAttachmentView, AcpBootstrapView, AcpSettingsView,
 };
 use crate::api::{
     inline_safe, pct_encode, quota_message, read_upload, serve_stored, stored_file_path,
@@ -9,9 +10,10 @@ use crate::api::{
 };
 use crate::auth;
 use crate::error::{AppError, AppResult};
+use crate::model::{AuthResponse, UserRow};
 use crate::state::{ConnMsg, SharedState};
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, patch, post, put},
     Json, Router,
@@ -19,16 +21,24 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const UPLOAD_BODY_MARGIN: usize = 1024 * 1024;
 const INLINE_ATTACHMENT_LIMIT: usize = 4 * 1024 * 1024;
+const TOTAL_INLINE_ATTACHMENT_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_PROMPT_ATTACHMENTS: usize = 10;
+const MAX_PROMPT_FILE_REFS: usize = 20;
+const PAIR_CODE_TTL: Duration = Duration::from_secs(300);
 
 pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
     let body_cap = cfg.upload_max_bytes.saturating_add(UPLOAD_BODY_MARGIN);
     Router::new()
         .route("/bootstrap", get(get_bootstrap))
         .route("/settings", put(put_settings))
+        .route("/hosts/pair-code", post(create_pair_code))
+        .route("/hosts/pair", post(exchange_pair_code))
         .route("/hosts/{id}", patch(rename_host).delete(delete_host))
         .route("/hosts/{id}/dirs", get(list_host_dirs))
         .route("/agents", post(create_agent))
@@ -121,12 +131,116 @@ async fn rename_host(
     Ok(Json(host))
 }
 
+async fn create_pair_code(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    let uid = uid_of(&headers, &st).await?;
+    crate::api::rate_limit(&st, format!("acp_pair:{uid}"))?;
+    st.acp_pair_codes
+        .retain(|_, (_, issued)| issued.elapsed() <= PAIR_CODE_TTL);
+    let mut buf = [0u8; 8];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut buf);
+    let code = format!("ACP-{}", hex::encode(buf).to_uppercase());
+    st.acp_pair_codes.insert(code.clone(), (uid, Instant::now()));
+    Ok(Json(json!({
+        "code": code,
+        "expires_in": PAIR_CODE_TTL.as_secs(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct ExchangePairReq {
+    code: String,
+    #[serde(default)]
+    host_name: Option<String>,
+}
+
+async fn exchange_pair_code(
+    State(st): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ExchangePairReq>,
+) -> AppResult<Json<AuthResponse>> {
+    let ip = crate::api::client_ip(&st, &headers, addr);
+    crate::api::rate_limit(&st, format!("acp_pair_ip:{ip}"))?;
+    let code = req.code.trim().to_uppercase();
+    let Some((_, (uid, issued))) = st.acp_pair_codes.remove(&code) else {
+        return Err(AppError::unauthorized("配对码无效或已使用"));
+    };
+    if issued.elapsed() > PAIR_CODE_TTL {
+        return Err(AppError::unauthorized("配对码已过期"));
+    }
+
+    let mut tx = st.pool.begin().await?;
+    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1 FOR UPDATE")
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("配对账号不存在"))?;
+    if row.disabled_at.is_some() {
+        return Err(AppError::forbidden("账号已被禁用"));
+    }
+    let raw_label = req
+        .host_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|h| format!("ACP Host: {h}"))
+        .unwrap_or_else(|| "ACP Host".to_string());
+    let sid = auth::create_session(
+        &mut *tx,
+        row.id,
+        &crate::sessions::device_label_of(Some(&raw_label)),
+        &crate::sessions::user_agent_of(&headers),
+    )
+    .await?;
+    let res = auth::issue_tokens(&mut tx, &st.cfg, &row, sid).await?;
+    tx.commit().await?;
+    Ok(Json(res))
+}
+
+fn cancel_sessions_on_hosts(st: &SharedState, uid: Uuid, sessions: &[(Uuid, Uuid)]) {
+    for &(sess_id, host_id) in sessions {
+        if let Some(conn) = st.acp_hosts.get(&host_id) {
+            if conn.uid == uid {
+                let _ = conn.tx.try_send(ConnMsg::Frame(
+                    json!({ "type": "prompt_cancel", "session_id": sess_id }).to_string(),
+                ));
+            }
+        }
+    }
+}
+
 async fn delete_host(
     State(st): State<SharedState>,
     headers: HeaderMap,
     Path(host_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
+    let running_sessions: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT s.id, w.acp_host_id
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE w.acp_host_id = $1 AND s.user_id = $2 AND s.running = true",
+    )
+    .bind(host_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
+    let att_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT att.storage_path
+           FROM acp_attachments att
+           JOIN acp_sessions s ON s.id = att.acp_session_id
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE w.acp_host_id = $1 AND att.user_id = $2",
+    )
+    .bind(host_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
     let affected = sqlx::query("DELETE FROM acp_hosts WHERE id = $1 AND user_id = $2")
         .bind(host_id)
         .bind(uid)
@@ -136,11 +250,14 @@ async fn delete_host(
     if affected == 0 {
         return Err(AppError::not_found("host not found"));
     }
+    cancel_sessions_on_hosts(&st, uid, &running_sessions);
     if let Some((_, conn)) = st.acp_hosts.remove(&host_id) {
         let _ = conn.tx.try_send(ConnMsg::Shutdown(
             json!({ "type": "force_logout", "reason": "host_removed" }).to_string(),
         ));
     }
+    st.fail_acp_host_rpcs(host_id);
+    delete_acp_attachment_files(&st.cfg.files_dir, &att_paths).await;
     broadcast_acp(&st, uid, "host_deleted", json!({ "host_id": host_id }));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -268,6 +385,7 @@ async fn create_agent(
 struct UpdateAgentReq {
     name: Option<String>,
     cmd: Option<String>,
+    env: Option<Value>,
     default_model: Option<String>,
     model_options: Option<Vec<String>>,
     permission_override: Option<String>,
@@ -281,6 +399,7 @@ async fn update_agent(
 ) -> AppResult<Json<super::AcpAgentView>> {
     let uid = uid_of(&headers, &st).await?;
     let cur = load_agent(&st.pool, uid, agent_id).await?;
+    let cur_raw_env = load_agent_env_map(&st.pool, uid, agent_id).await?;
 
     let name = match req.name {
         Some(n) => {
@@ -301,6 +420,24 @@ async fn update_agent(
             trimmed
         }
         None => cur.cmd,
+    };
+    let next_env = match req.env {
+        Some(Value::Object(map)) => {
+            let mut merged = serde_json::Map::new();
+            let prev_obj = cur_raw_env.as_object();
+            for (k, v) in map {
+                let s = v.as_str().unwrap_or("");
+                if s == "••••••••" {
+                    if let Some(prev_val) = prev_obj.and_then(|p| p.get(&k)) {
+                        merged.insert(k, prev_val.clone());
+                    }
+                } else if !s.is_empty() {
+                    merged.insert(k, Value::String(s.to_string()));
+                }
+            }
+            Value::Object(merged)
+        }
+        _ => cur_raw_env,
     };
     let mut model_options = req.model_options.unwrap_or(cur.model_options);
     let default_model = match req.default_model {
@@ -329,13 +466,14 @@ async fn update_agent(
 
     sqlx::query(
         "UPDATE acp_agents
-            SET name = $2, cmd = $3, default_model = $4, model_options = $5,
-                permission_override = $6, updated_at = now()
-          WHERE id = $1 AND user_id = $7",
+            SET name = $2, cmd = $3, env_json = $4, default_model = $5, model_options = $6,
+                permission_override = $7, updated_at = now()
+          WHERE id = $1 AND user_id = $8",
     )
     .bind(agent_id)
     .bind(&name)
     .bind(&cmd)
+    .bind(&next_env)
     .bind(&default_model)
     .bind(json!(model_options))
     .bind(&permission_override)
@@ -354,6 +492,28 @@ async fn delete_agent(
     Path(agent_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
+    let running_sessions: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT s.id, w.acp_host_id
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE s.acp_agent_id = $1 AND s.user_id = $2 AND s.running = true",
+    )
+    .bind(agent_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
+    let att_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT att.storage_path
+           FROM acp_attachments att
+           JOIN acp_sessions s ON s.id = att.acp_session_id
+          WHERE s.acp_agent_id = $1 AND att.user_id = $2",
+    )
+    .bind(agent_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
     let affected = sqlx::query("DELETE FROM acp_agents WHERE id = $1 AND user_id = $2")
         .bind(agent_id)
         .bind(uid)
@@ -363,6 +523,8 @@ async fn delete_agent(
     if affected == 0 {
         return Err(AppError::not_found("agent not found"));
     }
+    cancel_sessions_on_hosts(&st, uid, &running_sessions);
+    delete_acp_attachment_files(&st.cfg.files_dir, &att_paths).await;
     broadcast_acp(&st, uid, "agent_deleted", json!({ "agent_id": agent_id }));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -451,6 +613,28 @@ async fn delete_workspace(
     Path(ws_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
+    let running_sessions: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT s.id, w.acp_host_id
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE w.id = $1 AND s.user_id = $2 AND s.running = true",
+    )
+    .bind(ws_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
+    let att_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT att.storage_path
+           FROM acp_attachments att
+           JOIN acp_sessions s ON s.id = att.acp_session_id
+          WHERE s.acp_workspace_id = $1 AND att.user_id = $2",
+    )
+    .bind(ws_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
     let affected = sqlx::query("DELETE FROM acp_workspaces WHERE id = $1 AND user_id = $2")
         .bind(ws_id)
         .bind(uid)
@@ -460,6 +644,8 @@ async fn delete_workspace(
     if affected == 0 {
         return Err(AppError::not_found("workspace not found"));
     }
+    cancel_sessions_on_hosts(&st, uid, &running_sessions);
+    delete_acp_attachment_files(&st.cfg.files_dir, &att_paths).await;
     broadcast_acp(
         &st,
         uid,
@@ -556,7 +742,7 @@ async fn create_session(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(160).collect())
-        .unwrap_or_else(|| format!("{} · {}", ag.name, ws.name));
+        .unwrap_or_else(|| format!("{} · {}", ag.name, ws.name).chars().take(160).collect());
 
     let row = sqlx::query(
         "INSERT INTO acp_sessions
@@ -656,6 +842,25 @@ async fn delete_session(
     Path(sess_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
+    let running_sessions: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT s.id, w.acp_host_id
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE s.id = $1 AND s.user_id = $2 AND s.running = true",
+    )
+    .bind(sess_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
+    let att_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT storage_path FROM acp_attachments WHERE acp_session_id = $1 AND user_id = $2",
+    )
+    .bind(sess_id)
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+
     let affected = sqlx::query("DELETE FROM acp_sessions WHERE id = $1 AND user_id = $2")
         .bind(sess_id)
         .bind(uid)
@@ -665,6 +870,8 @@ async fn delete_session(
     if affected == 0 {
         return Err(AppError::not_found("session not found"));
     }
+    cancel_sessions_on_hosts(&st, uid, &running_sessions);
+    delete_acp_attachment_files(&st.cfg.files_dir, &att_paths).await;
     broadcast_acp(
         &st,
         uid,
@@ -696,23 +903,34 @@ async fn send_prompt(
     Json(req): Json<SendPromptReq>,
 ) -> AppResult<Json<super::AcpTurnView>> {
     let uid = uid_of(&headers, &st).await?;
+    if req.attachment_ids.len() > MAX_PROMPT_ATTACHMENTS {
+        return Err(AppError::bad_request(format!(
+            "一次最多附带 {MAX_PROMPT_ATTACHMENTS} 个附件"
+        )));
+    }
+    if req.files.len() > MAX_PROMPT_FILE_REFS {
+        return Err(AppError::bad_request(format!(
+            "一次最多引用 {MAX_PROMPT_FILE_REFS} 个文件路径"
+        )));
+    }
+
     let sess = load_session_meta(&st.pool, uid, sess_id).await?;
     let ws = load_workspace(&st.pool, uid, sess.workspace_id).await?;
-    let ag = load_agent(&st.pool, uid, sess.agent_id).await?;
+    let ag = load_agent_raw(&st.pool, uid, sess.agent_id).await?;
 
-    if sess.running {
-        return Err(AppError::conflict("session is already running"));
-    }
-    let text = req.text.trim().to_string();
+    let text: String = req.text.trim().chars().take(16_384).collect();
     if text.is_empty() && req.files.is_empty() && req.attachment_ids.is_empty() {
         return Err(AppError::bad_request("prompt cannot be empty"));
     }
 
-    let model = req
+    let model: String = req
         .model
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or(sess.selected_model);
+        .unwrap_or(sess.selected_model)
+        .chars()
+        .take(120)
+        .collect();
     let thinking_level = req
         .thinking_level
         .filter(|lv| matches!(lv.as_str(), "关" | "低" | "中" | "高"))
@@ -736,9 +954,32 @@ async fn send_prompt(
         conn.tx.clone()
     };
 
-    // 读取随附上传文件（若 < INLINE_ATTACHMENT_LIMIT 则直接内联 base64/text 给宿主）
+    // 在单个事务里原子抢占会话执行权（running: false -> true），关联附件并顺带分配 seq
+    let mut tx = st.pool.begin().await?;
+    let claimed = sqlx::query(
+        "UPDATE acp_sessions
+            SET running = true,
+                selected_model = $2,
+                thinking_level = $3,
+                permission_policy = $4,
+                updated_at = now()
+          WHERE id = $1 AND user_id = $5 AND running = false",
+    )
+    .bind(sess_id)
+    .bind(&model)
+    .bind(&thinking_level)
+    .bind(&permission_policy)
+    .bind(uid)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if claimed == 0 {
+        return Err(AppError::conflict("session is already running"));
+    }
+
     let mut attachments_meta = Vec::new();
     let mut host_attachments = Vec::new();
+    let mut total_inline_bytes: usize = 0;
     if !req.attachment_ids.is_empty() {
         let rows = sqlx::query(
             "SELECT id, file_name, mime, size, storage_path
@@ -746,7 +987,7 @@ async fn send_prompt(
         )
         .bind(uid)
         .bind(&req.attachment_ids)
-        .fetch_all(&st.pool)
+        .fetch_all(&mut *tx)
         .await?;
         for r in rows {
             let att_id: Uuid = r.get("id");
@@ -761,10 +1002,19 @@ async fn send_prompt(
                 "size": size,
             }));
             let mut inline_b64: Option<String> = None;
-            if (size as usize) <= INLINE_ATTACHMENT_LIMIT {
+            let sz = size.max(0) as usize;
+            if sz <= INLINE_ATTACHMENT_LIMIT
+                && total_inline_bytes.saturating_add(sz) <= TOTAL_INLINE_ATTACHMENT_LIMIT
+            {
                 let p = stored_file_path(&st.cfg.files_dir, &stored);
                 if let Ok(bytes) = tokio::fs::read(p).await {
-                    inline_b64 = Some(base64_encode(&bytes));
+                    if bytes.len() <= INLINE_ATTACHMENT_LIMIT
+                        && total_inline_bytes.saturating_add(bytes.len())
+                            <= TOTAL_INLINE_ATTACHMENT_LIMIT
+                    {
+                        total_inline_bytes = total_inline_bytes.saturating_add(bytes.len());
+                        inline_b64 = Some(base64_encode(&bytes));
+                    }
                 }
             }
             host_attachments.push(json!({
@@ -775,48 +1025,24 @@ async fn send_prompt(
                 "data_base64": inline_b64,
             }));
         }
-        let _ = sqlx::query(
+        sqlx::query(
             "UPDATE acp_attachments SET acp_session_id = $2
               WHERE user_id = $1 AND id = ANY($3) AND acp_session_id IS NULL",
         )
         .bind(uid)
         .bind(sess_id)
         .bind(&req.attachment_ids)
-        .execute(&st.pool)
-        .await;
+        .execute(&mut *tx)
+        .await?;
     }
 
-    sqlx::query(
-        "UPDATE acp_sessions
-            SET running = true,
-                selected_model = $2,
-                thinking_level = $3,
-                permission_policy = $4,
-                updated_at = now()
-          WHERE id = $1 AND user_id = $5",
-    )
-    .bind(sess_id)
-    .bind(&model)
-    .bind(&thinking_level)
-    .bind(&permission_policy)
-    .bind(uid)
-    .execute(&st.pool)
-    .await?;
-
-    let turn_row = insert_turn(
-        &st,
-        sess_id,
-        uid,
-        "user",
-        "done",
-        json!({
-            "text": text,
-            "files": req.files,
-            "attachments": attachments_meta,
-        }),
-    )
-    .await
-    .ok_or_else(|| AppError::internal("failed to store prompt turn"))?;
+    let user_payload = json!({
+        "text": text,
+        "files": req.files,
+        "attachments": attachments_meta,
+    });
+    let turn_row = insert_turn_tx(&mut *tx, sess_id, uid, "user", "done", &user_payload).await?;
+    tx.commit().await?;
     let turn_view = turn_from_row(&turn_row);
 
     broadcast_acp(
@@ -1049,7 +1275,7 @@ async fn upload_acp_file(
         .map_err(|e| AppError::internal(format!("store acp file: {e}")))?;
 
     let size = file.size as i64;
-    sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO acp_attachments (id, user_id, acp_session_id, file_name, mime, size, storage_path)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
@@ -1061,7 +1287,11 @@ async fn upload_acp_file(
     .bind(size)
     .bind(&stored)
     .execute(&st.pool)
-    .await?;
+    .await
+    {
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(e.into());
+    }
 
     Ok(Json(AcpAttachmentView {
         id,

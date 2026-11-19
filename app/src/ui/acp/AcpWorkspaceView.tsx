@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { acp } from "../../api";
-import { applyAcpBootstrap, setState, useApp } from "../../store";
+import { applyAcpBootstrap, getState, setState, useApp } from "../../store";
 import type {
   AcpAttachment,
   AcpPermissionPolicy,
@@ -210,15 +210,20 @@ export default function AcpWorkspaceView() {
     const picked = Array.from(e.target.files ?? []);
     e.target.value = "";
     if (!picked.length || !activeSession) return;
+    const targetSessId = activeSession.id;
     setUploading(true);
     setErrMsg("");
     try {
       const uploaded = await Promise.all(
-        picked.map((f) => acp.uploadFile(f, activeSession.id)),
+        picked.map((f) => acp.uploadFile(f, targetSessId)),
       );
-      setPendingAtts((cur) => [...cur, ...uploaded]);
+      if (getState().activeAcpSessionId === targetSessId) {
+        setPendingAtts((cur) => [...cur, ...uploaded]);
+      }
     } catch (ex) {
-      setErrMsg(ex instanceof Error ? ex.message : "上传附件失败");
+      if (getState().activeAcpSessionId === targetSessId) {
+        setErrMsg(ex instanceof Error ? ex.message : "上传附件失败");
+      }
     } finally {
       setUploading(false);
     }
@@ -226,13 +231,14 @@ export default function AcpWorkspaceView() {
 
   const sendPrompt = async () => {
     if (!activeSession || activeSession.running || sending) return;
+    const targetSessId = activeSession.id;
     const raw = promptText.trim();
     if (!raw && pendingAtts.length === 0) return;
     const fileRefs = Array.from(raw.matchAll(/@([^\s@]+)/g)).map((m) => m[1]);
     setSending(true);
     setErrMsg("");
     try {
-      const turn = await acp.sendPrompt(activeSession.id, {
+      const turn = await acp.sendPrompt(targetSessId, {
         text: raw,
         files: fileRefs,
         attachment_ids: pendingAtts.map((a) => a.id),
@@ -240,11 +246,13 @@ export default function AcpWorkspaceView() {
         thinking_level: activeSession.thinking_level,
         permission_policy: activeSession.permission_policy,
       });
-      setPromptText("");
-      setPendingAtts([]);
+      if (getState().activeAcpSessionId === targetSessId) {
+        setPromptText("");
+        setPendingAtts([]);
+      }
       setState((cur) => ({
         acpSessions: cur.acpSessions.map((x) => {
-          if (x.id !== activeSession.id) return x;
+          if (x.id !== targetSessId) return x;
           const prevTurns = x.turns ?? [];
           const has = prevTurns.some((t) => t.id === turn.id);
           return {
@@ -306,16 +314,24 @@ export default function AcpWorkspaceView() {
                 </span>
               ))}
               {atts.map((a) => (
-                <a
+                <button
                   key={a.id}
-                  href={acp.fileUrl(a.id, true)}
-                  target="_blank"
-                  rel="noreferrer"
+                  type="button"
+                  onClick={() =>
+                    void acp.downloadFile(a.id, a.file_name).catch((ex) =>
+                      setErrMsg(ex instanceof Error ? ex.message : "下载附件失败"),
+                    )
+                  }
                   className="acp-chip"
-                  style={{ background: "rgba(255,255,255,0.16)", color: "#fff", borderColor: "transparent", textDecoration: "none" }}
+                  style={{
+                    background: "rgba(255,255,255,0.16)",
+                    color: "#fff",
+                    borderColor: "transparent",
+                    cursor: "pointer",
+                  }}
                 >
                   📎 {a.file_name}
-                </a>
+                </button>
               ))}
             </div>
           )}
@@ -707,7 +723,10 @@ export default function AcpWorkspaceView() {
                             .then((u) => {
                               patchSessionState(u);
                               setEditingTitle(false);
-                            });
+                            })
+                            .catch((ex) =>
+                              setErrMsg(ex instanceof Error ? ex.message : "更新会话标题失败"),
+                            );
                         }
                       }}
                     />
@@ -721,7 +740,10 @@ export default function AcpWorkspaceView() {
                           .then((u) => {
                             patchSessionState(u);
                             setEditingTitle(false);
-                          });
+                          })
+                          .catch((ex) =>
+                            setErrMsg(ex instanceof Error ? ex.message : "更新会话标题失败"),
+                          );
                       }}
                     >
                       <CheckIcon size={14} /> 保存
@@ -894,6 +916,9 @@ export default function AcpWorkspaceView() {
                         void acp
                           .updateSession(activeSession.id, { selected_model: e.target.value })
                           .then(patchSessionState)
+                          .catch((ex) =>
+                            setErrMsg(ex instanceof Error ? ex.message : "切换模型失败"),
+                          )
                       }
                     >
                       {(activeAgent?.model_options.length
@@ -916,6 +941,9 @@ export default function AcpWorkspaceView() {
                             thinking_level: e.target.value as AcpThinkingLevel,
                           })
                           .then(patchSessionState)
+                          .catch((ex) =>
+                            setErrMsg(ex instanceof Error ? ex.message : "更新思考深度失败"),
+                          )
                       }
                     >
                       {THINKING_LEVELS.map((lv) => (
@@ -935,6 +963,9 @@ export default function AcpWorkspaceView() {
                             permission_policy: e.target.value as AcpPermissionPolicy,
                           })
                           .then(patchSessionState)
+                          .catch((ex) =>
+                            setErrMsg(ex instanceof Error ? ex.message : "更新权限策略失败"),
+                          )
                       }
                     >
                       {PERMISSION_POLICIES.map((p) => (
@@ -950,13 +981,18 @@ export default function AcpWorkspaceView() {
                         aria-label="Git 分支"
                         value={activeWs.branch}
                         onChange={(e) =>
-                          void acp.gitCheckout(activeWs.id, e.target.value).then((ws) =>
-                            setState((cur) => ({
-                              acpWorkspaces: cur.acpWorkspaces.map((x) =>
-                                x.id === ws.id ? ws : x,
-                              ),
-                            })),
-                          )
+                          void acp
+                            .gitCheckout(activeWs.id, e.target.value)
+                            .then((ws) =>
+                              setState((cur) => ({
+                                acpWorkspaces: cur.acpWorkspaces.map((x) =>
+                                  x.id === ws.id ? ws : x,
+                                ),
+                              })),
+                            )
+                            .catch((ex) =>
+                              setErrMsg(ex instanceof Error ? ex.message : "切换分支失败"),
+                            )
                         }
                       >
                         {activeWs.branches.map((b) => (
@@ -976,6 +1012,9 @@ export default function AcpWorkspaceView() {
                         void acp
                           .cancelSession(activeSession.id)
                           .then(patchSessionState)
+                          .catch((ex) =>
+                            setErrMsg(ex instanceof Error ? ex.message : "停止运行失败"),
+                          )
                       }
                     >
                       停止运行

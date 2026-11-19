@@ -369,10 +369,67 @@ export function removeSavedAccount(storage: Stor, id: string): SavedAccount[] {
   return next;
 }
 
-// ---------- 删除服务器：清掉它名下的全部本地数据 ----------
+export function updateSavedAccountTokens(
+  storage: Stor,
+  id: string,
+  patch: { access: string; refresh: string; user?: UserPublic },
+): void {
+  const list = listSavedAccounts(storage);
+  let changed = false;
+  const next = list.map((a) => {
+    if (a.id !== id) return a;
+    changed = true;
+    return {
+      ...a,
+      access: patch.access,
+      refresh: patch.refresh,
+      user: patch.user ?? a.user,
+    };
+  });
+  if (changed) saveAccounts(storage, next);
+}
+
+// ---------- 删除服务器 / 删除单账号：按 scope (+ userId) 精确清理 ----------
 // 只认 `<prefix>:<enc>:`（带尾冒号）开头的键：enc 本身无冒号，
 // 别的服务器的 enc 即使以它为前缀也接不上冒号，不会误匹配。
 const DATA_PREFIXES = ["chat_cache:", "chat_outbox:", "chat_drafts:", "chat_reedit:"];
+
+export function removeUserServerData(storage: Stor, scope: string, userId: string): void {
+  try {
+    storage.removeItem(`chat_cache:${scope}:${userId}`);
+    storage.removeItem(`chat_outbox:${scope}:${userId}`);
+    storage.removeItem(`chat_reedit:${scope}:${userId}`);
+    const dKey = `chat_drafts:${scope}:${userId}`;
+    const raw = storage.getItem(dKey);
+    if (raw) {
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const cleaned: Record<string, string> = {};
+          for (const [cid, val] of Object.entries(parsed)) {
+            if (typeof val === "string" && val) {
+              cleaned[cid] = val;
+            } else if (
+              val &&
+              typeof val === "object" &&
+              !Array.isArray(val) &&
+              typeof (val as { text?: unknown }).text === "string" &&
+              (val as { text: string }).text
+            ) {
+              cleaned[cid] = (val as { text: string }).text;
+            }
+          }
+          if (Object.keys(cleaned).length === 0) storage.removeItem(dKey);
+          else storage.setItem(dKey, JSON.stringify(cleaned));
+        } else {
+          storage.removeItem(dKey);
+        }
+      } catch {
+        storage.removeItem(dKey);
+      }
+    }
+  } catch {}
+}
 
 export function removeServerData(storage: Stor, scope: string) {
   try {

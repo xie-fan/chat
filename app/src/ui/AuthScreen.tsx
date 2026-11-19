@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
   auth,
-  confirmServerRemove,
   getServer,
   inTauri,
   isSameOriginServer,
@@ -116,16 +115,14 @@ export default function AuthScreen() {
   };
 
   const removeSv = async (sv: ServerEntry) => {
-    if (confirmServerRemove(sv)) {
-      const label = sv.name || sv.url || "当前站点";
-      if (
-        !(await confirmDialog(
-          `服务器「${label}」上仍有已保存的登录账号，移除后需要重新登录。确定移除？`,
-          { danger: true, okText: "移除" },
-        ))
-      ) {
-        return;
-      }
+    const label = sv.name || sv.url || "当前站点";
+    if (
+      !(await confirmDialog(
+        `删除服务器「${label}」（${sv.url}）？\n它的登录凭据、本地缓存和未发出的消息都会被清除。`,
+        { danger: true, okText: "移除" },
+      ))
+    ) {
+      return;
     }
     const fallback = removeServer(sv.url);
     setServers(listServers());

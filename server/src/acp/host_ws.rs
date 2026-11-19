@@ -179,6 +179,7 @@ pub async fn host_session(
     }
 
     if st.unregister_acp_host(host_id, conn_id) {
+        st.fail_acp_host_rpcs(host_id);
         let _ = sqlx::query(
             "UPDATE acp_hosts SET online = false, latency_ms = 0, last_seen = now() WHERE id = $1",
         )
@@ -239,6 +240,10 @@ pub async fn host_session(
 }
 
 async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str) {
+    if raw.len() > 8 * 1024 * 1024 {
+        tracing::warn!(host_id = %host_id, bytes = raw.len(), "dropping oversized acp host frame");
+        return;
+    }
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
         return;
     };
@@ -251,14 +256,19 @@ async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str
             let Some(req_id) = v["req_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
                 return;
             };
-            if let Some((_, tx)) = st.acp_rpc_wait.remove(&req_id) {
+            if let Some((_, (_, tx))) = st
+                .acp_rpc_wait
+                .remove_if(&req_id, |_, (expected_host, _)| *expected_host == host_id)
+            {
                 if v["ok"].as_bool() == Some(true) {
                     let _ = tx.send(Ok(v["data"].clone()));
                 } else {
                     let msg = v["error"]
                         .as_str()
                         .unwrap_or("rpc execution failed")
-                        .to_string();
+                        .chars()
+                        .take(500)
+                        .collect();
                     let _ = tx.send(Err(msg));
                 }
             }
@@ -356,77 +366,106 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
             }
         }
         "text_delta" | "text" => {
-            let turn_key = v["turn_key"].as_str().unwrap_or("");
-            let delta = v["delta"].as_str().unwrap_or("");
-            let full_text = v["text"].as_str();
+            let turn_key: String = v["turn_key"].as_str().unwrap_or("").chars().take(120).collect();
+            let delta: String = v["delta"].as_str().unwrap_or("").chars().take(65536).collect();
+            let full_text: Option<String> = v["text"].as_str().map(|s| s.chars().take(262144).collect());
             let done = v["done"].as_bool().unwrap_or(kind == "text");
             let status = if done { "done" } else { "streaming" };
 
-            let existing = if !turn_key.is_empty() {
+            let mut tx = match st.pool.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(session_id = %sess_id, error = %e, "text_delta begin tx failed");
+                    return;
+                }
+            };
+            let locked = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM acp_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+            )
+            .bind(sess_id)
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()
+            .flatten();
+            if locked.is_none() {
+                return;
+            }
+
+            let updated_existing = if !turn_key.is_empty() {
                 sqlx::query(
-                    "SELECT id, payload FROM acp_turns
-                      WHERE acp_session_id = $1 AND role = 'agent_text'
-                        AND payload->>'turn_key' = $2
-                      LIMIT 1",
+                    "UPDATE acp_turns
+                        SET payload = jsonb_build_object(
+                                'turn_key', $3::text,
+                                'text', CASE WHEN $4::text IS NOT NULL
+                                             THEN left($4, 262144)
+                                             ELSE left(COALESCE(payload->>'text', '') || $5::text, 262144)
+                                        END
+                            ),
+                            status = $6,
+                            updated_at = now()
+                      WHERE id = (
+                          SELECT id FROM acp_turns
+                           WHERE acp_session_id = $1 AND role = 'agent_text'
+                             AND payload->>'turn_key' = $2
+                           LIMIT 1
+                      )
+                      RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
                 )
                 .bind(sess_id)
-                .bind(turn_key)
-                .fetch_optional(&st.pool)
+                .bind(&turn_key)
+                .bind(&turn_key)
+                .bind(full_text.as_deref())
+                .bind(&delta)
+                .bind(status)
+                .fetch_optional(&mut *tx)
                 .await
-                .ok()
-                .flatten()
+                .unwrap_or(None)
             } else {
                 None
             };
 
-            let row = if let Some(ex) = existing {
-                use sqlx::Row;
-                let tid: Uuid = ex.get("id");
-                let prev: Value = ex.get("payload");
-                let next_text = if let Some(ft) = full_text {
-                    ft.to_string()
-                } else {
-                    format!("{}{}", prev["text"].as_str().unwrap_or(""), delta)
-                };
-                sqlx::query(
-                    "UPDATE acp_turns SET payload = $2, status = $3, updated_at = now()
-                      WHERE id = $1
-                      RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
-                )
-                .bind(tid)
-                .bind(json!({ "turn_key": turn_key, "text": next_text }))
-                .bind(status)
-                .fetch_optional(&st.pool)
-                .await
-                .ok()
-                .flatten()
-            } else {
-                let txt = full_text.unwrap_or(delta);
-                insert_turn(
-                    st,
-                    sess_id,
-                    uid,
-                    "agent_text",
-                    status,
-                    json!({ "turn_key": turn_key, "text": txt }),
-                )
-                .await
+            let row = match updated_existing {
+                Some(r) => Some(r),
+                None => {
+                    let initial = full_text.unwrap_or(delta);
+                    match insert_turn_tx(
+                        &mut *tx,
+                        sess_id,
+                        uid,
+                        "agent_text",
+                        status,
+                        &json!({ "turn_key": turn_key, "text": initial }),
+                    )
+                    .await
+                    {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            tracing::warn!(session_id = %sess_id, error = %e, "insert text turn failed");
+                            None
+                        }
+                    }
+                }
             };
 
-            if let Some(r) = row {
-                let tv = turn_from_row(&r);
-                broadcast_acp(
-                    st,
-                    uid,
-                    "turn_upserted",
-                    json!({ "session_id": sess_id, "turn": tv }),
-                );
+            if row.is_some() && tx.commit().await.is_ok() {
+                if let Some(r) = row {
+                    let tv = turn_from_row(&r);
+                    broadcast_acp(
+                        st,
+                        uid,
+                        "turn_upserted",
+                        json!({ "session_id": sess_id, "turn": tv }),
+                    );
+                }
             }
         }
         "terminal_out" => {
+            let cmd_str: String = v["command"].as_str().unwrap_or("").chars().take(1000).collect();
+            let output_str: String = v["output"].as_str().unwrap_or("").chars().take(65536).collect();
             let payload = json!({
-                "command": v["command"].as_str().unwrap_or(""),
-                "output": v["output"].as_str().unwrap_or(""),
+                "command": cmd_str,
+                "output": output_str,
                 "exit_code": v["exit_code"].as_i64().unwrap_or(0),
             });
             if let Some(r) = insert_turn(st, sess_id, uid, "terminal_out", "done", payload).await {
@@ -575,14 +614,17 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
     }
 }
 
-pub(crate) async fn insert_turn(
-    st: &SharedState,
+pub(crate) async fn insert_turn_tx<'e, E>(
+    exec: E,
     sess_id: Uuid,
     uid: Uuid,
     role: &str,
     status: &str,
-    payload: Value,
-) -> Option<sqlx::postgres::PgRow> {
+    payload: &Value,
+) -> Result<sqlx::postgres::PgRow, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query(
         "INSERT INTO acp_turns (acp_session_id, user_id, seq, role, status, payload)
          VALUES (
@@ -599,9 +641,47 @@ pub(crate) async fn insert_turn(
     .bind(uid)
     .bind(role)
     .bind(status)
-    .bind(&payload)
-    .fetch_optional(&st.pool)
+    .bind(payload)
+    .fetch_one(exec)
     .await
-    .ok()
-    .flatten()
+}
+
+pub(crate) async fn insert_turn(
+    st: &SharedState,
+    sess_id: Uuid,
+    uid: Uuid,
+    role: &str,
+    status: &str,
+    payload: Value,
+) -> Option<sqlx::postgres::PgRow> {
+    let mut tx = match st.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(session_id = %sess_id, error = %e, "insert_turn begin tx failed");
+            return None;
+        }
+    };
+    let locked = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM acp_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(sess_id)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await;
+    if !matches!(locked, Ok(Some(_))) {
+        return None;
+    }
+    match insert_turn_tx(&mut *tx, sess_id, uid, role, status, &payload).await {
+        Ok(row) => {
+            if let Err(e) = tx.commit().await {
+                tracing::warn!(session_id = %sess_id, error = %e, "insert_turn commit failed");
+                return None;
+            }
+            Some(row)
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %sess_id, error = %e, "insert_turn failed");
+            None
+        }
+    }
 }
