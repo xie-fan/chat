@@ -1,3 +1,4 @@
+import { isDesktopShell, session } from "./api";
 import { convTitle, isMuted, isOwnMessage, type AppState } from "./store";
 import { RECORD_TITLE_MAX, recordLabel } from "./ui/chat/chatRecord";
 import { systemBarText } from "./ui/chat/systemMessage";
@@ -5,7 +6,7 @@ import type { ConversationView, MessageView } from "./types";
 
 /**
  * ===== V2 P1-1 =====
- * 系统通知（Web Notification / Tauri 通知插件）+ 标题未读数 + 任务栏提醒。
+ * 系统通知（Web Notification / 原生通知）+ 标题未读数 + 任务栏提醒。
  * 判定逻辑做成纯函数便于单测；Tauri API 一律动态 import，Web 端不受影响。
  */
 
@@ -14,9 +15,13 @@ const LS_ENABLED = "chat_notify_enabled";
 const LS_PREVIEW = "chat_notify_preview";
 
 export type NotifyKind = "web" | "tauri" | "none";
-export type NotifyPermission = "granted" | "denied" | "default";
+export type NotifyPermission = "granted" | "denied" | "default" | "unavailable";
 
-/** 系统通知能力：Tauri 壳走插件通道；浏览器要求 Web Notification 可用 */
+const isAndroidShell = () => notifySupport() === "tauri" && !isDesktopShell();
+const invokeNotify = async <T>(command: string, args?: Record<string, unknown>) =>
+  (await import("@tauri-apps/api/core")).invoke<T>(command, args);
+
+/** 系统通知能力：浏览器要求 Web Notification 可用 */
 export function notifySupport(): NotifyKind {
   if (typeof window === "undefined") return "none";
   if ("__TAURI_INTERNALS__" in window) return "tauri";
@@ -26,7 +31,8 @@ export function notifySupport(): NotifyKind {
 
 export function notifyEnabled(): boolean {
   try {
-    return localStorage.getItem(LS_ENABLED) === "1";
+    const value = localStorage.getItem(LS_ENABLED);
+    return value == null ? notifySupport() === "tauri" : value === "1";
   } catch {
     return false;
   }
@@ -34,8 +40,7 @@ export function notifyEnabled(): boolean {
 
 export function setNotifyEnabled(v: boolean) {
   try {
-    if (v) localStorage.setItem(LS_ENABLED, "1");
-    else localStorage.removeItem(LS_ENABLED);
+    localStorage.setItem(LS_ENABLED, v ? "1" : "0");
   } catch {}
 }
 
@@ -66,11 +71,9 @@ export async function notifyPermission(): Promise<NotifyPermission> {
   }
   if (kind === "tauri") {
     try {
-      const n = await import("@tauri-apps/plugin-notification");
-      // 插件 JS 侧 internally 读 window.Notification.permission / 走原生 is_permission_granted
-      return (await n.isPermissionGranted()) ? "granted" : "default";
+      return await invokeNotify<NotifyPermission>("notification_permission");
     } catch {
-      return "default";
+      return "unavailable";
     }
   }
   return "denied";
@@ -82,9 +85,7 @@ export async function requestNotifyPermission(): Promise<boolean> {
   try {
     if (kind === "web") return (await Notification.requestPermission()) === "granted";
     if (kind === "tauri") {
-      const n = await import("@tauri-apps/plugin-notification");
-      // Android 13+ 经插件 requestPermission 走运行时权限申请
-      return (await n.isPermissionGranted()) || (await n.requestPermission()) === "granted";
+      return await invokeNotify<NotifyPermission>("notification_permission", { request: true }) === "granted";
     }
   } catch {}
   return false;
@@ -118,13 +119,18 @@ export function shouldSystemNotify(s: AppState, m: MessageView, env: NotifyEnv):
 }
 
 /** 标题未读数：未静音会话 unread_count 之和 + 静音但 @我 会话的未读数；>99 显示 99+ */
-export function unreadTitle(conversations: ConversationView[]): string {
+export function unreadLabel(conversations: ConversationView[]): string | null {
   let n = 0;
   for (const c of conversations) {
     if (isMuted(c) && !c.has_mention) continue;
     n += c.unread_count;
   }
-  return n > 0 ? `(${n > 99 ? "99+" : n}) Chat` : "Chat";
+  return n === 0 ? null : n > 99 ? "99+" : String(n);
+}
+
+export function unreadTitle(conversations: ConversationView[]): string {
+  const label = unreadLabel(conversations);
+  return label ? `(${label}) Chat` : "Chat";
 }
 
 /** 非文本 kind 的占位摘要（与 ChatView 的 kindLabel 一致） */
@@ -171,39 +177,46 @@ export function notificationBody(
 
 /**
  * 弹一条系统通知。Web 端用 tag 保证同会话通知互相替换（不刷屏）；
- * 点击聚焦窗口并回调打开会话（Tauri 桌面端插件拿不到点击回调时只弹出）。
- * Tauri 同时闪烁任务栏图标；Android 上该调用失败静默吞掉。
+ * 点击聚焦窗口并打开会话；桌面壳由原生通知处理点击。
  */
 export async function showSystemNotification(o: {
   title: string;
   body: string;
-  convId: string;
+  convId?: string;
   onOpen?: (convId: string) => void;
-}): Promise<void> {
+}): Promise<boolean> {
   const kind = notifySupport();
   if (kind === "web") {
     try {
-      if (Notification.permission !== "granted") return;
-      const n = new Notification(o.title, { body: o.body, tag: `chat-${o.convId}` });
+      if (Notification.permission !== "granted") return false;
+      const n = new Notification(o.title, { body: o.body, tag: `chat-${o.convId ?? "test"}` });
       n.onclick = () => {
         try {
           window.focus();
         } catch {}
-        o.onOpen?.(o.convId);
+        if (o.convId) o.onOpen?.(o.convId);
       };
+      return true;
     } catch {}
-    return;
   }
   if (kind === "tauri") {
     try {
-      const { sendNotification } = await import("@tauri-apps/plugin-notification");
-      sendNotification({ title: o.title, body: o.body });
-    } catch {}
-    try {
-      const { getCurrentWindow, UserAttentionType } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().requestUserAttention(UserAttentionType.Informational);
+      const shown = await invokeNotify<boolean>("show_chat_notification", {
+        title: o.title,
+        body: o.body,
+        target: o.convId ? { convId: o.convId, session: session() } : null,
+      });
+      if (shown && isDesktopShell()) {
+        void import("@tauri-apps/api/window")
+          .then(({ getCurrentWindow, UserAttentionType }) =>
+            getCurrentWindow().requestUserAttention(UserAttentionType.Informational),
+          )
+          .catch(() => {});
+      }
+      return shown;
     } catch {}
   }
+  return false;
 }
 
 /** ws 新消息入口：读环境 → 判定 → 组文案 → 弹通知（Tauri 顺带闪任务栏） */
@@ -213,9 +226,12 @@ export async function notifyIncoming(
   onOpen?: (convId: string) => void,
 ): Promise<void> {
   if (notifySupport() === "none") return;
-  if (!shouldSystemNotify(s, m, { foreground: windowForeground(), enabled: notifyEnabled() }))
+  // Android 的原生通知入口按 Activity 状态判断前后台。
+  if (!shouldSystemNotify(s, m, {
+    foreground: !isAndroidShell() && windowForeground(),
+    enabled: notifyEnabled(),
+  }))
     return;
-  if ((await notifyPermission()) !== "granted") return;
   const conv = s.conversations.find((c) => c.id === m.conversation_id);
   const mentioned = s.me != null && m.mentions.includes(s.me.id);
   await showSystemNotification({
@@ -227,13 +243,35 @@ export async function notifyIncoming(
 }
 
 /** 同步标题：浏览器 document.title + Tauri 窗口 setTitle */
-export function syncWindowTitle(title: string): void {
+export function syncWindowTitle(conversations: ConversationView[]): void {
+  const title = unreadTitle(conversations);
   try {
     document.title = title;
   } catch {}
   if (notifySupport() === "tauri") {
     void import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) => getCurrentWindow().setTitle(title))
+      .then(({ getCurrentWindow }) => {
+        const win = getCurrentWindow();
+        const updates = [win.setTitle(title)];
+        if (/Macintosh/i.test(navigator.userAgent)) {
+          updates.push(win.setBadgeLabel(unreadLabel(conversations) ?? undefined));
+        }
+        return Promise.all(updates);
+      })
       .catch(() => {});
+  }
+}
+
+export async function listenForNotificationClicks(onOpen: (convId: string) => void) {
+  if (notifySupport() !== "tauri" || !isDesktopShell()) return;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ convId: string; session: number }>("chat-notification-open", ({ payload }) => {
+    if (payload.session === session()) onOpen(payload.convId);
+  });
+}
+
+export async function notificationReady(): Promise<void> {
+  if (notifySupport() === "tauri" && /Windows/i.test(navigator.userAgent)) {
+    await invokeNotify("notification_ready", { session: session() });
   }
 }

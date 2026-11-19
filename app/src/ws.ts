@@ -38,7 +38,7 @@ import {
   updateDrafts,
   upsertMessage,
 } from "./store";
-import type { AttachmentView, MessageView, WsOut } from "./types";
+import type { AttachmentView, ConversationView, MessageView, WsOut } from "./types";
 
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
@@ -46,6 +46,7 @@ let attempts = 0;
 let stopped = false;
 let catalogGen = 0;
 let wsGen = -1; // 建立连接时的会话代次快照；换代后旧 socket/异步回调一律作废
+let pendingNotificationRead: { id: string; session: number } | null = null;
 let connectionAttempt = 0;
 let heartbeat: ReturnType<typeof setTimeout> | null = null;
 let pongDeadline: ReturnType<typeof setTimeout> | null = null;
@@ -187,6 +188,7 @@ export function stopWs() {
   stopped = true;
   wsGen = -1; // 使在途连接/回调全部失效（P1-10）
   catalogGen++; // 使在途目录刷新失效
+  pendingNotificationRead = null;
   // 只清内存：本地存的待发记录留给该账号下次登录
   outbox.length = 0;
   outboxKey = "";
@@ -252,6 +254,7 @@ export async function refreshCatalogs(): Promise<void> {
     }
     return next;
   });
+  flushNotificationRead();
 }
 
 async function connect() {
@@ -915,15 +918,38 @@ export async function leaveGroup(convId: string): Promise<"left" | "already_left
  * 归档会话被主动打开时即取消本人归档（§8.3，新普通消息不自动恢复）。
  */
 export function openConversation(id: string) {
-  const s = getState();
-  const c = s.conversations.find((x) => x.id === id);
+  const c = getState().conversations.find((x) => x.id === id);
   setState({ activeConv: id, tab: "chats" });
-  if (c && c.unread_count > 0 && c.last_seq > 0) {
-    sendRead(id, c.last_seq);
-    setState((cur) => ({
-      conversations: cur.conversations.map((x) =>
-        x.id === id ? { ...x, unread_count: 0, has_mention: false } : x,
-      ),
-    }));
+  markConversationRead(c);
+}
+
+export function openConversationFromNotification(id: string) {
+  setState({ activeConv: id, tab: "chats" });
+  pendingNotificationRead = { id, session: session() };
+  flushNotificationRead();
+}
+
+function flushNotificationRead() {
+  const pending = pendingNotificationRead;
+  if (!pending) return;
+  const s = getState();
+  if (pending.session !== session() || !isViewing(s, pending.id)) {
+    pendingNotificationRead = null;
+    return;
   }
+  if (!s.friendsLoaded || !s.wsReady || wsGen !== pending.session || ws?.readyState !== WebSocket.OPEN) return;
+  const c = s.conversations.find((x) => x.id === pending.id);
+  if (!c) return;
+  pendingNotificationRead = null;
+  markConversationRead(c);
+}
+
+function markConversationRead(c: ConversationView | undefined) {
+  if (!c || c.unread_count <= 0 || c.last_seq <= 0) return;
+  sendRead(c.id, c.last_seq);
+  setState((cur) => ({
+    conversations: cur.conversations.map((x) =>
+      x.id === c.id ? { ...x, unread_count: 0, has_mention: false } : x,
+    ),
+  }));
 }

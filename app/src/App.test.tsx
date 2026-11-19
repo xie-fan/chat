@@ -10,7 +10,12 @@ import App from "./App";
 
 vi.mock("./acpHost", () => ({ startAcpHost: vi.fn(), stopAcpHost: vi.fn() }));
 vi.mock("./ws", () => ({ startWs: vi.fn(), stopWs: vi.fn() }));
-vi.mock("./notify", () => ({ syncWindowTitle: vi.fn(), unreadTitle: vi.fn() }));
+vi.mock("./notify", () => ({
+  syncWindowTitle: vi.fn(),
+  unreadTitle: vi.fn(),
+  listenForNotificationClicks: vi.fn(async () => undefined),
+  notificationReady: vi.fn(async () => undefined),
+}));
 vi.mock("./ui/ChatScreen", () => ({ default: () => <div>chat</div> }));
 vi.mock("./ui/AuthScreen", () => ({ default: () => <div>auth</div> }));
 vi.mock("./ui/Modal", () => ({ DialogHost: () => null, dismissAllDialogs: vi.fn() }));

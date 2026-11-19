@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Window, WindowEvent};
-use tauri_plugin_notification::NotificationExt;
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -18,13 +17,38 @@ fn box_err(err: impl std::error::Error + Send + Sync + 'static) -> Box<dyn std::
 }
 
 pub fn install(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        use ksni::TrayMethods;
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let tray = LinuxTray(app.clone());
+            match tray.spawn().await {
+                Ok(handle) => {
+                    app.manage(handle);
+                }
+                Err(_) => {
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        let _ = install_standard(&handle);
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    install_standard(app)
+}
+
+fn install_standard(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>).map_err(box_err)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>).map_err(box_err)?;
     let menu = Menu::with_items(app, &[&show, &quit]).map_err(box_err)?;
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("Chat")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(cfg!(target_os = "linux"))
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => reveal(app),
             "quit" => request_quit(app),
@@ -43,32 +67,86 @@ pub fn install(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Linux 下左键单击收不到事件：Tauri 的 TrayIconEvent 在 Linux 标注为
-// Unsupported，因为后端 libayatana-appindicator 只有 Activate/ContextMenu
-// 信号且两者都会弹出菜单，应用拿不到点击。所以 Linux 上左/右键行为都是弹
-// 菜单，菜单首项「显示窗口」是入口；本函数只在 Windows/macOS 生效。
 fn click_shows_window(event: &TrayIconEvent) -> bool {
-    match event {
+    matches!(
+        event,
         TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
             ..
-        } => true,
-        TrayIconEvent::DoubleClick {
+        } | TrayIconEvent::DoubleClick {
             button: MouseButton::Left,
             ..
-        } => true,
-        _ => false,
-    }
+        }
+    )
 }
 
-fn reveal(app: &AppHandle) {
+pub(crate) fn reveal(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    let _ = window.unminimize();
     let _ = window.show();
+    let _ = window.unminimize();
     let _ = window.set_focus();
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxTray(AppHandle);
+
+#[cfg(target_os = "linux")]
+impl LinuxTray {
+    fn on_main(&self, action: fn(&AppHandle)) {
+        let app = self.0.clone();
+        let _ = self.0.run_on_main_thread(move || action(&app));
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ksni::Tray for LinuxTray {
+    fn id(&self) -> String {
+        self.0.config().identifier.clone()
+    }
+
+    fn title(&self) -> String {
+        "Chat".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        let Some(icon) = self.0.default_window_icon() else {
+            return Vec::new();
+        };
+        let mut data = icon.rgba().to_vec();
+        for pixel in data.as_chunks_mut::<4>().0 {
+            pixel.rotate_right(1);
+        }
+        vec![ksni::Icon {
+            width: icon.width() as i32,
+            height: icon.height() as i32,
+            data,
+        }]
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.on_main(reveal);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        vec![
+            StandardItem {
+                label: "显示窗口".into(),
+                activate: Box::new(|tray: &mut Self| tray.on_main(reveal)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "退出".into(),
+                activate: Box::new(|tray: &mut Self| tray.on_main(request_quit)),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
 }
 
 /// QUITTING 让随后的 CloseRequested 真正关掉窗口。
@@ -90,10 +168,9 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst) {
         return;
     }
-    let _ = window
-        .notification()
-        .builder()
-        .title("Chat")
-        .body(TRAY_HINT)
-        .show();
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ =
+            crate::notifications::show_desktop(app, "Chat".into(), TRAY_HINT.into(), None).await;
+    });
 }
