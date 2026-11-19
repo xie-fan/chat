@@ -118,6 +118,7 @@ pub async fn show_chat_notification(
     title: String,
     body: String,
     target: Option<Target>,
+    android_account: Option<String>,
 ) -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
@@ -128,6 +129,7 @@ pub async fn show_chat_notification(
                 "show",
                 serde_json::json!({
                     "title": title, "body": body, "convId": target.map(|t| t.conv_id),
+                    "account": android_account,
                 }),
             )
             .await
@@ -135,19 +137,44 @@ pub async fn show_chat_notification(
     }
     #[cfg(desktop)]
     {
+        let _ = android_account;
         show_desktop(app, title, body, target).await.map(|()| true)
     }
     #[cfg(all(not(desktop), not(target_os = "android")))]
     {
-        let _ = (app, title, body, target);
+        let _ = (app, title, body, target, android_account);
         Ok(false)
     }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn listen_for_android_notification_open(
+    app: AppHandle,
+    account: String,
+    channel: tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    use tauri::Manager;
+    app.state::<AndroidNotifications>()
+        .0
+        .run_mobile_plugin_async(
+            "listenForNotificationOpen",
+            serde_json::json!({ "account": account, "channel": channel }),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(desktop)]
 fn activate(app: &AppHandle, target: Option<Target>) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
+        #[cfg(target_os = "linux")]
+        if let Some(window) = handle.get_webview_window("main") {
+            if matches!(window.is_focused(), Ok(false)) {
+                let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+            }
+        }
         crate::tray::reveal(&handle);
         if let Some(target) = target {
             if let Some(window) = handle.get_webview_window("main") {

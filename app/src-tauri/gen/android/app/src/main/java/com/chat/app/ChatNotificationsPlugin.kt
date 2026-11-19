@@ -7,6 +7,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -16,17 +17,26 @@ import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.Permission
 import app.tauri.annotation.PermissionCallback
 import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
 
 private const val PERMISSION = "notifications"
 private const val CHANNEL = "chat_messages"
+internal const val OPEN_CHAT_NOTIFICATION = "com.chat.app.OPEN_CHAT_NOTIFICATION"
 
 @InvokeArg
 class ChatNotificationArgs {
   lateinit var title: String
   lateinit var body: String
   var convId: String? = null
+  var account: String? = null
+}
+
+@InvokeArg
+class NotificationOpenListener {
+  lateinit var account: String
+  lateinit var channel: Channel
 }
 
 @TauriPlugin(permissions = [
@@ -62,6 +72,15 @@ class ChatNotificationsPlugin(private val activity: Activity) : Plugin(activity)
     invoke.resolveObject(permission())
   }
 
+  @Command
+  fun listenForNotificationOpen(invoke: Invoke) {
+    val args = invoke.parseArgs(NotificationOpenListener::class.java)
+    activity.runOnUiThread {
+      (activity as MainActivity).listenForNotificationOpen(args.account, args.channel)
+      invoke.resolve()
+    }
+  }
+
   @SuppressLint("MissingPermission")
   @Command
   fun show(invoke: Invoke) {
@@ -87,7 +106,19 @@ class ChatNotificationsPlugin(private val activity: Activity) : Plugin(activity)
           }
         }
         val intent = Intent(activity, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        val pending = PendingIntent.getActivity(activity, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+        val convId = args.convId
+        val account = args.account
+        if (convId != null && account != null) {
+          intent.action = OPEN_CHAT_NOTIFICATION
+          intent.data = Uri.Builder().scheme("chat-notification").authority("open")
+            .appendPath(account).appendPath(convId).build()
+          intent.putExtra("convId", convId)
+          intent.putExtra("account", account)
+          intent.putExtra(NOTIFICATION_TAP_TOKEN, NotificationTapAuth.sign(activity, convId, account))
+        }
+        val pending = PendingIntent.getActivity(
+          activity, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val notification = NotificationCompat.Builder(activity, CHANNEL)
           .setSmallIcon(R.drawable.ic_chat_notification)
           .setContentTitle(args.title)
