@@ -1,10 +1,14 @@
-export function isFileDrag(data: DataTransfer | null): boolean {
-  return !!data && (data.types.includes("Files") || data.files.length > 0);
+export function isManagedFileDrag({ target, dataTransfer }: Pick<DragEvent, "target" | "dataTransfer">): boolean {
+  if (!dataTransfer || (!dataTransfer.types.includes("Files") && !dataTransfer.files.length)) {
+    return false;
+  }
+  const element = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+  return !element?.closest('input[type="file"]');
 }
 
 export function installFileDropGuard(target: Window): () => void {
   const preventFileDropDefault = (event: DragEvent) => {
-    if (isFileDrag(event.dataTransfer)) event.preventDefault();
+    if (isManagedFileDrag(event)) event.preventDefault();
   };
   target.addEventListener("dragover", preventFileDropDefault, true);
   target.addEventListener("drop", preventFileDropDefault, true);

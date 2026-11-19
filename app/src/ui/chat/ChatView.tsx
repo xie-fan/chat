@@ -20,7 +20,7 @@ import {
 import { copyPlainText } from "../../clipboard";
 import { saveAttachment } from "../../download";
 import { unsentText, type DraftReuse } from "../../drafts";
-import { isFileDrag } from "../../fileDrop";
+import { isManagedFileDrag } from "../../fileDrop";
 import {
   REEDIT_WINDOW_MS,
   patchReedit,
@@ -1536,12 +1536,12 @@ export default function ChatView() {
     <main
       className="chat-view"
       onDragOverCapture={(e) => {
-        if (!isFileDrag(e.dataTransfer)) return;
+        if (!isManagedFileDrag(e)) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = readonly || msMode || s.editingMessage ? "none" : "copy";
       }}
       onDropCapture={(e) => {
-        if (!e.dataTransfer.files.length) return;
+        if (!e.dataTransfer.files.length || !isManagedFileDrag(e)) return;
         e.preventDefault();
         if (!readonly && !msMode && !s.editingMessage) addPending(e.dataTransfer.files);
       }}

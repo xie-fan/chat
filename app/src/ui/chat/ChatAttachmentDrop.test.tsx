@@ -32,6 +32,24 @@ it("prevents browser file handling outside chat before mounting React, without c
   }
 });
 
+it("leaves native file selection enabled for a file input", () => {
+  const uninstall = installFileDropGuard(window);
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".tar.gz,application/gzip";
+  document.body.appendChild(input);
+  const data = new DataTransfer();
+  Object.defineProperty(data, "types", { value: ["Files"] });
+  try {
+    expect(input.dispatchEvent(dragEvent("dragover", data))).toBe(true);
+    data.items.add(new File(["backup"], "backup.tar.gz", { type: "application/gzip" }));
+    expect(input.dispatchEvent(dragEvent("drop", data))).toBe(true);
+  } finally {
+    input.remove();
+    uninstall();
+  }
+});
+
 it("stages files from the chat header and composer without sending them", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL) =>
