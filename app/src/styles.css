@@ -1885,6 +1885,11 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
   border-radius: 18px 18px 18px 4px; border: 1px solid var(--border-color);
   box-shadow: var(--shadow-sm);
 }
+/* 墓碑不套用我方/对方气泡配色，否则「重新编辑」的强调色会落在同色背景上看不见 */
+.msg-row .bubble.deleted {
+  background: var(--bg); color: var(--muted);
+  border: 1px dashed var(--line); box-shadow: none;
+}
 .composer {
   position: relative; padding: 4px 20px 18px; background: transparent; border-top: none;
 }
