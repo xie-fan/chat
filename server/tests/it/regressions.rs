@@ -1,5 +1,28 @@
 use super::*;
 
+#[tokio::test]
+async fn client_heartbeat_and_replayed_message_are_idempotent() {
+    let base = spawn().await;
+    let a = register(&base, &format!("hb_{}", uniq())).await;
+    let b = register(&base, &format!("hb_{}", uniq())).await;
+    befriend(&base, &a, &b).await;
+    let conv = dm_conv(&base, &a).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    next_of(&mut socket, "presence_init").await;
+    socket
+        .send(WsMsg::Text(json!({"type":"ping"}).to_string().into()))
+        .await
+        .unwrap();
+    next_of(&mut socket, "pong").await;
+    let frame = json!({"client_msg_id":"heartbeat-replay", "content":"retry"});
+    let first = ws_send(&mut socket, &conv, frame.clone()).await;
+    let replay = ws_send(&mut socket, &conv, frame).await;
+    assert_eq!(first["id"], replay["id"]);
+    assert_eq!(first["seq"], replay["seq"]);
+}
+
 // ---------- review 回归 ----------
 
 /// P1-1：附件下载安全头。HTML/SVG 一律 attachment + nosniff；图片/PDF 仍可 inline。

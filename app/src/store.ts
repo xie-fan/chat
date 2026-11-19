@@ -46,6 +46,7 @@ export interface AppState {
   /** conv_id -> { user, ts } 正在输入 */
   typing: Record<string, { user: UserPublic; ts: number }>;
   friends: FriendView[];
+  friendsLoaded?: boolean;
   requests: RequestsView;
   wsReady: boolean;
   tab: "chats" | "contacts" | "agents" | "me" | "admin";
@@ -91,6 +92,7 @@ const emptySessionData = () => ({
   online: {} as Record<string, boolean>,
   typing: {} as Record<string, { user: UserPublic; ts: number }>,
   friends: [] as FriendView[],
+  friendsLoaded: false,
   requests: { incoming: [], outgoing: [] } as RequestsView,
   wsReady: false,
   tab: "chats" as AppState["tab"],
@@ -137,6 +139,7 @@ export function setState(patch: Partial<AppState> | ((s: AppState) => Partial<Ap
     p.me !== undefined ||
     p.conversations !== undefined ||
     p.messages !== undefined ||
+    p.friends !== undefined ||
     p.activeConv !== undefined
   ) {
     scheduleCachePersist();
@@ -159,6 +162,7 @@ function scheduleCachePersist() {
     const ids = [...recent, ...Object.keys(s.messages).filter((id) => !recent.includes(id))];
     writeLocalCache(localStorage, cacheKey(serverScope(), s.me.id), {
       conversations: s.conversations,
+      friends: s.friends,
       recent: ids,
       messages: Object.fromEntries(ids.map((id) => [id, s.messages[id]])),
     });
@@ -177,6 +181,11 @@ export function useApp(): AppState {
 }
 
 // ---------- 领域辅助 ----------
+
+export function isReadonlyDm(conv: ConversationView, s: AppState): boolean {
+  return conv.kind === "dm" && !!conv.peer && s.friendsLoaded === true &&
+    !s.friends.some((f) => f.user.id === conv.peer!.id);
+}
 
 export function convTitle(c: ConversationView, meId?: string): string {
   if (c.kind === "group") return c.name ?? `群聊(${c.member_count})`;

@@ -47,6 +47,46 @@ let attempts = 0;
 let stopped = false;
 let catalogGen = 0;
 let wsGen = -1; // 建立连接时的会话代次快照；换代后旧 socket/异步回调一律作废
+let connectionAttempt = 0;
+let heartbeat: ReturnType<typeof setTimeout> | null = null;
+let pongDeadline: ReturnType<typeof setTimeout> | null = null;
+
+function clearHeartbeat() {
+  if (heartbeat != null) clearTimeout(heartbeat);
+  if (pongDeadline != null) clearTimeout(pongDeadline);
+  heartbeat = pongDeadline = null;
+}
+
+function reconnectNow() {
+  if (stopped || wsGen !== session()) return;
+  connectionAttempt++;
+  clearHeartbeat();
+  const sock = ws;
+  ws = null;
+  if (sock) {
+    sock.onclose = null;
+    sock.close();
+  }
+  setState({ wsReady: false });
+  scheduleReconnect(wsGen);
+}
+
+function scheduleHeartbeat(sock: WebSocket) {
+  clearHeartbeat();
+  heartbeat = setTimeout(() => {
+    if (ws !== sock || sock.readyState !== WebSocket.OPEN) return;
+    sock.send(JSON.stringify({ type: "ping" }));
+    pongDeadline = setTimeout(reconnectNow, 3_000);
+  }, 4_000);
+}
+
+function onOnline() {
+  if (stopped || getState().wsReady) return;
+  if (reconnectTimer != null) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  attempts = 0;
+  void connect();
+}
 
 // ---- 同步水位（P1-9）：以「最高连续 seq」为准，缺口靠 sync 补齐 ----
 const syncedSeq = new Map<string, number>(); // conv_id → 已确认连续的最大 seq
@@ -72,7 +112,7 @@ type Outgoing = {
   sentAt?: number;
 };
 
-/** ack 看门狗：发出 ACK_TIMEOUT_MS 未确认即判超时失败（可重试/删除），
+/** ack 看门狗：发出 ACK_TIMEOUT_MS 未确认即重连重放，
  * 期间每 ACK_WATCHDOG_MS 扫一次——ack 丢了但消息本体已回显的，直接按 ack 收敛。 */
 const ACK_TIMEOUT_MS = 10_000;
 const ACK_WATCHDOG_MS = 3_000;
@@ -140,6 +180,10 @@ const PERMANENT_SEND_ERRORS = new Set([
 const REUSE_FAIL_CODES = new Set(["attachment_expired", "forbidden", "bad_request"]);
 
 export function stopWs() {
+  connectionAttempt++;
+  clearHeartbeat();
+  window.removeEventListener?.("offline", reconnectNow);
+  window.removeEventListener?.("online", onOnline);
   stopped = true;
   wsGen = -1; // 使在途连接/回调全部失效（P1-10）
   catalogGen++; // 使在途目录刷新失效
@@ -170,6 +214,8 @@ export function stopWs() {
 export async function startWs() {
   stopped = false;
   wsGen = session(); // P1-10：绑定当前登录会话
+  window.addEventListener?.("offline", reconnectNow);
+  window.addEventListener?.("online", onOnline);
   restoreOutbox();
   scheduleAckWatchdog();
   await connect();
@@ -189,6 +235,7 @@ export async function refreshCatalogs(): Promise<void> {
       ...s,
       conversations: mergeConversationLists(s.conversations, conversations),
       friends,
+      friendsLoaded: true,
       requests,
       avatars: absorbAvatarUsers(s.avatars, [
         s.me,
@@ -209,15 +256,16 @@ export async function refreshCatalogs(): Promise<void> {
 
 async function connect() {
   if (stopped) return;
+  const attempt = ++connectionAttempt;
   const gen = wsGen;
   let ticket: string;
   try {
     ticket = (await convs.ticket()).ticket;
   } catch {
-    if (gen === wsGen) scheduleReconnect(gen);
+    if (gen === wsGen && attempt === connectionAttempt) scheduleReconnect(gen);
     return;
   }
-  if (stopped || gen !== wsGen || gen !== session()) return; // ticket 落地前会话已换代 → 丢弃
+  if (stopped || gen !== wsGen || gen !== session() || attempt !== connectionAttempt) return; // ticket 落地前会话已换代 → 丢弃
   const sock = new WebSocket(`${wsBase()}/v1/ws?ticket=${ticket}`);
   ws = sock;
 
@@ -225,12 +273,16 @@ async function connect() {
     if (gen !== wsGen || gen !== session() || ws !== sock) return;
     attempts = 0;
     setState({ wsReady: true });
+    scheduleHeartbeat(sock);
     void afterOpen(sock, gen);
   };
   sock.onmessage = (ev) => {
     if (gen !== wsGen || gen !== session() || ws !== sock) return;
+    scheduleHeartbeat(sock);
     try {
-      dispatch(JSON.parse(ev.data) as WsOut);
+      const frame = JSON.parse(ev.data);
+      if (frame.type === "pong") return;
+      dispatch(frame as WsOut);
     } catch (e) {
       console.warn("bad ws frame", e);
     }
@@ -238,6 +290,7 @@ async function connect() {
   sock.onclose = () => {
     if (gen !== wsGen || gen !== session() || ws !== sock) return;
     setState({ wsReady: false });
+    clearHeartbeat();
     if (!stopped) scheduleReconnect(gen);
   };
   sock.onerror = () => sock.close();
@@ -612,7 +665,7 @@ function scheduleAckWatchdog() {
  * 而 message_ack 单帧丢失（服务端回包通道满、半开连接等）时，没有重连触发就
  * 永远卡在「发送中」。看门狗两路兜底：
  * 1. 真身已从广播/sync 回显（同会话、本人、同正文/附件）→ 按 ack 语义收敛；
- * 2. 在当前存活连接上发出且超时未确认 → 标失败气泡（重试/删除，不自动重发）。
+ * 2. 在当前存活连接上发出且超时未确认 → 重连，按原幂等键重放。
  * 死连接上的待发项交给重连 flushOutbox 重放，不在此判失败；
  * 从没上过 socket 的离线待发项同理（无 sentAt，直接跳过）。
  */
@@ -631,7 +684,7 @@ function checkOutboxAcks() {
       ws.readyState === WebSocket.OPEN &&
       Date.now() - item.sentAt >= ACK_TIMEOUT_MS
     ) {
-      markFailed(item.clientMsgId, "发送超时，请检查网络后重试");
+      reconnectNow();
     }
   }
 }

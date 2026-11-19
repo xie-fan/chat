@@ -9,6 +9,7 @@ import {
   convTitle,
   fetchForward,
   isOwnMessage,
+  isReadonlyDm,
   mergeConversationLists,
   resolveAck,
   shouldNotify,
@@ -104,6 +105,19 @@ function state(patch: Partial<AppState> = {}): AppState {
 function apply(s: AppState, m: MessageView): AppState {
   return { ...s, ...applyUpdatedMessage(s, m) };
 }
+
+describe("DM friendship authority", () => {
+  const peer = { id: "friend", username: "friend", display_name: "Friend", role: "user" as const, last_seen_at: null };
+  const dm = { ...state().conversations[0], peer };
+  it("keeps offline cold-start DMs writable with cached or missing friends", () => {
+    expect(isReadonlyDm(dm, state({ friendsLoaded: false, friends: [{ user: peer, since: "2026-01-01" }] }))).toBe(false);
+    expect(isReadonlyDm(dm, state({ friendsLoaded: false, friends: [] }))).toBe(false);
+  });
+  it("makes only a confirmed missing friendship read-only", () => {
+    expect(isReadonlyDm(dm, state({ friendsLoaded: true, friends: [] }))).toBe(true);
+    expect(isReadonlyDm(dm, state({ friendsLoaded: true, friends: [{ user: peer, since: "2026-01-01" }] }))).toBe(false);
+  });
+});
 
 // ===== MM2：撤回墓碑的幂等应用 =====
 // REST 响应与 WS message_deleted 帧都走 applyUpdatedMessage（整视图 id+version 合并），

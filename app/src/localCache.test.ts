@@ -53,6 +53,17 @@ describe("本地会话缓存（localStorage chat_cache:<enc(server)>:<userId>）
     expect(cacheKey("enc-a", "u1")).not.toBe(cacheKey("enc-a", "u2"));
   });
 
+  it("persists friends with cached history and tolerates legacy snapshots", () => {
+    const st = memStorage();
+    const friends = [{ user: { id: "u1", username: "u1", display_name: "U1", role: "user" as const, last_seen_at: null }, since: "2026-01-01" }];
+    const snapshot = { conversations: [conv("c")], messages: { c: [msg("m1", 1)] }, recent: ["c"], friends };
+    writeLocalCache(st, "k", snapshot);
+    expect(readLocalCache(st, "k")).toEqual(snapshot);
+    st.setItem("k", JSON.stringify({ ...snapshot, friends: null }));
+    expect(readLocalCache(st, "k")?.friends).toBeUndefined();
+    expect(readLocalCache(st, "k")?.messages.c).toHaveLength(1);
+  });
+
   it("写入→读回：会话列表与消息往返一致", () => {
     const st = memStorage();
     const key = cacheKey("", "u1");
