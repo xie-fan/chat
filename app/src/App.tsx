@@ -31,7 +31,7 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void listenForNotificationClicks((id) => {
       if (!disposed && getState().me) openConversationFromNotification(id);
-    }).then((stop) => {
+    }, s.me.id).then((stop) => {
       if (disposed) stop?.();
       else {
         unlisten = stop;

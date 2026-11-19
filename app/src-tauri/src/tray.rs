@@ -157,6 +157,10 @@ fn request_quit(app: &AppHandle) {
 }
 
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
+    #[cfg(target_os = "linux")]
+    if window.label() == "main" && matches!(event, WindowEvent::Focused(true)) {
+        let _ = window.request_user_attention(None);
+    }
     let WindowEvent::CloseRequested { api, .. } = event else {
         return;
     };

@@ -1,4 +1,5 @@
-import { isDesktopShell, session } from "./api";
+import { getServer, isDesktopShell, session } from "./api";
+import { accountIdOf } from "./servers";
 import { convTitle, isMuted, isOwnMessage, type AppState } from "./store";
 import { RECORD_TITLE_MAX, recordLabel } from "./ui/chat/chatRecord";
 import { systemBarText } from "./ui/chat/systemMessage";
@@ -183,6 +184,7 @@ export async function showSystemNotification(o: {
   title: string;
   body: string;
   convId?: string;
+  androidAccount?: string;
   onOpen?: (convId: string) => void;
 }): Promise<boolean> {
   const kind = notifySupport();
@@ -205,6 +207,7 @@ export async function showSystemNotification(o: {
         title: o.title,
         body: o.body,
         target: o.convId ? { convId: o.convId, session: session() } : null,
+        ...(o.androidAccount ? { androidAccount: o.androidAccount } : {}),
       });
       if (shown && isDesktopShell()) {
         void import("@tauri-apps/api/window")
@@ -238,6 +241,7 @@ export async function notifyIncoming(
     title: conv ? convTitle(conv) : "新消息",
     body: notificationBody(m, { preview: notifyPreview(), mentioned }),
     convId: m.conversation_id,
+    androidAccount: isAndroidShell() && s.me ? accountIdOf(getServer(), s.me.id) : undefined,
     onOpen,
   });
 }
@@ -262,8 +266,22 @@ export function syncWindowTitle(conversations: ConversationView[]): void {
   }
 }
 
-export async function listenForNotificationClicks(onOpen: (convId: string) => void) {
-  if (notifySupport() !== "tauri" || !isDesktopShell()) return;
+export async function listenForNotificationClicks(onOpen: (convId: string) => void, userId?: string) {
+  if (notifySupport() !== "tauri") return;
+  if (isAndroidShell()) {
+    if (!userId) return;
+    const gen = session();
+    const { Channel, invoke } = await import("@tauri-apps/api/core");
+    if (gen !== session()) return;
+    const channel = new Channel<string>((convId) => {
+      if (gen === session()) onOpen(convId);
+    });
+    await invoke("listen_for_android_notification_open", {
+      account: accountIdOf(getServer(), userId),
+      channel,
+    });
+    return () => { channel.onmessage = () => {}; };
+  }
   const { listen } = await import("@tauri-apps/api/event");
   return listen<{ convId: string; session: number }>("chat-notification-open", ({ payload }) => {
     if (payload.session === session()) onOpen(payload.convId);

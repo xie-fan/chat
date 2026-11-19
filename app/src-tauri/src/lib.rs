@@ -96,6 +96,8 @@ pub fn run() {
         .on_window_event(tray::on_window_event);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
+        #[cfg(target_os = "android")]
+        notifications::listen_for_android_notification_open,
         notifications::notification_permission,
         notifications::show_chat_notification,
         download::download_to_downloads,

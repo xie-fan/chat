@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { session } from "./api";
+import { getServer, session } from "./api";
+import { accountIdOf } from "./servers";
 import {
   listenForNotificationClicks,
   messageLine,
@@ -20,7 +21,12 @@ import type { AppState } from "./store";
 import type { ConversationView, MessageView } from "./types";
 
 const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke,
+  Channel: class {
+    constructor(public onmessage: (msg: string) => void) {}
+  },
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
 // ===== V2 P1-1 系统通知 =====
@@ -323,7 +329,24 @@ describe("native notifications", () => {
       title: "C",
       body: "Other: hello",
       target: { convId: "c", session: session() },
+      androidAccount: accountIdOf(getServer(), me.id),
     });
+  });
+
+  it("routes Android notification targets for the current account until disposed", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Android" });
+    const open = vi.fn();
+    invoke.mockImplementationOnce((_command, { channel }) => {
+      channel.onmessage("cold");
+    });
+    const stop = await listenForNotificationClicks(open, me.id);
+    const [command, { account, channel }] = invoke.mock.calls[0];
+    expect(command).toBe("listen_for_android_notification_open");
+    expect(account).toBe(accountIdOf(getServer(), me.id));
+    channel.onmessage("warm");
+    stop?.();
+    channel.onmessage("after-disposal");
+    expect(open.mock.calls).toEqual([["cold"], ["warm"]]);
   });
 
   it("test notifications carry no conversation target and report send failures", async () => {
