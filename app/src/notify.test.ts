@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  messageLine,
   notificationBody,
   notifyEnabled,
   notifyPreview,
@@ -242,5 +243,18 @@ describe("本机通知设置", () => {
     expect(() => setNotifyPreview(false)).not.toThrow();
     expect(notifyEnabled()).toBe(false);
     expect(notifyPreview()).toBe(true);
+  });
+});
+
+describe("messageLine", () => {
+  it("renders group system JSON as copy without sender prefix", () => {
+    const content = JSON.stringify({ code: "group_invited", actor_name: "A", invitee_names: ["B"] });
+    expect(messageLine(msg({ kind: "system", content }))).toBe("A 邀请 B 加入了群聊");
+    expect(
+      notificationBody(msg({ kind: "system", content: JSON.stringify({ code: "group_created", actor_name: "A" }) }), {
+        preview: true,
+        mentioned: false,
+      }),
+    ).toBe("A 创建了群聊");
   });
 });

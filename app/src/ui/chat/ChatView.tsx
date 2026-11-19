@@ -84,6 +84,7 @@ import {
 } from "./forwardBatch";
 import {
   canRecall,
+  EDIT_WINDOW_MS,
   copyTextFor,
   escClose,
   isGhostClick,
@@ -195,7 +196,7 @@ function kindLabel(kind: string): string {
 
 /** 编辑窗口 15 分钟（客户端只用于隐藏入口，服务端按库时间强制判定） */
 function withinEditWindow(m: MessageView): boolean {
-  return Date.now() - new Date(m.created_at).getTime() < 15 * 60 * 1000;
+  return Date.now() - new Date(m.created_at).getTime() < EDIT_WINDOW_MS;
 }
 
 /** MM2：菜单动作 → 图标（右键菜单、动作面板、预览工具栏共用） */
@@ -410,7 +411,7 @@ export default function ChatView() {
   }, [conv?.id]);
 
   // ===== MM2：重新编辑暂存 =====
-  // 打开会话时装载本账号在本服务器的暂存；每 30s 扫一遍把超过 10 分钟的剔除；
+  // 打开会话时装载本账号在本服务器的暂存；每 30s 扫一遍把超过 15 分钟的剔除；
   // 登出时清掉（servers.removeServerData 按 chat_reedit: 键前缀兜底）。
   useEffect(() => {
     const meId = getState().me?.id;
@@ -1855,7 +1856,7 @@ export default function ChatView() {
                       >
                         {tombstoneText(m, { meId: s.me?.id, convType: conv.kind })}
                         {(() => {
-                          // MM2：本地留有原文且在 10 分钟窗口内 → 「重新编辑」
+                          // MM2：本地留有原文且在 15 分钟窗口内 → 「重新编辑」
                           const entry = reedits.find(
                             (e) => e.message_id === m.id && reeditFresh(e),
                           );

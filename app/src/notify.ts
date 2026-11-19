@@ -138,6 +138,25 @@ function kindLabel(kind: string): string {
   return "";
 }
 
+/** toast / 系统通知共用摘要：附件、聊天记录、系统条（JSON → 中文文案）等按 kind 映射 */
+export function messageExcerpt(m: MessageView): string {
+  if (m.attachment) {
+    if (m.kind === "image") return "[图片]";
+    if (m.kind === "audio" || m.attachment.duration_ms != null) return "[语音]";
+    return `[文件] ${m.attachment.file_name}`;
+  }
+  if (m.kind === "chat_record") return recordLabel(m, RECORD_TITLE_MAX);
+  if (m.kind === "system") return systemBarText(m.content);
+  if (m.kind === "meeting") return "[视频会议]";
+  return kindLabel(m.kind) || m.content.slice(0, 80);
+}
+
+/** "发送者: 摘要"；系统条文案自带操作者，不再加发送者前缀 */
+export function messageLine(m: MessageView): string {
+  const excerpt = messageExcerpt(m);
+  return m.kind === "system" ? excerpt : `${m.sender_name}: ${excerpt}`;
+}
+
 /**
  * 通知正文：预览开 → "发送者: 摘要"（@我 加前缀，摘要规则与 toast 一致）；
  * 预览关 → "你收到一条新消息" / "有人@了你"，不含消息内容。
@@ -147,18 +166,7 @@ export function notificationBody(
   o: { preview: boolean; mentioned: boolean },
 ): string {
   if (!o.preview) return o.mentioned ? "有人@了你" : "你收到一条新消息";
-  const excerpt = m.attachment
-    ? m.kind === "image"
-      ? "[图片]"
-      : m.kind === "audio" || m.attachment.duration_ms != null
-        ? "[语音]"
-        : `[文件] ${m.attachment.file_name}`
-    : m.kind === "chat_record"
-      ? recordLabel(m, RECORD_TITLE_MAX)
-      : m.kind === "system"
-        ? systemBarText(m.content)
-        : kindLabel(m.kind) || m.content.slice(0, 80);
-  return `${o.mentioned ? "[有人@我] " : ""}${m.sender_name}: ${excerpt}`;
+  return `${o.mentioned ? "[有人@我] " : ""}${messageLine(m)}`;
 }
 
 /**

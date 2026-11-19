@@ -19,7 +19,7 @@ describe("systemMessage", () => {
     });
   });
 
-  it("maps six codes to centered-bar Chinese copy", () => {
+  it("maps seven codes to centered-bar Chinese copy", () => {
     expect(
       systemBarText(JSON.stringify({ code: "group_created", actor_name: "A", group_name: "周末" })),
     ).toBe("A 创建了群聊");
@@ -37,6 +37,9 @@ describe("systemMessage", () => {
     expect(systemBarText(JSON.stringify({ code: "group_left", actor_name: "B" }))).toBe(
       "B 退出了群聊",
     );
+    expect(
+      systemBarText(JSON.stringify({ code: "group_removed", actor_name: "A", target_name: "B" })),
+    ).toBe("A 将 B 移出了群聊");
     expect(systemBarText(JSON.stringify({ code: "group_dissolved", actor_name: "A" }))).toBe(
       "A 解散了群聊",
     );

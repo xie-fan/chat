@@ -10,8 +10,7 @@ import {
   session,
   wsBase,
 } from "./api";
-import { notifyIncoming } from "./notify";
-import { RECORD_TITLE_MAX, recordLabel } from "./ui/chat/chatRecord";
+import { messageLine, notifyIncoming } from "./notify";
 import { clearReuseOnAck, failReuseSend } from "./drafts";
 import { kickReasonKey } from "./servers";
 import {
@@ -607,22 +606,11 @@ function onMessage(m: MessageView) {
     || s.conversations.some((c) => c.last_message?.id === m.id);
   if (!existed && shouldNotify(cur, m)) {
     const c = cur.conversations.find((x) => x.id === m.conversation_id);
-    const excerpt = m.attachment
-      ? m.kind === "image"
-        ? "[图片]"
-        : m.kind === "audio" || m.attachment.duration_ms != null
-          ? "[语音]"
-          : `[文件] ${m.attachment.file_name}`
-      : m.kind === "chat_record"
-        ? recordLabel(m, RECORD_TITLE_MAX)
-        : m.kind === "meeting"
-          ? "[视频会议]"
-          : m.content.slice(0, 80);
     const tag = cur.me && m.mentions.includes(cur.me.id) ? "[有人@我] " : "";
     pushToast({
       convId: m.conversation_id,
       title: c ? convTitle(c) : "新消息",
-      text: `${tag}${m.sender_name}: ${excerpt}`,
+      text: `${tag}${messageLine(m)}`,
     });
   }
   // P1-1 系统通知：窗口不在前台时弹出（与 toast 共用 !existed 去重；开关/权限/静音在内部判定）

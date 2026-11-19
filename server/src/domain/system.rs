@@ -19,6 +19,7 @@ pub const CODE_RENAMED: &str = "group_renamed";
 pub const CODE_ANNOUNCEMENT: &str = "group_announcement";
 pub const CODE_INVITED: &str = "group_invited";
 pub const CODE_LEFT: &str = "group_left";
+pub const CODE_REMOVED: &str = "group_removed";
 pub const CODE_DISSOLVED: &str = "group_dissolved";
 
 /// 组装 content JSON；`text` 必填作兜底。
@@ -43,6 +44,12 @@ pub fn params_actor_group(actor_name: &str, group_name: &str) -> Map<String, Val
 pub fn params_invite(actor_name: &str, invitee_names: &[String]) -> Map<String, Value> {
     let mut m = params_actor(actor_name);
     m.insert("invitee_names".into(), json!(invitee_names));
+    m
+}
+
+pub fn params_remove(actor_name: &str, target_name: &str) -> Map<String, Value> {
+    let mut m = params_actor(actor_name);
+    m.insert("target_name".into(), json!(target_name));
     m
 }
 
