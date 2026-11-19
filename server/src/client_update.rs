@@ -207,9 +207,14 @@ const LATEST_RETRY_DELAY: Duration = Duration::from_secs(15);
 
 pub(crate) struct CachedLatest {
     source: UpdateRepo,
-    release: Release,
-    fetched: Instant,
+    value: CachedRelease,
     retry_at: Instant,
+}
+
+enum CachedRelease {
+    Available { release: Release, fetched: Instant },
+    Missing,
+    Unavailable(String),
 }
 
 /// GET /client/latest：公共端点。功能关闭 / 还没有 Release → 404
@@ -230,41 +235,62 @@ pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLates
     }))
 }
 
-async fn cached_latest(
-    cache: &mut Option<CachedLatest>,
-    repo: UpdateRepo,
-) -> AppResult<Release> {
+async fn cached_latest(cache: &mut Option<CachedLatest>, repo: UpdateRepo) -> AppResult<Release> {
     if cache.as_ref().is_some_and(|entry| entry.source != repo) {
         *cache = None;
     }
     if let Some(entry) = cache.as_ref() {
-        if Instant::now() < entry.retry_at && entry.fetched.elapsed() < LATEST_MAX_AGE {
-            return Ok(entry.release.clone());
+        if Instant::now() < entry.retry_at {
+            match &entry.value {
+                CachedRelease::Available { release, fetched }
+                    if fetched.elapsed() < LATEST_MAX_AGE =>
+                {
+                    return Ok(release.clone());
+                }
+                CachedRelease::Missing => return Err(AppError::not_found("no_release")),
+                CachedRelease::Unavailable(message) => {
+                    return Err(AppError::bad_gateway(message.clone()));
+                }
+                CachedRelease::Available { .. } => {}
+            }
         }
     }
-    let release = match fetch_release(&repo).await {
-        Ok(release) => release,
-        Err(e) => {
-            if matches!(e, AppError::BadGateway(_)) {
-                if let Some(entry) = cache.as_mut() {
-                    if entry.fetched.elapsed() < LATEST_MAX_AGE {
-                        entry.retry_at = Instant::now() + LATEST_RETRY_DELAY;
-                        return Ok(entry.release.clone());
+    let result = fetch_release(&repo).await;
+    let now = Instant::now();
+    let (value, delay) = match &result {
+        Ok(release) => (
+            CachedRelease::Available {
+                release: release.clone(),
+                fetched: now,
+            },
+            LATEST_TTL,
+        ),
+        Err(AppError::BadGateway(message)) => {
+            if let Some(entry) = cache.as_mut() {
+                if let CachedRelease::Available { release, fetched } = &entry.value {
+                    if fetched.elapsed() < LATEST_MAX_AGE {
+                        entry.retry_at = now + LATEST_RETRY_DELAY;
+                        return Ok(release.clone());
                     }
                 }
             }
+            (
+                CachedRelease::Unavailable(message.clone()),
+                LATEST_RETRY_DELAY,
+            )
+        }
+        Err(AppError::NotFound(_)) => (CachedRelease::Missing, LATEST_RETRY_DELAY),
+        Err(_) => {
             *cache = None;
-            return Err(e);
+            return result;
         }
     };
-    let fetched = Instant::now();
     *cache = Some(CachedLatest {
         source: repo,
-        release: release.clone(),
-        fetched,
-        retry_at: fetched + LATEST_TTL,
+        value,
+        retry_at: now + delay,
     });
-    Ok(release)
+    result
 }
 
 /// 本服务对外地址：优先后台配置的 public_url，否则按请求的 Host 拼
@@ -371,7 +397,8 @@ pub async fn download(
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_latest, gitea_api_base, parse_repo, AppError, Instant, UpdateRepo, LATEST_MAX_AGE,
+        cached_latest, gitea_api_base, parse_repo, AppError, CachedRelease, Instant, UpdateRepo,
+        LATEST_MAX_AGE,
     };
     use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
     use std::sync::{
@@ -426,12 +453,26 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::Relaxed), 2);
 
-        cache.as_mut().unwrap().fetched = Instant::now() - LATEST_MAX_AGE;
+        let CachedRelease::Available { fetched, .. } = &mut cache.as_mut().unwrap().value else {
+            panic!("expected cached release");
+        };
+        *fetched = Instant::now() - LATEST_MAX_AGE;
         assert!(matches!(
             cached_latest(&mut cache, repo()).await,
             Err(AppError::BadGateway(_))
         ));
         assert_eq!(requests.load(Ordering::Relaxed), 3);
+
+        let cache = tokio::sync::Mutex::new(None);
+        let check = || async {
+            let mut entry = cache.lock().await;
+            cached_latest(&mut entry, repo()).await
+        };
+        let (a, b, c) = tokio::join!(check(), check(), check());
+        for result in [a, b, c] {
+            assert!(matches!(result, Err(AppError::BadGateway(_))));
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
 
     #[test]
