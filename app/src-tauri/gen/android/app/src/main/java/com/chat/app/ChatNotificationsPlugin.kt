@@ -114,8 +114,11 @@ class ChatNotificationsPlugin(private val activity: Activity) : Plugin(activity)
             .appendPath(account).appendPath(convId).build()
           intent.putExtra("convId", convId)
           intent.putExtra("account", account)
+          intent.putExtra(NOTIFICATION_TAP_TOKEN, NotificationTapAuth.sign(activity, convId, account))
         }
-        val pending = PendingIntent.getActivity(activity, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+        val pending = PendingIntent.getActivity(
+          activity, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val notification = NotificationCompat.Builder(activity, CHANNEL)
           .setSmallIcon(R.drawable.ic_chat_notification)
           .setContentTitle(args.title)

@@ -45,7 +45,8 @@ class MainActivity : TauriActivity() {
     if (intent.action != OPEN_CHAT_NOTIFICATION) return
     val convId = intent.getStringExtra("convId") ?: return
     val account = intent.getStringExtra("account") ?: return
-    if (convId.isEmpty() || account.isEmpty()) return
+    val token = intent.getByteArrayExtra(NOTIFICATION_TAP_TOKEN) ?: return
+    if (convId.isEmpty() || account.isEmpty() || !NotificationTapAuth.verify(this, convId, account, token)) return
     val listener = notificationListener
     if (listener == null) {
       pendingNotification = NotificationOpen(convId, account)
