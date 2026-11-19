@@ -82,7 +82,13 @@ pub async fn notification_permission(
             &windows::core::HSTRING::from(windows_app_id(&app)),
         )
         .map_err(|e| e.to_string())?;
-        let setting = notifier.Setting().map_err(|e| e.to_string())?;
+        let setting = match notifier.Setting() {
+            Ok(setting) => setting,
+            Err(error) if error.code() == windows::core::HRESULT(0x80070490u32 as i32) => {
+                NotificationSetting::Enabled
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         Ok(if setting == NotificationSetting::Enabled {
             "granted"
         } else {
