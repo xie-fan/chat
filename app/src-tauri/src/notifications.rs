@@ -170,11 +170,8 @@ fn activate(app: &AppHandle, target: Option<Target>) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         #[cfg(target_os = "linux")]
-        if let Some(window) = handle.get_webview_window("main") {
-            if matches!(window.is_focused(), Ok(false)) {
-                let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
-            }
-        }
+        reveal_linux_notification(&handle);
+        #[cfg(not(target_os = "linux"))]
         crate::tray::reveal(&handle);
         if let Some(target) = target {
             if let Some(window) = handle.get_webview_window("main") {
@@ -182,6 +179,35 @@ fn activate(app: &AppHandle, target: Option<Target>) {
             }
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_linux_notification(app: &AppHandle) {
+    use gtk::prelude::*;
+
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Ok(gtk_window) = window.gtk_window() {
+        if !gtk_window.is_mapped() {
+            gtk_window.show_all();
+            gtk_window.deiconify();
+            // Tauri queues show, but Tao checks GTK visibility before queuing focus.
+            gtk::glib::idle_add_local_once(move || {
+                if gtk_window.is_mapped() {
+                    if !gtk_window.is_active() {
+                        gtk_window.set_urgency_hint(true);
+                    }
+                    gtk_window.present();
+                }
+            });
+            return;
+        }
+    }
+    if matches!(window.is_focused(), Ok(false)) {
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+    crate::tray::reveal(app);
 }
 
 #[cfg(target_os = "linux")]
