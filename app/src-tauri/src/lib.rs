@@ -98,6 +98,8 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         #[cfg(target_os = "android")]
         notifications::listen_for_android_notification_open,
+        #[cfg(target_os = "android")]
+        notifications::android_push_registration,
         notifications::notification_permission,
         notifications::show_chat_notification,
         download::download_to_downloads,

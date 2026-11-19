@@ -266,6 +266,10 @@ pub(super) async fn logout(
                 .bind(sid)
                 .execute(&mut *tx)
                 .await?;
+                sqlx::query("DELETE FROM android_fcm_devices WHERE session_id = $1")
+                    .bind(sid)
+                    .execute(&mut *tx)
+                    .await?;
                 sqlx::query(
                     "UPDATE refresh_tokens SET revoked_at = now()
                      WHERE session_id = $1 AND revoked_at IS NULL",

@@ -356,9 +356,14 @@ jobs:
           echo "Fixed Debug Keystore 证书 SHA-256：$ks_fp（可钉成 vars.EXPECTED_ANDROID_DEBUG_CERT_SHA256）"
       - name: Android APK
         working-directory: app
+        env:
+          CHAT_ANDROID_GOOGLE_SERVICES_JSON: ${{ secrets.CHAT_ANDROID_GOOGLE_SERVICES_JSON }}
         # runner 预装 NDK：ANDROID_NDK_LATEST_HOME → NDK_HOME；SDK 在 ANDROID_HOME
         run: |
           export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          if [ -n "$CHAT_ANDROID_GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$CHAT_ANDROID_GOOGLE_SERVICES_JSON" > src-tauri/gen/android/app/google-services.json
+          fi
           pnpm tauri android build --apk --debug --target aarch64
       - name: 校验 APK 签名指纹（与写入的 keystore 一致才上传）
         env:

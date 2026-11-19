@@ -5,4 +5,5 @@ server/target
 .git
 .devin
 data/
+secrets/
 app/src-tauri/target

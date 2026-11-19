@@ -6,6 +6,9 @@ plugins {
     id("rust")
 }
 
+val firebaseEnabled = file("google-services.json").isFile
+if (firebaseEnabled) apply(plugin = "com.google.gms.google-services")
+
 val tauriProperties = Properties().apply {
     val propFile = file("tauri.properties")
     if (propFile.exists()) {
@@ -48,6 +51,13 @@ android {
     kotlinOptions {
         jvmTarget = "1.8"
     }
+    sourceSets.getByName("main").java.srcDir(
+        if (firebaseEnabled) "src/firebase/java" else "src/noFirebase/java"
+    )
+    if (firebaseEnabled) {
+        sourceSets.getByName("debug").manifest.srcFile("src/firebase/AndroidManifest.xml")
+        sourceSets.getByName("release").manifest.srcFile("src/firebase/AndroidManifest.xml")
+    }
     buildFeatures {
         buildConfig = true
     }
@@ -63,6 +73,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    if (firebaseEnabled) {
+        implementation("com.google.firebase:firebase-messaging:25.0.1")
+        implementation("androidx.work:work-runtime:2.10.1")
+    }
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")

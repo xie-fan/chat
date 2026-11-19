@@ -80,6 +80,11 @@ pub fn router(cfg: &crate::config::Config, st: &SharedState) -> Router<SharedSta
         )
         .route("/users/me/push/devices", post(crate::push::add_device))
         .route(
+            "/users/me/push/android",
+            put(crate::fcm::register),
+        )
+        .route("/push/android/rotate", post(crate::fcm::rotate))
+        .route(
             "/users/me/push/devices/{id}",
             delete(crate::push::delete_device),
         )

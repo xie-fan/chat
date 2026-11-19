@@ -119,6 +119,7 @@ pub async fn show_chat_notification(
     body: String,
     target: Option<Target>,
     android_account: Option<String>,
+    android_message_id: Option<String>,
 ) -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
@@ -130,6 +131,7 @@ pub async fn show_chat_notification(
                 serde_json::json!({
                     "title": title, "body": body, "convId": target.map(|t| t.conv_id),
                     "account": android_account,
+                    "messageId": android_message_id,
                 }),
             )
             .await
@@ -137,14 +139,33 @@ pub async fn show_chat_notification(
     }
     #[cfg(desktop)]
     {
-        let _ = android_account;
+        let _ = (android_account, android_message_id);
         show_desktop(app, title, body, target).await.map(|()| true)
     }
     #[cfg(all(not(desktop), not(target_os = "android")))]
     {
-        let _ = (app, title, body, target, android_account);
+        let _ = (app, title, body, target, android_account, android_message_id);
         Ok(false)
     }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn android_push_registration(
+    app: AppHandle,
+    account: Option<String>,
+    server: Option<String>,
+    enabled: bool,
+) -> Result<Option<serde_json::Value>, String> {
+    use tauri::Manager;
+    app.state::<AndroidNotifications>()
+        .0
+        .run_mobile_plugin_async(
+            "androidPushRegistration",
+            serde_json::json!({ "account": account, "server": server, "enabled": enabled }),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "android")]

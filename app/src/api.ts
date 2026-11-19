@@ -739,6 +739,7 @@ const post = <T>(p: string, body?: unknown) =>
   call<T>(p, { method: "POST", body: body == null ? "{}" : JSON.stringify(body) });
 const get = <T>(p: string) => call<T>(p);
 const del = <T>(p: string) => call<T>(p, { method: "DELETE" });
+
 const patch = <T>(p: string, body: unknown) =>
   call<T>(p, { method: "PATCH", body: JSON.stringify(body) });
 const put = <T>(p: string, body?: unknown) =>
@@ -746,6 +747,12 @@ const put = <T>(p: string, body?: unknown) =>
     method: "PUT",
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+
+export type AndroidPushRegistration = {
+  token: string; project: string; binding: string; rotationKey: string; generation: number;
+};
+export const registerAndroidPush = (registration: AndroidPushRegistration) =>
+  put<void>("/users/me/push/android", registration);
 
 // ---------- 设备名（V2 P1-5） ----------
 // 登录/注册带给服务端的 device_label：Tauri 壳固定文案，Web 端按 UA 拼「浏览器 · 系统」。

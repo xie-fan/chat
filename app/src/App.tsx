@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { auth, clearSkipAutoLogin, getServer, hasSkipAutoLogin, loadSession, serverScope } from "./api";
 import { startAcpHost, stopAcpHost } from "./acpHost";
+import { clearAndroidPush, watchAndroidPush } from "./androidPush";
 import { draftsKey, readDrafts } from "./drafts";
 import { clearReedits, purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
@@ -53,9 +54,14 @@ export default function App() {
     }
   }, [s.me?.id, bootSeq]);
 
+  useEffect(() => {
+    if (s.me) return watchAndroidPush();
+  }, [s.me?.id, bootSeq]);
+
   // 401/403 或手动登出：清敏感暂存与复用附件 chip；切账号仅切换视图态并保留多账号隔离数据
   useEffect(() => {
     const onBeforeSwitch = () => {
+      clearAndroidPush();
       flushDrafts();
     };
     const onSwitch = () => {
@@ -68,6 +74,7 @@ export default function App() {
       setBootSeq((n) => n + 1);
     };
     const onLogout = () => {
+      clearAndroidPush();
       const { me, drafts } = getState();
       const scope = serverScope();
       const clean = Object.fromEntries(

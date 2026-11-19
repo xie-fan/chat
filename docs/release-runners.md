@@ -96,6 +96,25 @@ GitHub 每个组只保留**一个**排队中的 run：一个 release run 正在�
    发版，日志会打出本次 APK 指纹供抄过去钉死。指纹是公开信息——任何人都能从已发布
    的 APK 算出来——不是 secret，可以明文写。
 
+### Android：FCM 后台私聊通知（可选）
+
+1. 在 [Firebase 控制台](https://console.firebase.google.com/) 新建或选择项目，添加包名为
+   `com.chat.app` 的 Android 应用。在同一项目启用
+   [Firebase Cloud Messaging API](https://console.cloud.google.com/apis/library/fcm.googleapis.com)。
+2. 下载 `google-services.json`。本地构建放到
+   `app/src-tauri/gen/android/app/google-services.json`；正式发版在
+   [GitHub Actions secrets](https://github.com/xie-fan/chat/settings/secrets/actions)
+   设置 `CHAT_ANDROID_GOOGLE_SERVICES_JSON`，值为原始 JSON 文本（不是 base64）。不要提交文件。
+3. 在 [Google Cloud IAM](https://console.cloud.google.com/iam-admin/serviceaccounts) 创建专用
+   服务账号，在同一 Firebase 项目授予 `roles/firebasecloudmessaging.admin` 并下载 JSON 密钥。
+   Docker Compose 部署：把密钥存为与 `docker-compose.yml` 同级的 `secrets/fcm.json`，
+   然后运行 `docker compose up -d`，无需改 `.env` 或添加覆盖文件。
+   非 Compose 部署可用 `CHAT_FCM_SERVICE_ACCOUNT_FILE` 指定服务端可读的 JSON 路径。
+   不需要旧版 FCM server key；服务账号密钥只放服务端，勿用作 APK 构建 secret。
+
+未配置时沿用 WebSocket 通知。FCM 只发私聊的会话和消息标识，不上传消息内容或发件人信息。
+Android 系统通知必须已授权，且设备需能访问 Google Play 服务；系统强行停止应用后需手动启动一次。
+
 ## 1. 发一个版本
 
 ```bash

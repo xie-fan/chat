@@ -43,6 +43,7 @@ export function setNotifyEnabled(v: boolean) {
   try {
     localStorage.setItem(LS_ENABLED, v ? "1" : "0");
   } catch {}
+  if (isAndroidShell()) window.dispatchEvent(new Event("chat:android-push-settings"));
 }
 
 /** 「通知显示消息内容」默认开 */
@@ -185,6 +186,7 @@ export async function showSystemNotification(o: {
   body: string;
   convId?: string;
   androidAccount?: string;
+  androidMessageId?: string;
   onOpen?: (convId: string) => void;
 }): Promise<boolean> {
   const kind = notifySupport();
@@ -208,6 +210,7 @@ export async function showSystemNotification(o: {
         body: o.body,
         target: o.convId ? { convId: o.convId, session: session() } : null,
         ...(o.androidAccount ? { androidAccount: o.androidAccount } : {}),
+        ...(o.androidMessageId ? { androidMessageId: o.androidMessageId } : {}),
       });
       if (shown && isDesktopShell()) {
         void import("@tauri-apps/api/window")
@@ -242,6 +245,7 @@ export async function notifyIncoming(
     body: notificationBody(m, { preview: notifyPreview(), mentioned }),
     convId: m.conversation_id,
     androidAccount: isAndroidShell() && s.me ? accountIdOf(getServer(), s.me.id) : undefined,
+    androidMessageId: isAndroidShell() ? m.id : undefined,
     onOpen,
   });
 }
