@@ -7,6 +7,9 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : TauriActivity() {
+  var chatResumed = false
+    private set
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
@@ -17,5 +20,15 @@ class MainActivity : TauriActivity() {
       v.setPadding(b.left, b.top, b.right, b.bottom)
       WindowInsetsCompat.CONSUMED
     }
+  }
+
+  override fun onResume() {
+    super.onResume()
+    chatResumed = true
+  }
+
+  override fun onPause() {
+    chatResumed = false
+    super.onPause()
   }
 }

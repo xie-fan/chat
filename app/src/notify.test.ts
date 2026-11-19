@@ -1,16 +1,26 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { session } from "./api";
 import {
+  listenForNotificationClicks,
   messageLine,
   notificationBody,
   notifyEnabled,
+  notifyIncoming,
+  notifyPermission,
   notifyPreview,
   setNotifyEnabled,
   setNotifyPreview,
+  showSystemNotification,
   shouldSystemNotify,
   unreadTitle,
+  unreadLabel,
 } from "./notify";
 import type { AppState } from "./store";
 import type { ConversationView, MessageView } from "./types";
+
+const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
 // ===== V2 P1-1 系统通知 =====
 
@@ -102,6 +112,8 @@ function state(patch: Partial<AppState> = {}): AppState {
 const BG = { foreground: false, enabled: true };
 
 beforeEach(() => {
+  invoke.mockReset();
+  listen.mockReset();
   const storage = new Map<string, string>();
   vi.stubGlobal("localStorage", {
     getItem: (k: string) => storage.get(k) ?? null,
@@ -109,6 +121,8 @@ beforeEach(() => {
     removeItem: (k: string) => storage.delete(k),
   });
 });
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("shouldSystemNotify", () => {
   it("窗口在前台不弹", () => {
@@ -161,6 +175,11 @@ describe("unreadTitle", () => {
 
   it("总数 > 99 显示 99+", () => {
     expect(unreadTitle([conv({ unread_count: 150 })])).toBe("(99+) Chat");
+  });
+
+  it("Dock badge uses the same count and clears when read", () => {
+    expect(unreadLabel([conv({ unread_count: 150 })])).toBe("99+");
+    expect(unreadLabel([conv({ unread_count: 0 })])).toBeNull();
   });
 });
 
@@ -229,6 +248,14 @@ describe("本机通知设置", () => {
     expect(notifyPreview()).toBe(true);
   });
 
+  it("defaults on in the native app and remembers an explicit opt-out", () => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    expect(notifyEnabled()).toBe(true);
+    setNotifyEnabled(false);
+    expect(localStorage.getItem("chat_notify_enabled")).toBe("0");
+    expect(notifyEnabled()).toBe(false);
+  });
+
   it("localStorage 异常时读写不抛、回落默认值", () => {
     vi.stubGlobal("localStorage", {
       getItem: () => {
@@ -245,7 +272,6 @@ describe("本机通知设置", () => {
     expect(notifyPreview()).toBe(true);
   });
 });
-
 describe("messageLine", () => {
   it("renders group system JSON as copy without sender prefix", () => {
     const content = JSON.stringify({ code: "group_invited", actor_name: "A", invitee_names: ["B"] });
@@ -256,5 +282,53 @@ describe("messageLine", () => {
         mentioned: false,
       }),
     ).toBe("A 创建了群聊");
+  });
+});
+
+describe("native notifications", () => {
+  beforeEach(() => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+  });
+
+  it("queries current OS permission rather than the WebView's cached permission", async () => {
+    invoke.mockResolvedValueOnce("denied").mockResolvedValueOnce("granted");
+    await expect(notifyPermission()).resolves.toBe("denied");
+    await expect(notifyPermission()).resolves.toBe("granted");
+    expect(invoke).toHaveBeenCalledWith("notification_permission", undefined);
+  });
+
+  it("asks Android to use the activity's foreground state, not document focus", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Android" });
+    vi.stubGlobal("document", { hidden: false, hasFocus: () => true });
+    invoke.mockResolvedValue(true);
+    await notifyIncoming(state(), msg());
+    expect(invoke).toHaveBeenCalledWith("show_chat_notification", {
+      title: "C",
+      body: "Other: hello",
+      target: { convId: "c", session: session() },
+    });
+  });
+
+  it("test notifications carry no conversation target and report send failures", async () => {
+    invoke.mockRejectedValueOnce(new Error("notification unavailable"));
+    await expect(showSystemNotification({ title: "Chat", body: "Test" })).resolves.toBe(false);
+    expect(invoke).toHaveBeenCalledWith("show_chat_notification", {
+      title: "Chat",
+      body: "Test",
+      target: null,
+    });
+  });
+
+  it("opens the clicked conversation only in the original login session", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const open = vi.fn();
+    const stop = vi.fn();
+    listen.mockResolvedValue(stop);
+    await expect(listenForNotificationClicks(open)).resolves.toBe(stop);
+    const [event, clicked] = listen.mock.calls[0];
+    expect(event).toBe("chat-notification-open");
+    clicked({ payload: { convId: "old", session: session() + 1 } });
+    clicked({ payload: { convId: "c", session: session() } });
+    expect(open).toHaveBeenCalledExactlyOnceWith("c");
   });
 });

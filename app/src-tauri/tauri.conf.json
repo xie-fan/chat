@@ -25,7 +25,10 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
-    "shortDescription": "LAN-first chat"
+    "shortDescription": "LAN-first chat",
+    "macOS": {
+      "signingIdentity": "-"
+    }
   },
   "plugins": {
     "updater": {

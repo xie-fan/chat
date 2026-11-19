@@ -12,6 +12,13 @@ import {
 } from "../../notify";
 import SetRow from "./SetRow";
 
+const PERMISSION_LABEL: Record<NotifyPermission, string> = {
+  granted: "已允许",
+  denied: "已拒绝，请在浏览器 / 系统设置中允许通知",
+  default: "未请求",
+  unavailable: "无法读取",
+};
+
 /** ===== V2 P1-1 ===== 「我」页通知设置卡片（桌面通知开关 / 预览开关 / 测试通知） */
 export default function NotifySettings() {
   const support = notifySupport();
@@ -23,9 +30,18 @@ export default function NotifySettings() {
 
   useEffect(() => {
     if (support === "none") return;
-    void notifyPermission()
-      .then(setPerm)
-      .catch(() => {});
+    let active = true;
+    const refresh = () => void notifyPermission().then((p) => {
+      if (active) setPerm(p);
+    });
+    refresh();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, [support]);
 
   const toggleEnabled = async () => {
@@ -42,15 +58,9 @@ export default function NotifySettings() {
       const ok = await requestNotifyPermission();
       const p = await notifyPermission();
       setPerm(p);
-      setEnabled(ok);
-      setNotifyEnabled(ok);
-      setHint(
-        ok
-          ? ""
-          : p === "denied"
-            ? "通知权限被拒绝，请在浏览器 / 系统设置里允许本站通知"
-            : "未获得通知权限",
-      );
+      setEnabled(true);
+      setNotifyEnabled(true);
+      setHint(ok ? "" : "未获得通知权限");
     } finally {
       setBusy(false);
     }
@@ -62,12 +72,18 @@ export default function NotifySettings() {
   };
 
   const sendTest = async () => {
-    await showSystemNotification({
-      title: "Chat",
-      body: notifyPreview() ? "这是一条测试通知" : "你收到一条新消息",
-      convId: "test",
-    });
-    setHint("已发送（窗口在前台时部分系统不弹出，可切走再试）");
+    setBusy(true);
+    try {
+      const ok = await requestNotifyPermission();
+      setPerm(await notifyPermission());
+      const shown = ok && await showSystemNotification({
+        title: "Chat",
+        body: "这是一条测试通知",
+      });
+      setHint(shown ? "已发送，请查看系统通知中心" : "未能发送测试通知");
+    } finally {
+      setBusy(false);
+    }
   };
 
   if (support === "none") return <SetRow label="桌面通知" desc="当前环境不支持系统通知" />;
@@ -76,7 +92,7 @@ export default function NotifySettings() {
     <>
       <SetRow
         label="桌面通知"
-        desc={!enabled && hint ? hint : "窗口不在前台时弹出系统通知"}
+        desc="窗口不在前台时弹出系统通知"
         toggle={{
           checked: enabled,
           disabled: busy,
@@ -84,19 +100,14 @@ export default function NotifySettings() {
         }}
       />
       <SetRow label="通知显示消息内容" toggle={{ checked: preview, onChange: togglePreview }} />
-      {enabled && (
-        <SetRow
-          label="测试通知"
-          desc={
-            hint ||
-            `权限：${perm === "granted" ? "已允许" : perm === "denied" ? "已拒绝" : "未请求"}`
-          }
-        >
-          <button disabled={perm !== "granted"} onClick={() => void sendTest()}>
-            发送
-          </button>
-        </SetRow>
-      )}
+      <SetRow
+        label="测试通知"
+        desc={`权限：${PERMISSION_LABEL[perm]}${hint ? ` · ${hint}` : ""}`}
+      >
+        <button disabled={busy} onClick={() => void sendTest()}>
+          发送
+        </button>
+      </SetRow>
     </>
   );
 }

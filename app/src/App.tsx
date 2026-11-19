@@ -4,9 +4,9 @@ import { startAcpHost, stopAcpHost } from "./acpHost";
 import { draftsKey, readDrafts } from "./drafts";
 import { clearReedits, purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
-import { syncWindowTitle, unreadTitle } from "./notify";
+import { listenForNotificationClicks, syncWindowTitle } from "./notify";
 import { flushDrafts, getState, resetSessionState, setState, useApp } from "./store";
-import { startWs, stopWs } from "./ws";
+import { openConversation, startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
 import ChatScreen from "./ui/ChatScreen";
 import { DialogHost, dismissAllDialogs } from "./ui/Modal";
@@ -22,8 +22,23 @@ export default function App() {
 
   // 未读消息数同步窗口标题
   useEffect(() => {
-    syncWindowTitle(unreadTitle(s.conversations));
+    syncWindowTitle(s.conversations);
   }, [s.conversations]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForNotificationClicks((id) => {
+      if (!disposed && getState().me) openConversation(id);
+    }).then((stop) => {
+      if (disposed) stop?.();
+      else unlisten = stop;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // 桌面壳登录/切换账号后自动接入本地 ACP 宿主；退出时关闭
   useEffect(() => {

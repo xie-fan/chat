@@ -128,7 +128,7 @@ pnpm tauri build --bundles app
 
 - 打出来的包只适配编译它的那台 Mac 的芯片（Apple 芯片或 Intel）。
 - 加上 `dmg`（`--bundles app,dmg`）会多打一个 DMG。这一步要用 AppleScript 控制 Finder，可能失败；失败时 `Chat.app` 已经生成，直接拖即可。
-- 包没有签名。拷到别的 Mac 上，第一次打开如果提示「已损坏」或「无法验证开发者」，执行 `xattr -cr /Applications/Chat.app` 后再打开。
+- 默认使用 ad-hoc 签名，让 macOS 可以识别 Chat 的通知权限；没有 Developer ID 签名或公证。拷到别的 Mac 上，第一次打开如果提示「已损坏」或「无法验证开发者」，执行 `xattr -cr /Applications/Chat.app` 后再打开。
 - 同时适配两种芯片的通用包（未实测）：先 `rustup target add aarch64-apple-darwin x86_64-apple-darwin`，再 `pnpm tauri build --bundles app --target universal-apple-darwin`，产物在 `src-tauri/target/universal-apple-darwin/release/bundle/macos/Chat.app`。
 
 ### Linux（未实测）

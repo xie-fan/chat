@@ -9,6 +9,7 @@ mod updater;
 mod download;
 // AS2：Android 应用内 APK 安装（缓存 + FileProvider + 系统安装器，与附件下载分离）
 mod apk_installer;
+mod notifications;
 
 #[cfg(desktop)]
 pub fn maybe_run_cli() -> bool {
@@ -18,10 +19,11 @@ pub fn maybe_run_cli() -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(download::init())
         .plugin(apk_installer::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(notifications::init());
     #[cfg(desktop)]
     let builder = builder
         .manage(acp_host::AcpHostState::new())
@@ -34,6 +36,8 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .invoke_handler(tauri::generate_handler![
+            notifications::notification_permission,
+            notifications::show_chat_notification,
             download::download_to_downloads,
             updater::install_update,
             acp_host::acp_host_start,
@@ -50,6 +54,8 @@ pub fn run() {
         .on_window_event(tray::on_window_event);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
+        notifications::notification_permission,
+        notifications::show_chat_notification,
         download::download_to_downloads,
         apk_installer::download_update_apk,
         apk_installer::apk_download_progress,
