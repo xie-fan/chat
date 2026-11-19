@@ -50,6 +50,30 @@ it("leaves native file selection enabled for a file input", () => {
   }
 });
 
+it("cancels URI-only drags on Linux Tauri but not in a web browser", () => {
+  vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15" });
+  const uninstall = installFileDropGuard(window);
+  const data = new DataTransfer();
+  data.setData("text/uri-list", "");
+  const input = document.createElement("input");
+  input.type = "file";
+  document.body.appendChild(input);
+  try {
+    for (const type of ["dragover", "drop"]) {
+      expect(document.body.dispatchEvent(dragEvent(type, data))).toBe(true);
+    }
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    for (const type of ["dragover", "drop"]) {
+      expect(document.body.dispatchEvent(dragEvent(type, data))).toBe(false);
+      expect(input.dispatchEvent(dragEvent(type, data))).toBe(true);
+    }
+  } finally {
+    uninstall();
+    input.remove();
+    vi.unstubAllGlobals();
+  }
+});
+
 it("stages files from the chat header and composer without sending them", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL) =>
@@ -87,6 +111,32 @@ it("stages files from the chat header and composer without sending them", async 
     });
     expect(Array.from(host.querySelectorAll(".pending-files .pf-name"), (el) => el.textContent))
       .toEqual(names);
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15" });
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const nativeInput = host.querySelector<HTMLInputElement>(".chat-drop-input")!;
+    const uriDrag = new DataTransfer();
+    Object.defineProperty(uriDrag, "types", { value: ["text/uri-list", "text/html"] });
+    const body = host.querySelector(".msg-scroll")!;
+    expect(nativeInput.hidden).toBe(true);
+    body.dispatchEvent(dragEvent("dragenter", uriDrag));
+    expect(nativeInput.hidden).toBe(false);
+    body.dispatchEvent(dragEvent("dragleave", uriDrag));
+    expect(nativeInput.hidden).toBe(true);
+    body.dispatchEvent(dragEvent("dragenter", uriDrag));
+    nativeInput.dispatchEvent(dragEvent("dragenter", uriDrag));
+    body.dispatchEvent(dragEvent("dragleave", uriDrag));
+    expect(nativeInput.hidden).toBe(false);
+    nativeInput.dispatchEvent(dragEvent("dragleave", uriDrag));
+    expect(nativeInput.hidden).toBe(true);
+    body.dispatchEvent(dragEvent("dragenter", uriDrag));
+    expect(nativeInput.dispatchEvent(dragEvent("drop", uriDrag))).toBe(true);
+    const nativeFiles = new DataTransfer();
+    nativeFiles.items.add(new File(["hi"], "dolphin.txt"));
+    Object.defineProperty(nativeInput, "files", { value: nativeFiles.files });
+    act(() => nativeInput.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(nativeInput.hidden).toBe(true);
+    expect(Array.from(host.querySelectorAll(".pending-files .pf-name"), (el) => el.textContent))
+      .toEqual([...names, "dolphin.txt"]);
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith("/v1/files"))).toBe(false);
   } finally {
     act(() => root.unmount());

@@ -20,7 +20,7 @@ import {
 import { copyPlainText } from "../../clipboard";
 import { saveAttachment } from "../../download";
 import { unsentText, type DraftReuse } from "../../drafts";
-import { isManagedFileDrag } from "../../fileDrop";
+import { isManagedFileDrag, isWebKitFileDrag } from "../../fileDrop";
 import {
   REEDIT_WINDOW_MS,
   patchReedit,
@@ -249,6 +249,8 @@ export default function ChatView() {
   const stickBottom = useRef(true);
   const lastTypingSent = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
+  const dropInput = useRef<HTMLInputElement>(null);
+  const dropTarget = useRef<EventTarget | null>(null);
   const imgInput = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const [showEmoji, setShowEmoji] = useState(false);
@@ -1532,18 +1534,36 @@ export default function ChatView() {
     }
   };
 
+  const fileDropBlocked = readonly || msMode || s.editingMessage;
+  const activateDropInput = (e: React.DragEvent) => {
+    const input = dropInput.current;
+    if (!input) return;
+    if (!fileDropBlocked && isManagedFileDrag(e) && isWebKitFileDrag(e.dataTransfer)) {
+      input.hidden = false;
+    }
+    if (!input.hidden) dropTarget.current = e.target;
+  };
+
   return (
     <main
       className="chat-view"
+      onDragEnterCapture={activateDropInput}
+      onDragLeaveCapture={(e) => {
+        if (e.target === dropTarget.current && dropInput.current) {
+          dropInput.current.hidden = true;
+          dropTarget.current = null;
+        }
+      }}
       onDragOverCapture={(e) => {
         if (!isManagedFileDrag(e)) return;
+        activateDropInput(e);
         e.preventDefault();
-        e.dataTransfer.dropEffect = readonly || msMode || s.editingMessage ? "none" : "copy";
+        e.dataTransfer.dropEffect = fileDropBlocked ? "none" : "copy";
       }}
       onDropCapture={(e) => {
         if (!e.dataTransfer.files.length || !isManagedFileDrag(e)) return;
         e.preventDefault();
-        if (!readonly && !msMode && !s.editingMessage) addPending(e.dataTransfer.files);
+        if (!fileDropBlocked) addPending(e.dataTransfer.files);
       }}
       // 全视图捕获 pointerType：lastPointer 供 contextmenu 来源判定与
       // openPreview 的幽灵点击豁免（触屏打开才豁免）使用，不限于气泡区域
@@ -1551,6 +1571,25 @@ export default function ChatView() {
         lastPointer.current = { type: e.pointerType ?? "", ts: Date.now() };
       }}
     >
+      {/* WebKitGTK masks paths in URI drags, but a file input can still accept the OS files. */}
+      <input
+        ref={dropInput}
+        className="chat-drop-input"
+        type="file"
+        multiple
+        hidden
+        tabIndex={-1}
+        aria-hidden="true"
+        onDrop={(e) => {
+          const input = e.currentTarget;
+          dropTarget.current = null;
+          setTimeout(() => { input.hidden = true; }, 0);
+        }}
+        onChange={(e) => {
+          e.currentTarget.hidden = true;
+          if (!fileDropBlocked) onFile(e);
+        }}
+      />
       <header className="chat-head">
         <button className="chat-back" aria-label="返回" onClick={() => setState({ activeConv: null })}>
           ‹

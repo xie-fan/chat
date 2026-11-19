@@ -187,6 +187,16 @@ describe("Android UpdateSetting → In-app APK Installer", () => {
 });
 
 describe("非 Android 平台不变", () => {
+  it("显示实际发布版本，不把本地测试版本当成最新发布版本", async () => {
+    vi.mocked(fetch).mockImplementation(async () => Response.json({ ...LATEST, version: "0.6.9" }));
+    await renderOn(UA.linux);
+    expect(host.textContent).toContain("当前版本 0.7.0 · 最新版本 0.6.9");
+    click(btn("检查更新"));
+    await flush();
+    expect(host.textContent).toContain("当前版本高于最新发布版本");
+    expect(host.textContent).not.toContain("已是最新版本");
+  });
+
   it("Linux 没有更新时仍可检查，并可发现后来发布的安装包", async () => {
     const appImage = "Chat_0.7.1_amd64.AppImage";
     vi.mocked(fetch).mockResolvedValueOnce({

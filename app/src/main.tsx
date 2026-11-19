@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import { watchIdentity } from "./api";
+import { isDesktopShell, osOfUa, watchIdentity } from "./api";
 import { installFileDropGuard } from "./fileDrop";
 import { flushDrafts } from "./store";
 import { applyAccent, applyTheme, readAccentChoice, readThemeChoice } from "./theme";
@@ -32,3 +32,11 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>,
 );
+
+if (isDesktopShell() && osOfUa(navigator.userAgent) === "macOS") {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      void import("@tauri-apps/api/core").then(({ invoke }) => invoke("show_startup_window")).catch(() => {});
+    });
+  });
+}

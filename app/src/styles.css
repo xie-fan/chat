@@ -389,6 +389,9 @@ button.ctx-item:hover { background: var(--bg); }
 /* ---------- 聊天窗 ---------- */
 .chat-view { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 .chat-view.empty { display: grid; place-items: center; }
+.chat-drop-input {
+  position: absolute; inset: 0; width: 100%; height: 100%; z-index: 31; opacity: 0;
+}
 .chat-head {
   height: 56px; background: var(--panel); border-bottom: 1px solid var(--line);
   display: flex; align-items: center; justify-content: space-between; padding: 0 16px;

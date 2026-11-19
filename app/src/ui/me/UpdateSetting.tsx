@@ -224,11 +224,10 @@ function ShellUpdate() {
       desc={
         <>
           当前版本 {current}
-          {/* 安装包还没传完的版本不算「有」 */}
-          {latest && ` · 最新版本 ${hasNew ? latest.version : current}`}
+          {latest && ` · 最新版本 ${latest.version}`}
           {hasNew && notes && <div style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
           {checked && !hasNew && (
-            <div>{!latest ? "暂时无法获取更新信息" : newer ? "这个平台暂时没有可用的安装包" : "已是最新版本"}</div>
+            <div>{!latest ? "暂时无法获取更新信息" : newer ? "这个平台暂时没有可用的安装包" : isNewer(current, latest.version) ? "当前版本高于最新发布版本" : "已是最新版本"}</div>
           )}
           {android && flow.phase === "downloading" && (
             <div>

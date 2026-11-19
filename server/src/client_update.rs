@@ -21,7 +21,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// update_repo_url / CLIENT_UPDATE_REPO 都为空时的默认仓库
 const DEFAULT_REPO: &str = "xie-fan/chat";
@@ -57,6 +57,7 @@ fn gitea_api_base(repo_url: &str) -> Option<String> {
 }
 
 /// 更新源：GitHub Releases 或 Gitea（api 为 .../api/v1/repos/o/r）
+#[derive(PartialEq, Eq)]
 pub enum UpdateRepo {
     GitHub { owner: String, repo: String },
     Gitea { api: String },
@@ -140,7 +141,11 @@ struct ReleaseAsset {
 async fn latest_release(st: &SharedState) -> AppResult<Release> {
     let s = settings::load(&st.pool).await?;
     let repo = resolve_repo(&s.update_repo_url).ok_or_else(|| AppError::not_found("update_off"))?;
-    let req = match &repo {
+    fetch_release(&repo).await
+}
+
+async fn fetch_release(repo: &UpdateRepo) -> AppResult<Release> {
+    let req = match repo {
         UpdateRepo::GitHub { owner, repo } => {
             let r = update_client()
                 .get(format!(
@@ -177,13 +182,13 @@ fn version_of(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AssetView {
     pub name: String,
     pub size: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ClientLatest {
     pub version: String,
     pub notes: String,
@@ -192,10 +197,56 @@ pub struct ClientLatest {
     pub assets: Vec<AssetView>,
 }
 
+const LATEST_TTL: Duration = Duration::from_secs(60);
+const LATEST_MAX_AGE: Duration = Duration::from_secs(600);
+const LATEST_RETRY_DELAY: Duration = Duration::from_secs(15);
+
+pub(crate) struct CachedLatest {
+    source: UpdateRepo,
+    release: ClientLatest,
+    fetched: Instant,
+    retry_at: Instant,
+}
+
 /// GET /client/latest：公共端点。功能关闭 / 还没有 Release → 404
 pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLatest>> {
-    let r = latest_release(&st).await?;
-    Ok(Json(ClientLatest {
+    let s = settings::load(&st.pool).await?;
+    let mut cache = st.client_latest.lock().await;
+    let Some(repo) = resolve_repo(&s.update_repo_url) else {
+        *cache = None;
+        return Err(AppError::not_found("update_off"));
+    };
+    cached_latest(&mut cache, repo).await.map(Json)
+}
+
+async fn cached_latest(
+    cache: &mut Option<CachedLatest>,
+    repo: UpdateRepo,
+) -> AppResult<ClientLatest> {
+    if cache.as_ref().is_some_and(|entry| entry.source != repo) {
+        *cache = None;
+    }
+    if let Some(entry) = cache.as_ref() {
+        if Instant::now() < entry.retry_at && entry.fetched.elapsed() < LATEST_MAX_AGE {
+            return Ok(entry.release.clone());
+        }
+    }
+    let r = match fetch_release(&repo).await {
+        Ok(release) => release,
+        Err(e) => {
+            if matches!(e, AppError::BadGateway(_)) {
+                if let Some(entry) = cache.as_mut() {
+                    if entry.fetched.elapsed() < LATEST_MAX_AGE {
+                        entry.retry_at = Instant::now() + LATEST_RETRY_DELAY;
+                        return Ok(entry.release.clone());
+                    }
+                }
+            }
+            *cache = None;
+            return Err(e);
+        }
+    };
+    let release = ClientLatest {
         version: version_of(&r.tag_name).to_string(),
         notes: r.body,
         published_at: r.published_at,
@@ -207,7 +258,15 @@ pub async fn latest(State(st): State<SharedState>) -> AppResult<Json<ClientLates
                 size: a.size,
             })
             .collect(),
-    }))
+    };
+    let fetched = Instant::now();
+    *cache = Some(CachedLatest {
+        source: repo,
+        release: release.clone(),
+        fetched,
+        retry_at: fetched + LATEST_TTL,
+    });
+    Ok(release)
 }
 
 /// 本服务对外地址：优先后台配置的 public_url，否则按请求的 Host 拼
@@ -313,7 +372,69 @@ pub async fn download(
 
 #[cfg(test)]
 mod tests {
-    use super::{gitea_api_base, parse_repo, UpdateRepo};
+    use super::{
+        cached_latest, gitea_api_base, parse_repo, AppError, Instant, UpdateRepo, LATEST_MAX_AGE,
+    };
+    use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn latest_metadata_uses_fresh_cache_and_falls_back_to_recent_release() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let upstream = Router::new().route(
+            "/releases/latest",
+            get({
+                let requests = requests.clone();
+                move || {
+                    let call = requests.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        if call == 0 {
+                            Json(serde_json::json!({"tag_name": "v0.8.3"})).into_response()
+                        } else {
+                            StatusCode::FORBIDDEN.into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let repo = || UpdateRepo::Gitea { api: url.clone() };
+        let mut cache = None;
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().version,
+            "0.8.3"
+        );
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().version,
+            "0.8.3"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        cache.as_mut().unwrap().retry_at = Instant::now();
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().version,
+            "0.8.3"
+        );
+        assert_eq!(
+            cached_latest(&mut cache, repo()).await.unwrap().version,
+            "0.8.3"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+
+        cache.as_mut().unwrap().fetched = Instant::now() - LATEST_MAX_AGE;
+        assert!(matches!(
+            cached_latest(&mut cache, repo()).await,
+            Err(AppError::BadGateway(_))
+        ));
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn repo_url_to_api() {

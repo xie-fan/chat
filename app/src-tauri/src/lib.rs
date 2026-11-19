@@ -5,6 +5,8 @@ mod acp_host;
 mod tray;
 #[cfg(desktop)]
 mod updater;
+#[cfg(target_os = "macos")]
+mod startup;
 // MM4：附件直存下载目录（桌面走 reqwest，Android 走 Kotlin MediaStore 插件）
 mod download;
 // AS2：Android 应用内 APK 安装（缓存 + FileProvider + 系统安装器，与附件下载分离）
@@ -56,6 +58,8 @@ pub fn run() {
             notifications::notification_ready,
             download::download_to_downloads,
             updater::install_update,
+            #[cfg(target_os = "macos")]
+            startup::show_startup_window,
             acp_host::acp_host_start,
             acp_host::acp_host_ticket,
             acp_host::acp_host_stop,
@@ -67,6 +71,8 @@ pub fn run() {
             tray::install(app.handle())?;
             #[cfg(target_os = "windows")]
             notifications::handle_windows_args(app.handle(), std::env::args().collect());
+            #[cfg(target_os = "macos")]
+            startup::schedule_fallback(app.handle());
             Ok(())
         })
         .on_window_event(tray::on_window_event);
