@@ -311,6 +311,7 @@ pub struct ServerInfo {
     pub registration_mode: String,
     /// ntfy 推送已配置（V2 P3-3）：客户端据此决定是否展示手机推送入口
     pub push_available: bool,
+    pub android_fcm_available: bool,
     /// 视频会议地址前缀；空字符串表示客户端不显示会议按钮
     pub meeting_base_url: String,
 }
@@ -321,6 +322,7 @@ pub async fn server_info(State(st): State<SharedState>) -> AppResult<Json<Server
     Ok(Json(ServerInfo {
         registration_mode: s.registration_mode,
         push_available: !s.push_ntfy_base.is_empty(),
+        android_fcm_available: crate::fcm::android_push_available(&st).await,
         meeting_base_url: s.meeting_base_url,
     }))
 }

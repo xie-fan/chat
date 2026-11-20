@@ -11,6 +11,7 @@ import {
   saveSession,
   savedAccounts,
   serverScope,
+  serverInfo,
   setServer,
   switchToAccount,
   watchIdentity,
@@ -41,6 +42,15 @@ beforeEach(() => {
   saveSession(login("old"));
 });
 afterEach(() => { clearSession(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe("server-info native FCM availability", () => {
+  it.each([true, false, undefined, "true"])("parses %s strictly", async (available) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      registration_mode: "open", android_fcm_available: available,
+    }))));
+    expect((await serverInfo()).android_fcm_available).toBe(available === true);
+  });
+});
 
 describe("session-owned HTTP requests", () => {
   it.each([200, 204, 401])("rejects an old-session %s response without refresh or retry", async (status) => {
