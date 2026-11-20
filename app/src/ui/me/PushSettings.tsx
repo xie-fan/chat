@@ -20,7 +20,9 @@ export default function PushSettings() {
 
   useEffect(() => {
     if (android) {
-      void serverInfo().then((v) => setFcmAvailable(v.android_fcm_available === true));
+      serverInfo()
+        .then((v) => setFcmAvailable(v.android_fcm_available === true))
+        .catch(() => setFcmAvailable(false));
     }
     auth
       .push()
