@@ -60,3 +60,17 @@ it("preserves push loading errors", async () => {
   await act(async () => root.render(<PushSettings />));
   expect(host.textContent).toContain("加载失败");
 });
+
+it("does not claim FCM is active while notifications are off on this device", async () => {
+  localStorage.setItem("chat_notify_enabled", "0");
+  try {
+    await act(async () => root.render(<PushSettings />));
+    expect(host.textContent).toContain("打开「桌面通知」后生效");
+    expect(host.textContent).not.toContain("已启用");
+    localStorage.setItem("chat_notify_enabled", "1");
+    await act(async () => window.dispatchEvent(new Event("chat:android-push-settings")));
+    expect(host.textContent).toContain("系统推送（FCM）已启用");
+  } finally {
+    localStorage.removeItem("chat_notify_enabled");
+  }
+});

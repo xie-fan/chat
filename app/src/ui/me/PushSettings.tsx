@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { auth, osOfUa, serverInfo } from "../../api";
+import { notifyEnabled } from "../../notify";
 import type { PushDevice, PushState } from "../../types";
 import SetRow from "./SetRow";
 
@@ -10,6 +11,7 @@ import SetRow from "./SetRow";
 export default function PushSettings() {
   const [info, setInfo] = useState<PushState | null>(null);
   const [fcmAvailable, setFcmAvailable] = useState(false);
+  const [notifyOn, setNotifyOn] = useState(notifyEnabled);
   const android = "__TAURI_INTERNALS__" in window && osOfUa(navigator.userAgent) === "Android";
   const [err, setErr] = useState("");
   const [hint, setHint] = useState("");
@@ -28,6 +30,13 @@ export default function PushSettings() {
       .push()
       .then(setInfo)
       .catch((e) => setErr(e instanceof Error ? e.message : "加载失败"));
+  }, [android]);
+
+  useEffect(() => {
+    if (!android) return;
+    const refresh = () => setNotifyOn(notifyEnabled());
+    window.addEventListener("chat:android-push-settings", refresh);
+    return () => window.removeEventListener("chat:android-push-settings", refresh);
   }, [android]);
 
   const run = async (what: string, f: () => Promise<PushState>) => {
@@ -82,7 +91,10 @@ export default function PushSettings() {
       <SetRow label="手机推送" desc={err ? <span className="auth-err">{err}</span> : "加载中…"} />
     );
   const fcmRow = fcmAvailable ? (
-    <SetRow label="手机推送" desc="系统推送（FCM）已启用，无需额外配置" />
+    <SetRow
+      label="手机推送"
+      desc={notifyOn ? "系统推送（FCM）已启用，无需额外配置" : "系统推送（FCM）可用，打开「桌面通知」后生效"}
+    />
   ) : null;
   if (!info.available) return fcmRow ?? <SetRow label="手机推送" desc="管理员未配置推送服务" />;
 
