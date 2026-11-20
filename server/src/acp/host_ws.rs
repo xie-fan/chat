@@ -279,6 +279,7 @@ async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str
             };
             let status = match v["status"].as_str() {
                 Some("online") => "online",
+                Some("installing") => "installing",
                 Some("offline") => "offline",
                 _ => "standby",
             };

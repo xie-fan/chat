@@ -3,6 +3,7 @@ import { acp, getServer, inTauri } from "../../api";
 import { copyPlainText } from "../../clipboard";
 import { setState, useApp } from "../../store";
 import type { AcpDirListing, AcpWorkspace } from "../../types";
+import { autoInstallPackageForCmd } from "./adapterHint";
 import {
   CheckIcon,
   ChevronLeftIcon,
@@ -23,6 +24,7 @@ const PRESETS: {
   { id: "codex", label: "Codex CLI", name: "Codex CLI", cmd: "codex-acp" },
   { id: "gemini", label: "Gemini CLI", name: "Gemini CLI", cmd: "gemini --acp" },
   { id: "opencode", label: "OpenCode", name: "OpenCode", cmd: "opencode acp" },
+  { id: "pi", label: "Pi", name: "Pi", cmd: "pi --mode rpc" },
   { id: "custom", label: "自定义 ACP", name: "Custom Agent", cmd: "" },
 ];
 
@@ -605,9 +607,18 @@ export function AttachAgentModal({
                 className="mono-code"
                 value={cmd}
                 onChange={(e) => setCmd(e.target.value)}
-                placeholder="例如 claude-agent-acp 或 codex-acp"
+                placeholder="例如 claude-agent-acp、codex-acp 或 pi --mode rpc"
                 required
               />
+              {(() => {
+                const pkg = autoInstallPackageForCmd(cmd);
+                return pkg ? (
+                  <span className="muted" style={{ fontSize: 12, lineHeight: 1.5 }}>
+                    本机未检测到该命令时，接入或首次对话将自动通过 npm 安装{" "}
+                    <code className="mono-code">{pkg}</code>（需已安装 Node.js / npm）。
+                  </span>
+                ) : null;
+              })()}
             </label>
 
             <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>

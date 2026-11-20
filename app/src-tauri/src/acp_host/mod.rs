@@ -1,7 +1,9 @@
 mod acp_client;
+mod adapters;
 mod command;
 mod dirs;
 mod permission;
+mod pi_rpc_client;
 
 use acp_client::{PendingPerms, PromptStartMsg};
 use futures_util::{SinkExt, StreamExt};
@@ -594,6 +596,52 @@ async fn run_one_connection(
                                 tokio::spawn(async move {
                                     handle_rpc_call(v, tx).await;
                                 });
+                            }
+                            Some("ensure_agent") => {
+                                let agent_id = v["agent_id"].as_str().unwrap_or("").to_string();
+                                let cmd_str = v["cmd"].as_str().unwrap_or("").to_string();
+                                if !agent_id.is_empty() && !cmd_str.is_empty() {
+                                    if let Ok((prog, _)) = command::split_cmdline(&cmd_str) {
+                                        if adapters::resolve_agent_program(&prog).is_some() {
+                                            let _ = out_tx
+                                                .send(json!({
+                                                    "type": "agent_status",
+                                                    "agent_id": agent_id,
+                                                    "status": "online",
+                                                }))
+                                                .await;
+                                        } else if let Some(spec) = adapters::lookup_npm_adapter(&prog) {
+                                            let tx = out_tx.clone();
+                                            let mut stop_watch = stop_rx.clone();
+                                            tokio::spawn(async move {
+                                                let _ = tx
+                                                    .send(json!({
+                                                        "type": "agent_status",
+                                                        "agent_id": agent_id,
+                                                        "status": "installing",
+                                                    }))
+                                                    .await;
+                                                let status = match adapters::ensure_npm_adapter(
+                                                    spec,
+                                                    &host_data_dir(),
+                                                    Some(&mut stop_watch),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(_) => "online",
+                                                    Err(_) => "standby",
+                                                };
+                                                let _ = tx
+                                                    .send(json!({
+                                                        "type": "agent_status",
+                                                        "agent_id": agent_id,
+                                                        "status": status,
+                                                    }))
+                                                    .await;
+                                            });
+                                        }
+                                    }
+                                }
                             }
                             Some("prompt_start") => {
                                 let turn_id_val = v["turn_id"].clone();

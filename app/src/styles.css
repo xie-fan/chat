@@ -2132,17 +2132,96 @@ button.st-nav-item.on,
   background: var(--bg-elevated); overflow: hidden;
 }
 .acp-ws-head {
-  display: flex; align-items: center; gap: 8px; padding: 9px 11px;
+  display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 11px;
   cursor: pointer; user-select: none;
 }
 .acp-ws-head:hover { background: var(--bg-hover); }
+.acp-ws-head > svg { flex-shrink: 0; color: var(--text-secondary); }
 .acp-ws-name {
-  flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600; color: var(--text-main);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.acp-ws-cwd {
-  padding: 0 11px 6px; font-size: 11px; color: var(--text-muted);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.acp-ws-actions {
+  display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0;
+}
+.acp-ws-menu-wrap {
+  position: relative; display: inline-flex; align-items: center;
+}
+.acp-ws-action-btn {
+  width: 26px; height: 26px; padding: 0; border: none; border-radius: 7px;
+  background: transparent; color: var(--text-muted);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0; transition: background .12s, color .12s;
+}
+.acp-ws-head:hover .acp-ws-action-btn { color: var(--text-secondary); }
+.acp-ws-action-btn:hover,
+.acp-ws-action-btn:focus-visible,
+.acp-ws-action-btn[aria-expanded="true"] {
+  background: var(--bg-subtle); color: var(--text-main);
+}
+.acp-ws-action-btn.acp-ws-add-btn:hover,
+.acp-ws-action-btn.acp-ws-add-btn:focus-visible {
+  background: var(--accent-soft); color: var(--accent);
+}
+.acp-ws-popover {
+  min-width: 140px; padding: 4px; border-radius: 11px;
+  border: 1px solid var(--border-color); background: var(--bg-panel);
+  box-shadow: var(--shadow-lg); color: var(--text-main);
+}
+.acp-ws-popover:not([popover]) {
+  position: fixed; z-index: 60;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.acp-ws-popover[popover]:popover-open {
+  display: flex; flex-direction: column; gap: 2px;
+}
+@supports (position-area: block-end) {
+  .acp-ws-popover[popover] {
+    inset: auto;
+    margin-block: 4px;
+    margin-inline: 0;
+    position-area: block-end span-inline-start;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+}
+@supports not (position-area: block-end) {
+  .acp-ws-popover[popover] {
+    position: fixed;
+    inset: auto;
+    margin: 0;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .acp-ws-popover[popover] {
+    opacity: 0;
+    translate: 0 -4px;
+    transition: opacity .12s ease, translate .12s ease, display .12s, overlay .12s;
+    transition-behavior: allow-discrete;
+  }
+  .acp-ws-popover[popover]:popover-open {
+    opacity: 1;
+    translate: 0 0;
+  }
+  @starting-style {
+    .acp-ws-popover[popover]:popover-open {
+      opacity: 0;
+      translate: 0 -4px;
+    }
+  }
+}
+.acp-ws-popover-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px; border: none; border-radius: 8px;
+  background: transparent; color: var(--text-main);
+  font-size: 12.5px; font-weight: 500; text-align: left;
+  cursor: pointer; white-space: nowrap; transition: background .12s, color .12s;
+}
+.acp-ws-popover-item:hover,
+.acp-ws-popover-item:focus-visible { background: var(--bg-hover); }
+.acp-ws-popover-item.danger { color: var(--danger); }
+.acp-ws-popover-item.danger:hover,
+.acp-ws-popover-item.danger:focus-visible {
+  background: rgba(239, 68, 68, 0.10); color: var(--danger);
 }
 .acp-ws-sessions {
   border-top: 1px solid var(--border-color); padding: 6px;

@@ -1,6 +1,8 @@
+use super::adapters;
 use super::command;
 use super::dirs::expand_tilde;
 use super::permission::{self, PermissionCache};
+use super::pi_rpc_client;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,6 +26,10 @@ pub struct AttachmentPayload {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub preset: String,
     pub cmd: String,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -94,7 +100,26 @@ pub async fn run_prompt_task(
         }
     };
 
-    let mut cmd = command::prepare(&prog, &args);
+    let is_pi = pi_rpc_client::is_pi_rpc_invocation(&msg.agent.preset, &prog, &args);
+    let (launch_args, gate_token) = if is_pi {
+        match pi_rpc_client::prepare_launch_args(&args, &msg, &super::host_data_dir()) {
+            Ok(x) => x,
+            Err(err_msg) => {
+                emit_done(&sink, &msg.session_id, None, &dir, Some(err_msg)).await;
+                return;
+            }
+        }
+    } else {
+        (args, None)
+    };
+
+    let mut cmd = match prepare_agent_command(&msg, &prog, &launch_args, &sink, &cancel).await {
+        Ok(c) => c,
+        Err(err_msg) => {
+            emit_done(&sink, &msg.session_id, None, &dir, Some(err_msg)).await;
+            return;
+        }
+    };
     cmd.current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -103,6 +128,9 @@ pub async fn run_prompt_task(
     command::configure_child_group(&mut cmd);
     for (k, v) in &msg.agent.env {
         cmd.env(k, v);
+    }
+    if let Some(ref tok) = gate_token {
+        cmd.env("CHAT_PI_GATE_TOKEN", tok);
     }
 
     let mut child = match cmd.spawn() {
@@ -143,18 +171,36 @@ pub async fn run_prompt_task(
     }
 
     let upload_dir = session_upload_dir(&msg.session_id);
-    let res = drive_stdio(
-        stdout,
-        stdin,
-        &msg,
-        &dir,
-        sink.clone(),
-        pending_perms,
-        perm_cache,
-        cancel,
-    )
-    .await;
+    let res = if is_pi {
+        pi_rpc_client::drive_stdio(
+            stdout,
+            stdin,
+            &msg,
+            &dir,
+            sink.clone(),
+            pending_perms,
+            perm_cache,
+            cancel,
+            gate_token.as_deref(),
+        )
+        .await
+    } else {
+        drive_stdio(
+            stdout,
+            stdin,
+            &msg,
+            &dir,
+            sink.clone(),
+            pending_perms,
+            perm_cache,
+            cancel,
+        )
+        .await
+    };
 
+    if is_pi {
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    }
     command::kill_child_tree(&mut child).await;
     if let Some(udir) = upload_dir {
         let _ = std::fs::remove_dir_all(udir);
@@ -182,6 +228,155 @@ pub async fn run_prompt_task(
                 format!("{e} ({})", extra.chars().take(240).collect::<String>())
             };
             emit_done(&sink, &msg.session_id, None, &dir, Some(err_msg)).await;
+        }
+    }
+}
+
+pub(super) async fn ask_user_permission_via_sink(
+    sink: &mpsc::Sender<Value>,
+    pending_perms: &PendingPerms,
+    cancel: &watch::Receiver<bool>,
+    session_id: &str,
+    cwd: &Path,
+    policy: &str,
+    tool_kind: &str,
+    cmd: &str,
+    reason: &str,
+) -> String {
+    if policy == "allow_all" {
+        return "allow_once".to_string();
+    }
+    let req_id = Uuid::new_v4().to_string();
+    let (tx, mut rx) = oneshot::channel::<String>();
+    pending_perms.lock().unwrap().insert(req_id.clone(), tx);
+
+    let _ = sink
+        .send(json!({
+            "type": "session_update",
+            "session_id": session_id,
+            "kind": "permission_request",
+            "req_id": req_id,
+            "tool_kind": tool_kind,
+            "command": cmd,
+            "cwd": cwd.to_string_lossy(),
+            "reason": reason,
+        }))
+        .await;
+
+    let mut cancel_rx = cancel.clone();
+    loop {
+        if *cancel_rx.borrow() {
+            pending_perms.lock().unwrap().remove(&req_id);
+            return "reject_once".to_string();
+        }
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    pending_perms.lock().unwrap().remove(&req_id);
+                    return "reject_once".to_string();
+                }
+            }
+            res = &mut rx => {
+                pending_perms.lock().unwrap().remove(&req_id);
+                return res.unwrap_or_else(|_| "reject_once".to_string());
+            }
+        }
+    }
+}
+
+async fn emit_install_plan(sink: &mpsc::Sender<Value>, session_id: &str, run_key: &str, label: &str, state: &str) {
+    let _ = sink
+        .send(json!({
+            "type": "session_update",
+            "session_id": session_id,
+            "kind": "plan",
+            "run_key": run_key,
+            "steps": [{ "label": label, "state": state }],
+        }))
+        .await;
+}
+
+async fn emit_agent_status(sink: &mpsc::Sender<Value>, agent_id: Option<&str>, status: &str) {
+    let Some(aid) = agent_id.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let _ = sink
+        .send(json!({
+            "type": "agent_status",
+            "agent_id": aid,
+            "status": status,
+        }))
+        .await;
+}
+
+async fn prepare_agent_command(
+    msg: &PromptStartMsg,
+    prog: &str,
+    args: &[String],
+    sink: &mpsc::Sender<Value>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<tokio::process::Command, String> {
+    let path_env = command::effective_path_env();
+    let pathext = command::default_pathext_env();
+    let data_dir = super::host_data_dir();
+
+    if let Some(bin_path) = adapters::resolve_agent_program_in(&data_dir, prog, &path_env, &pathext) {
+        return Ok(command::prepare_resolved(&bin_path, args, &path_env));
+    }
+
+    let Some(spec) = adapters::lookup_npm_adapter(prog) else {
+        return Ok(command::prepare(prog, args));
+    };
+
+    let install_key = format!("install-{}", Uuid::new_v4());
+    emit_install_plan(
+        sink,
+        &msg.session_id,
+        &install_key,
+        &format!("未检测到本地 {}，正在通过 npm 自动安装 {}…", spec.bin, spec.package),
+        "active",
+    )
+    .await;
+    let _ = sink
+        .send(json!({
+            "type": "session_update",
+            "session_id": msg.session_id,
+            "kind": "rpc_log",
+            "entry": {
+                "dir": "sys",
+                "method": "adapter/install",
+                "summary": format!("npm install {}", spec.package),
+            },
+        }))
+        .await;
+    emit_agent_status(sink, msg.agent.id.as_deref(), "installing").await;
+
+    let mut install_cancel = cancel.clone();
+    match adapters::ensure_npm_adapter(spec, &data_dir, Some(&mut install_cancel)).await {
+        Ok(bin_path) => {
+            emit_install_plan(
+                sink,
+                &msg.session_id,
+                &install_key,
+                &format!("已通过 npm 自动安装 {}", spec.package),
+                "done",
+            )
+            .await;
+            emit_agent_status(sink, msg.agent.id.as_deref(), "online").await;
+            Ok(command::prepare_resolved(&bin_path, args, &path_env))
+        }
+        Err(err_msg) => {
+            emit_install_plan(
+                sink,
+                &msg.session_id,
+                &install_key,
+                &format!("自动安装 {} 失败", spec.package),
+                "pending",
+            )
+            .await;
+            emit_agent_status(sink, msg.agent.id.as_deref(), "standby").await;
+            Err(err_msg)
         }
     }
 }
@@ -372,12 +567,12 @@ where
     Ok(Some(resolved_sid))
 }
 
-fn session_upload_dir(session_id: &str) -> Option<PathBuf> {
+pub(super) fn session_upload_dir(session_id: &str) -> Option<PathBuf> {
     let parsed = Uuid::parse_str(session_id.trim()).ok()?;
     Some(super::host_data_dir().join("uploads").join(parsed.to_string()))
 }
 
-fn restrict_dir_owner(path: &Path) {
+pub(super) fn restrict_dir_owner(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -387,7 +582,7 @@ fn restrict_dir_owner(path: &Path) {
     let _ = path;
 }
 
-fn restrict_file_owner(path: &Path) {
+pub(super) fn restrict_file_owner(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -727,47 +922,18 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         cmd: &str,
         reason: &str,
     ) -> Result<String, String> {
-        if self.policy == "allow_all" {
-            return Ok("allow_once".to_string());
-        }
-        let req_id = Uuid::new_v4().to_string();
-        let (tx, mut rx) = oneshot::channel::<String>();
-        self.pending_perms.lock().unwrap().insert(req_id.clone(), tx);
-
-        let _ = self
-            .sink
-            .send(json!({
-                "type": "session_update",
-                "session_id": self.session_id,
-                "kind": "permission_request",
-                "req_id": req_id,
-                "tool_kind": tool_kind,
-                "command": cmd,
-                "cwd": self.cwd.to_string_lossy(),
-                "reason": reason,
-            }))
-            .await;
-
-        let mut cancel_rx = self.cancel.clone();
-        loop {
-            if *cancel_rx.borrow() {
-                self.pending_perms.lock().unwrap().remove(&req_id);
-                return Ok("reject_once".to_string());
-            }
-            tokio::select! {
-                biased;
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        self.pending_perms.lock().unwrap().remove(&req_id);
-                        return Ok("reject_once".to_string());
-                    }
-                }
-                res = &mut rx => {
-                    self.pending_perms.lock().unwrap().remove(&req_id);
-                    return Ok(res.unwrap_or_else(|_| "reject_once".to_string()));
-                }
-            }
-        }
+        Ok(ask_user_permission_via_sink(
+            &self.sink,
+            &self.pending_perms,
+            &self.cancel,
+            &self.session_id,
+            &self.cwd,
+            &self.policy,
+            tool_kind,
+            cmd,
+            reason,
+        )
+        .await)
     }
 
     async fn handle_fs_read(&self, id: Value, params: &Value) -> Result<Value, String> {
@@ -1111,7 +1277,7 @@ mod tests {
             session_id: "s-1".into(),
             acp_session_key: None,
             cwd: dir.to_string_lossy().into(),
-            agent: AgentConfig { cmd: "mock".into(), env: HashMap::new() },
+            agent: AgentConfig { id: None, preset: String::new(), cmd: "mock".into(), env: HashMap::new() },
             model: String::new(),
             thinking_level: "中".into(),
             permission_policy: "ask".into(),

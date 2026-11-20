@@ -268,3 +268,11 @@ export const RefreshIcon = (p: IconProps) => (
     <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
   </Svg>
 );
+
+export const MoreVerticalIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="12" cy="5" r="1" fill="currentColor" />
+    <circle cx="12" cy="12" r="1" fill="currentColor" />
+    <circle cx="12" cy="19" r="1" fill="currentColor" />
+  </Svg>
+);

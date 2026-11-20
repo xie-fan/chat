@@ -166,6 +166,19 @@ pub(crate) fn preset_defaults(preset: &str) -> PresetDefaults {
             ],
             capabilities: vec!["fs.read".into(), "fs.write".into(), "terminal.run".into()],
         },
+        "pi" => PresetDefaults {
+            short_tag: "PI",
+            badge_bg: "from-amber-500 to-orange-600",
+            adapter: "pi-rpc",
+            default_model: "Default Model",
+            model_options: vec!["Default Model".into()],
+            capabilities: vec![
+                "fs.read".into(),
+                "fs.write".into(),
+                "terminal.run".into(),
+                "diff.stream".into(),
+            ],
+        },
         _ => PresetDefaults {
             short_tag: "AG",
             badge_bg: "from-indigo-500 to-sky-500",
@@ -635,4 +648,19 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preset_defaults;
+
+    #[test]
+    fn pi_preset_defaults_match_rpc_driver() {
+        let p = preset_defaults("pi");
+        assert_eq!(p.short_tag, "PI");
+        assert_eq!(p.adapter, "pi-rpc");
+        assert_eq!(p.default_model, "Default Model");
+        assert!(p.capabilities.contains(&"fs.read".to_string()));
+        assert!(p.capabilities.contains(&"terminal.run".to_string()));
+    }
 }

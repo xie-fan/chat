@@ -76,28 +76,63 @@ pub fn resolve_in(command: &str, path_env: &str, pathext: &str) -> Option<PathBu
     None
 }
 
+pub fn effective_path_env() -> String {
+    let raw = std::env::var("PATH").unwrap_or_default();
+    #[cfg(unix)]
+    {
+        let mut parts: Vec<String> = raw
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            if !parts.iter().any(|p| p == extra) {
+                parts.push(extra.to_string());
+            }
+        }
+        parts.join(":")
+    }
+    #[cfg(not(unix))]
+    {
+        raw
+    }
+}
+
+pub fn default_pathext_env() -> String {
+    std::env::var("PATHEXT").unwrap_or_else(|_| default_pathext())
+}
+
 pub fn prepare(command: &str, args: &[String]) -> Command {
-    let path = std::env::var("PATH").unwrap_or_default();
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| default_pathext());
+    let path = effective_path_env();
+    let pathext = default_pathext_env();
     prepare_in(command, args, &path, &pathext)
 }
 
-pub fn prepare_in(command: &str, args: &[String], path_env: &str, pathext: &str) -> Command {
-    let mut cmd = match resolve_in(command, path_env, pathext) {
-        Some(path) => {
-            let mut c = Command::new(path);
-            c.args(args);
-            c
-        }
-        None => {
-            let mut c = Command::new(command);
-            c.args(args);
-            c
-        }
-    };
+pub fn prepare_resolved(path: &Path, args: &[String], path_env: &str) -> Command {
+    let mut cmd = Command::new(path);
+    cmd.args(args);
+    if !path_env.is_empty() {
+        cmd.env("PATH", path_env);
+    }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
+}
+
+pub fn prepare_in(command: &str, args: &[String], path_env: &str, pathext: &str) -> Command {
+    match resolve_in(command, path_env, pathext) {
+        Some(path) => prepare_resolved(&path, args, path_env),
+        None => {
+            let mut c = Command::new(command);
+            c.args(args);
+            if !path_env.is_empty() {
+                c.env("PATH", path_env);
+            }
+            #[cfg(windows)]
+            c.creation_flags(CREATE_NO_WINDOW);
+            c
+        }
+    }
 }
 
 pub fn configure_child_group(cmd: &mut Command) {
@@ -167,13 +202,22 @@ fn try_file(base: &Path, exts: &[String]) -> Option<PathBuf> {
 }
 
 pub fn probe_agent(cmd: &str) -> Value {
+    let path = effective_path_env();
+    let pathext = default_pathext_env();
+    probe_agent_in(cmd, &super::host_data_dir(), &path, &pathext)
+}
+
+pub fn probe_agent_in(cmd: &str, data_dir: &Path, path_env: &str, pathext: &str) -> Value {
     let Ok((prog, _)) = split_cmdline(cmd) else {
-        return json!({ "ok": false });
+        return json!({ "ok": false, "installable": false });
     };
-    let path = std::env::var("PATH").unwrap_or_default();
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| default_pathext());
-    let ok = resolve_in(&prog, &path, &pathext).is_some();
-    json!({ "ok": ok })
+    let ok = super::adapters::resolve_agent_program_in(data_dir, &prog, path_env, pathext).is_some();
+    let adapter = super::adapters::lookup_npm_adapter(&prog);
+    json!({
+        "ok": ok,
+        "installable": adapter.is_some(),
+        "package": adapter.map(|a| a.package),
+    })
 }
 
 fn empty_hooks_dir() -> PathBuf {
@@ -337,5 +381,92 @@ mod tests {
         assert!(!res["cwd"].as_str().unwrap().is_empty());
         assert!(res["branches"].is_array());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn probe_agent_in_reports_installable_and_installed_states() {
+        let data = std::env::temp_dir().join(format!("acp_probe_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+
+        let missing = probe_agent_in("codex-acp", &data, "", ".CMD");
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["installable"], true);
+        assert_eq!(missing["package"], "@agentclientprotocol/codex-acp");
+
+        let native = probe_agent_in("gemini --acp", &data, "", ".CMD");
+        assert_eq!(native["ok"], false);
+        assert_eq!(native["installable"], false);
+        assert!(native["package"].is_null());
+
+        let prefix = super::super::adapters::managed_adapter_prefix(&data, "codex-acp");
+        let bin_dir = prefix.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin_name = if cfg!(windows) { "codex-acp.cmd" } else { "codex-acp" };
+        std::fs::write(bin_dir.join(bin_name), "echo ok\n").unwrap();
+        std::fs::write(prefix.join(".acp-installed"), "{}").unwrap();
+
+        let ready = probe_agent_in("codex-acp", &data, "", ".CMD");
+        assert_eq!(ready["ok"], true);
+        assert_eq!(ready["installable"], true);
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pathext_resolves_cmd_and_runs_it() {
+        let root = std::env::temp_dir().join(format!("acp_cmd_{}", uuid::Uuid::new_v4()));
+        let dir = root.join("bin dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hello.cmd"),
+            "@echo off\r\necho pong:%~1\r\n",
+        )
+        .unwrap();
+        let path_env = dir.display().to_string();
+        let resolved = resolve_in("hello", &path_env, ".COM;.EXE;.BAT;.CMD").unwrap();
+        assert!(resolved.extension().unwrap().eq_ignore_ascii_case("cmd"));
+
+        let mut cmd = prepare_resolved(&resolved, &["arg1".to_string()], &path_env);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let out = cmd.output().await.unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("pong:arg1"),
+            "status={:?} stdout={text} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_shim_forwards_stdin() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = std::env::temp_dir().join(format!("acp_stdin_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("read.cmd");
+        std::fs::write(&script, "@echo off\r\nset /p LINE=\r\necho got:%LINE%\r\n").unwrap();
+        let mut cmd = prepare_resolved(&script, &[], "");
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"ping\r\n").await.unwrap();
+        }
+        let out = child.wait_with_output().await.unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("got:ping"),
+            "status={:?} stdout={text} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

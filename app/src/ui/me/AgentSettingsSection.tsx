@@ -4,6 +4,7 @@ import { getLocalAllowAll, setLocalAllowAll } from "../../acpHost";
 import { applyAcpBootstrap, setState, useApp } from "../../store";
 import type { AcpPermissionPolicy } from "../../types";
 import { AttachAgentModal } from "../acp/AcpModals";
+import { agentStatusLabel } from "../acp/adapterHint";
 import { ChevronDownIcon, ChevronRightIcon, CpuIcon, PlusIcon, TrashIcon, XIcon } from "../icons";
 import { confirmDialog } from "../Modal";
 
@@ -31,7 +32,7 @@ const GLOBAL_POLICIES: {
 
 export default function AgentSettingsSection() {
   const s = useApp();
-  const [expandedHosts, setExpandedHosts] = useState<Set<string>>(() => new Set());
+  const [collapsedHosts, setCollapsedHosts] = useState<Set<string>>(() => new Set());
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
   const [renamingHostId, setRenamingHostId] = useState<string | null>(null);
   const [hostNameDraft, setHostNameDraft] = useState("");
@@ -55,12 +56,6 @@ export default function AgentSettingsSection() {
     }
   }, [s.acpLoaded]);
 
-  useEffect(() => {
-    if (s.acpHosts.length > 0 && expandedHosts.size === 0) {
-      setExpandedHosts(new Set(s.acpHosts.map((h) => h.id)));
-    }
-  }, [s.acpHosts, expandedHosts.size]);
-
   const setPolicy = async (policy: AcpPermissionPolicy) => {
     setErr("");
     try {
@@ -72,7 +67,7 @@ export default function AgentSettingsSection() {
   };
 
   const toggleHost = (id: string) => {
-    setExpandedHosts((prev) => {
+    setCollapsedHosts((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -239,11 +234,15 @@ export default function AgentSettingsSection() {
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {s.acpHosts.map((h) => {
-              const open = expandedHosts.has(h.id);
+              const open = !collapsedHosts.has(h.id);
               const agents = s.acpAgents.filter((a) => a.host_id === h.id);
               return (
                 <div key={h.id} className="host-group-card">
-                  <div className="host-group-head" onClick={() => toggleHost(h.id)}>
+                  <div
+                    className="host-group-head"
+                    aria-expanded={open}
+                    onClick={() => toggleHost(h.id)}
+                  >
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       {open ? <ChevronDownIcon size={15} /> : <ChevronRightIcon size={15} />}
                       <span
@@ -324,16 +323,23 @@ export default function AgentSettingsSection() {
                           该机器上尚未注册 Agent。
                         </div>
                       ) : (
-                        agents.map((ag) => (
-                          <div key={ag.id} className="agent-item-card">
-                            <div className="row between">
-                              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                <span className="acp-chip">{ag.short_tag}</span>
-                                <b>{ag.name}</b>
-                                <code className="muted" style={{ fontSize: 12 }}>
-                                  {ag.cmd}
-                                </code>
-                              </div>
+                        agents.map((ag) => {
+                          const st = agentStatusLabel(ag.status);
+                          return (
+                            <div key={ag.id} className="agent-item-card">
+                              <div className="row between">
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                  <span className="acp-chip">{ag.short_tag}</span>
+                                  <b>{ag.name}</b>
+                                  <span
+                                    className={`status-pill${st.tone === "online" || st.tone === "installing" ? " online" : ""}`}
+                                  >
+                                    {st.text}
+                                  </span>
+                                  <code className="muted" style={{ fontSize: 12 }}>
+                                    {ag.cmd}
+                                  </code>
+                                </div>
                               <button
                                 type="button"
                                 className="icon-btn"
@@ -452,7 +458,8 @@ export default function AgentSettingsSection() {
                               </div>
                             </div>
                           </div>
-                        ))
+                          );
+                        })
                       )}
                     </div>
                   )}

@@ -302,6 +302,37 @@ fn default_custom_preset() -> String {
     "custom".to_string()
 }
 
+async fn probe_and_resolve_status(
+    st: &SharedState,
+    uid: Uuid,
+    host_id: Uuid,
+    cmd: &str,
+) -> (&'static str, bool) {
+    if !st.acp_hosts.contains_key(&host_id) {
+        return ("standby", false);
+    }
+    match call_host_rpc(st, uid, host_id, "probe_agent", json!({ "cmd": cmd })).await {
+        Ok(res) if res["ok"].as_bool() == Some(true) => ("online", false),
+        Ok(res) if res["installable"].as_bool() == Some(true) => ("installing", true),
+        _ => ("standby", false),
+    }
+}
+
+fn trigger_ensure_agent(st: &SharedState, uid: Uuid, host_id: Uuid, agent_id: Uuid, cmd: &str) {
+    if let Some(conn) = st.acp_hosts.get(&host_id) {
+        if conn.uid == uid {
+            let _ = conn.tx.try_send(ConnMsg::Frame(
+                json!({
+                    "type": "ensure_agent",
+                    "agent_id": agent_id,
+                    "cmd": cmd,
+                })
+                .to_string(),
+            ));
+        }
+    }
+}
+
 async fn create_agent(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -335,23 +366,8 @@ async fn create_agent(
         _ => json!({}),
     };
 
-    // 如果宿主机在线，尝试探测本地可执行文件；探测不阻止创建（离线或待命同样允许预配）
-    let status = if st.acp_hosts.contains_key(&req.host_id) {
-        match call_host_rpc(
-            &st,
-            uid,
-            req.host_id,
-            "probe_agent",
-            json!({ "cmd": cmd }),
-        )
-        .await
-        {
-            Ok(res) if res["ok"].as_bool() == Some(true) => "online",
-            _ => "standby",
-        }
-    } else {
-        "standby"
-    };
+    // 如果宿主机在线，尝试探测本地可执行文件；若为官方可安装适配器则返回 installing 并后台预装
+    let (status, should_ensure) = probe_and_resolve_status(&st, uid, req.host_id, &cmd).await;
 
     let agent_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO acp_agents
@@ -378,6 +394,9 @@ async fn create_agent(
 
     let view = load_agent(&st.pool, uid, agent_id).await?;
     broadcast_acp(&st, uid, "agent_upserted", json!({ "agent": view }));
+    if should_ensure {
+        trigger_ensure_agent(&st, uid, req.host_id, agent_id, &cmd);
+    }
     Ok(Json(view))
 }
 
@@ -411,15 +430,16 @@ async fn update_agent(
         }
         None => cur.name,
     };
-    let cmd = match req.cmd {
+    let (cmd, cmd_changed) = match req.cmd {
         Some(c) => {
             let trimmed: String = c.trim().chars().take(500).collect();
             if trimmed.is_empty() {
                 return Err(AppError::bad_request("agent cmd cannot be empty"));
             }
-            trimmed
+            let changed = trimmed != cur.cmd;
+            (trimmed, changed)
         }
-        None => cur.cmd,
+        None => (cur.cmd, false),
     };
     let next_env = match req.env {
         Some(Value::Object(map)) => {
@@ -464,11 +484,18 @@ async fn update_agent(
         None => cur.permission_override,
     };
 
+    let (next_status, should_ensure) = if cmd_changed {
+        let (st_str, ens) = probe_and_resolve_status(&st, uid, cur.host_id, &cmd).await;
+        (st_str.to_string(), ens)
+    } else {
+        (cur.status.clone(), false)
+    };
+
     sqlx::query(
         "UPDATE acp_agents
             SET name = $2, cmd = $3, env_json = $4, default_model = $5, model_options = $6,
-                permission_override = $7, updated_at = now()
-          WHERE id = $1 AND user_id = $8",
+                permission_override = $7, status = $8, updated_at = now()
+          WHERE id = $1 AND user_id = $9",
     )
     .bind(agent_id)
     .bind(&name)
@@ -477,12 +504,16 @@ async fn update_agent(
     .bind(&default_model)
     .bind(json!(model_options))
     .bind(&permission_override)
+    .bind(&next_status)
     .bind(uid)
     .execute(&st.pool)
     .await?;
 
     let view = load_agent(&st.pool, uid, agent_id).await?;
     broadcast_acp(&st, uid, "agent_upserted", json!({ "agent": view }));
+    if should_ensure {
+        trigger_ensure_agent(&st, uid, cur.host_id, agent_id, &cmd);
+    }
     Ok(Json(view))
 }
 

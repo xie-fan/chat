@@ -6,7 +6,8 @@ import {
   type AppState,
 } from "../../store";
 import { nextQuickTheme, resolveRenderedDark } from "../../theme";
-import type { AcpBootstrap, AcpHost, AcpSession, AcpTurn, AcpWorkspace } from "../../types";
+import type { AcpAgent, AcpBootstrap, AcpHost, AcpSession, AcpTurn, AcpWorkspace } from "../../types";
+import { agentStatusLabel, autoInstallPackageForCmd } from "./adapterHint";
 
 function baseState(): AppState {
   return {
@@ -173,6 +174,73 @@ describe("ACP Workspace store reducers", () => {
     expect(st.activeAcpHostId).toBeNull();
     expect(st.activeAcpWorkspaceId).toBeNull();
     expect(st.activeAcpSessionId).toBeNull();
+  });
+  it("applyAcpEvent updates agent status from installing to online", () => {
+    const sampleAgent: AcpAgent = {
+      id: "a1",
+      host_id: "h1",
+      preset: "codex",
+      name: "Codex CLI",
+      adapter: "codex-acp",
+      cmd: "codex-acp",
+      env: {},
+      short_tag: "CX",
+      badge_bg: "from-emerald-500 to-teal-600",
+      default_model: "GPT-5 Codex",
+      model_options: ["GPT-5 Codex"],
+      permission_override: "inherit",
+      capabilities: ["fs.read"],
+      status: "installing",
+      created_at: "2026-11-20T00:00:00Z",
+      updated_at: "2026-11-20T00:00:00Z",
+    };
+    let st = {
+      ...baseState(),
+      ...applyAcpBootstrap(baseState(), {
+        settings: { default_permission: "auto_read" },
+        hosts: [sampleHost()],
+        agents: [sampleAgent],
+        workspaces: [sampleWs()],
+        sessions: [sampleSess()],
+      }),
+    };
+    expect(st.acpAgents[0].status).toBe("installing");
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "agent_upserted", {
+        agent: { ...sampleAgent, status: "online" },
+      }),
+    };
+    expect(st.acpAgents[0].status).toBe("online");
+  });
+});
+
+describe("ACP adapter auto-install hints & status labels", () => {
+  it("autoInstallPackageForCmd maps codex-acp and claude-agent-acp only", () => {
+    expect(autoInstallPackageForCmd("codex-acp")).toBe("@agentclientprotocol/codex-acp");
+    expect(autoInstallPackageForCmd("CODEX-ACP.cmd --help")).toBe("@agentclientprotocol/codex-acp");
+    expect(autoInstallPackageForCmd("claude-agent-acp")).toBe(
+      "@agentclientprotocol/claude-agent-acp",
+    );
+    expect(autoInstallPackageForCmd('"claude-agent-acp"')).toBe(
+      "@agentclientprotocol/claude-agent-acp",
+    );
+    expect(autoInstallPackageForCmd("gemini --acp")).toBeNull();
+    expect(autoInstallPackageForCmd("opencode acp")).toBeNull();
+    expect(autoInstallPackageForCmd("pi --mode rpc")).toBeNull();
+    expect(autoInstallPackageForCmd("C:\\tools\\codex-acp.cmd")).toBeNull();
+    expect(autoInstallPackageForCmd("/usr/local/bin/codex-acp")).toBeNull();
+    expect(autoInstallPackageForCmd("")).toBeNull();
+  });
+
+  it("agentStatusLabel formats all agent lifecycle states", () => {
+    expect(agentStatusLabel("online")).toEqual({ text: "就绪", tone: "online" });
+    expect(agentStatusLabel("installing")).toEqual({
+      text: "正在通过 npm 安装适配器…",
+      tone: "installing",
+    });
+    expect(agentStatusLabel("offline")).toEqual({ text: "离线", tone: "muted" });
+    expect(agentStatusLabel("standby")).toEqual({ text: "待命", tone: "muted" });
   });
 });
 

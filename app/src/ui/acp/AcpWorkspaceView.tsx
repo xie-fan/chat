@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { acp } from "../../api";
 import { applyAcpBootstrap, getState, setState, useApp } from "../../store";
 import type {
@@ -16,6 +25,7 @@ import {
   CpuIcon,
   FolderIcon,
   GitBranchIcon,
+  MoreVerticalIcon,
   PlusIcon,
   TerminalIcon,
   TrashIcon,
@@ -586,34 +596,30 @@ export default function AcpWorkspaceView() {
                       <ChevronDownIcon size={14} />
                     )}
                     <FolderIcon size={15} />
-                    <span className="acp-ws-name" title={w.name}>
+                    <span
+                      className="acp-ws-name"
+                      title={w.cwd ? `${w.name} (${w.cwd})` : w.name}
+                    >
                       {w.name}
                     </span>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      title="在此目录新建对话"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setNewSessWsId(w.id);
-                      }}
+                    <div
+                      className="acp-ws-actions"
+                      onClick={(e) => e.stopPropagation()}
                     >
-                      <PlusIcon size={14} />
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      title="删除工作目录"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void removeWorkspace(w.id, w.name);
-                      }}
-                    >
-                      <TrashIcon size={13} />
-                    </button>
-                  </div>
-                  <div className="acp-ws-cwd mono-code" title={w.cwd}>
-                    {w.cwd}
+                      <button
+                        type="button"
+                        className="acp-ws-action-btn acp-ws-add-btn"
+                        title="在此目录新建对话"
+                        aria-label="在此目录新建对话"
+                        onClick={() => setNewSessWsId(w.id)}
+                      >
+                        <PlusIcon size={15} />
+                      </button>
+                      <WorkspaceActionMenu
+                        workspaceName={w.name}
+                        onDelete={() => void removeWorkspace(w.id, w.name)}
+                      />
+                    </div>
                   </div>
                   {!collapsed && (
                     <div className="acp-ws-sessions">
@@ -776,9 +782,19 @@ export default function AcpWorkspaceView() {
                     >
                       {activeSession.title}
                     </h3>
-                    <span className={`status-pill${activeSession.running ? " online" : ""}`}>
-                      {activeSession.running ? "运行中…" : "就绪"}
-                    </span>
+                    {(() => {
+                      const installing = !activeSession.running && activeAgent?.status === "installing";
+                      const active = activeSession.running || installing;
+                      return (
+                        <span className={`status-pill${active ? " online" : ""}`}>
+                          {activeSession.running
+                            ? "运行中…"
+                            : installing
+                              ? "正在安装 ACP 适配器…"
+                              : "就绪"}
+                        </span>
+                      );
+                    })()}
                   </div>
                 )}
 
@@ -1055,5 +1071,172 @@ export default function AcpWorkspaceView() {
         />
       )}
     </main>
+  );
+}
+
+function WorkspaceActionMenu({
+  workspaceName,
+  onDelete,
+}: {
+  workspaceName: string;
+  onDelete: () => void;
+}) {
+  const supportsNativePopover =
+    typeof HTMLElement !== "undefined" &&
+    typeof (HTMLElement.prototype as { showPopover?: unknown }).showPopover ===
+      "function";
+  const supportsAnchorPos =
+    typeof CSS !== "undefined" &&
+    typeof CSS.supports === "function" &&
+    CSS.supports("position-area: block-end");
+
+  const rawId = useId();
+  const safeId = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
+  const menuId = `ws-menu-${safeId}`;
+  const anchorName = `--ws-menu-${safeId}`;
+
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  const positionMenu = useCallback(() => {
+    const trigger = triggerRef.current;
+    const popover = popoverRef.current;
+    if (!trigger || !popover) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const menuRect = popover.getBoundingClientRect();
+    const menuWidth = menuRect.width || 140;
+    const menuHeight = menuRect.height || 40;
+    const maxLeft = Math.max(8, window.innerWidth - menuWidth - 8);
+    const left = Math.min(Math.max(8, triggerRect.right - menuWidth), maxLeft);
+    let top = triggerRect.bottom + 4;
+    if (top + menuHeight > window.innerHeight - 8) {
+      top = Math.max(8, triggerRect.top - menuHeight - 4);
+    }
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+  }, []);
+
+  useEffect(() => {
+    if (!supportsNativePopover) return;
+    const popover = popoverRef.current;
+    if (!popover) return;
+    const onToggle = (e: Event) => {
+      const nextState = (e as Event & { newState?: string }).newState;
+      const isOpen = nextState
+        ? nextState === "open"
+        : popover.matches(":popover-open");
+      setOpen(isOpen);
+      if (isOpen && !supportsAnchorPos) {
+        positionMenu();
+        requestAnimationFrame(positionMenu);
+      }
+    };
+    popover.addEventListener("toggle", onToggle);
+    return () => popover.removeEventListener("toggle", onToggle);
+  }, [supportsNativePopover, supportsAnchorPos, positionMenu]);
+
+  useEffect(() => {
+    if (!open || !supportsNativePopover || supportsAnchorPos) return;
+    const sync = () => positionMenu();
+    window.addEventListener("resize", sync);
+    window.addEventListener("scroll", sync, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener("resize", sync);
+      window.removeEventListener("scroll", sync, true);
+    };
+  }, [open, supportsNativePopover, supportsAnchorPos, positionMenu]);
+
+  useLayoutEffect(() => {
+    if (!supportsNativePopover && open) {
+      positionMenu();
+    }
+  }, [supportsNativePopover, open, positionMenu]);
+
+  useEffect(() => {
+    if (supportsNativePopover || !open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    const onSync = () => positionMenu();
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", onSync);
+    window.addEventListener("scroll", onSync, { capture: true, passive: true });
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", onSync);
+      window.removeEventListener("scroll", onSync, true);
+    };
+  }, [supportsNativePopover, open, positionMenu]);
+
+  const handleDelete = () => {
+    if (supportsNativePopover) {
+      (
+        popoverRef.current as (HTMLDivElement & { hidePopover?: () => void }) | null
+      )?.hidePopover?.();
+    } else {
+      setOpen(false);
+    }
+    onDelete();
+  };
+
+  return (
+    <div className="acp-ws-menu-wrap" ref={wrapRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="acp-ws-action-btn"
+        title="更多操作"
+        aria-label={`${workspaceName} 更多操作`}
+        aria-expanded={open}
+        aria-controls={menuId}
+        style={
+          supportsNativePopover
+            ? ({ anchorName } as CSSProperties)
+            : undefined
+        }
+        {...(supportsNativePopover
+          ? ({ popovertarget: menuId } as Record<string, string>)
+          : { onClick: () => setOpen((v) => !v) })}
+      >
+        <MoreVerticalIcon size={15} />
+      </button>
+      {(supportsNativePopover || open) && (
+        <div
+          ref={popoverRef}
+          id={menuId}
+          className="acp-ws-popover"
+          style={
+            supportsNativePopover
+              ? ({ positionAnchor: anchorName } as CSSProperties)
+              : undefined
+          }
+          {...(supportsNativePopover
+            ? ({ popover: "auto" } as Record<string, string>)
+            : undefined)}
+        >
+          <button
+            type="button"
+            className="acp-ws-popover-item danger"
+            onClick={handleDelete}
+          >
+            <TrashIcon size={14} />
+            <span>删除工作目录</span>
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

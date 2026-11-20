@@ -745,3 +745,101 @@ async fn acp_security_concurrency_pairing_and_cleanup() {
         .unwrap();
     assert_eq!(st_after["used_bytes"], 0);
 }
+
+#[tokio::test]
+async fn create_installable_agent_triggers_ensure_and_status_updates() {
+    let base = spawn().await;
+    let u = register(&base, &format!("acpens_{}", uniq())).await;
+
+    let (mut client_ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await)
+        .await
+        .unwrap();
+    let mut host_ws = host_ws_connect(&base, &u).await;
+
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "host_hello",
+                "install_id": Uuid::new_v4(),
+                "name": "Win-Node",
+                "os": "windows · x86_64",
+                "ip": "127.0.0.1",
+                "roots": ["C:\\work"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ready = next_of(&mut host_ws, "host_ready").await;
+    let host_id = ready["host_id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "host_upserted").await;
+
+    let ag_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/acp/agents"))
+                .header("authorization", authz(&access))
+                .json(&json!({
+                    "host_id": host_id,
+                    "preset": "codex",
+                    "name": "Codex CLI",
+                    "cmd": "codex-acp"
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+
+    let probe_ag = next_of(&mut host_ws, "rpc_call").await;
+    assert_eq!(probe_ag["method"], "probe_agent");
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "rpc_result",
+                "req_id": probe_ag["req_id"],
+                "ok": true,
+                "data": {
+                    "ok": false,
+                    "installable": true,
+                    "package": "@agentclientprotocol/codex-acp"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let ag_res: Value = ag_req.await.unwrap().json().await.unwrap();
+    let agent_id = ag_res["id"].as_str().unwrap().to_string();
+    assert_eq!(ag_res["status"], "installing");
+
+    let created_ev = next_acp_event(&mut client_ws, "agent_upserted").await;
+    assert_eq!(created_ev["data"]["agent"]["status"], "installing");
+
+    let ensure_msg = next_of(&mut host_ws, "ensure_agent").await;
+    assert_eq!(ensure_msg["agent_id"], agent_id);
+    assert_eq!(ensure_msg["cmd"], "codex-acp");
+
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "agent_status",
+                "agent_id": agent_id,
+                "status": "online"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let online_ev = next_acp_event(&mut client_ws, "agent_upserted").await;
+    assert_eq!(online_ev["data"]["agent"]["id"], agent_id);
+    assert_eq!(online_ev["data"]["agent"]["status"], "online");
+}

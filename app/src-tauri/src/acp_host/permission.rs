@@ -2,7 +2,16 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
-const READ_KINDS: &[&str] = &["read", "search", "glob", "grep", "ls", "fs/read_text_file", "fs.read"];
+const READ_KINDS: &[&str] = &[
+    "read",
+    "search",
+    "glob",
+    "grep",
+    "find",
+    "ls",
+    "fs/read_text_file",
+    "fs.read",
+];
 
 #[derive(Default)]
 pub struct PermissionCache {
@@ -30,7 +39,7 @@ pub fn cache_key(session_id: &str, cwd: &Path, tool_kind: &str, cmd_or_title: &s
     let kind = tool_kind.to_ascii_lowercase();
     let extra = if matches!(
         kind.as_str(),
-        "execute" | "terminal/run" | "bash" | "shell" | "command"
+        "execute" | "terminal/run" | "bash" | "powershell" | "shell" | "command"
     ) {
         cmd_or_title.split_whitespace().next().unwrap_or("")
     } else {
@@ -186,6 +195,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            evaluate_policy("auto_read", "find", &["src".into()], &root),
+            Some(true)
+        );
+        assert_eq!(
             evaluate_policy("auto_read", "read", &["../../etc/passwd".into()], &root),
             None
         );
@@ -234,6 +247,15 @@ mod tests {
         assert_ne!(
             base,
             cache_key("s1", Path::new("/tmp/a"), "terminal/run", "rm -rf /")
+        );
+        let ps = cache_key("s1", Path::new("/tmp/a"), "powershell", "Get-ChildItem src");
+        assert_eq!(
+            ps,
+            cache_key("s1", Path::new("/tmp/a"), "powershell", "Get-ChildItem tests")
+        );
+        assert_ne!(
+            ps,
+            cache_key("s1", Path::new("/tmp/a"), "powershell", "Remove-Item foo")
         );
     }
 
