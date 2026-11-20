@@ -394,6 +394,7 @@ export interface ServerInfo {
   registration_mode: RegistrationMode;
   /** ntfy 推送已配置（V2 P3-3；旧服务端无此字段 → 视为未配置） */
   push_available?: boolean;
+  android_fcm_available?: boolean;
   /** 视频会议地址前缀；空字符串 = 关闭按钮。旧服务端缺省 */
   meeting_base_url?: string;
 }

@@ -1129,6 +1129,7 @@ export async function serverInfo(server?: string): Promise<ServerInfo> {
     return {
       registration_mode: m === "invite" || m === "closed" ? m : "open",
       push_available: j.push_available === true,
+      android_fcm_available: j.android_fcm_available === true,
       meeting_base_url: typeof j.meeting_base_url === "string" ? j.meeting_base_url : undefined,
     };
   } catch {

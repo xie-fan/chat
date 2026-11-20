@@ -366,6 +366,10 @@ async fn dispatch(st: &SharedState, msg: &MessageView) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) async fn android_push_available(st: &SharedState) -> bool {
+    android_push_client(st).await.is_some()
+}
+
 async fn android_push_client(st: &SharedState) -> Option<Arc<Fcm>> {
     st.fcm.as_ref()?.client().await
 }
@@ -416,6 +420,50 @@ fn payload(token: &str, binding: Uuid, conv_id: Uuid, msg_id: Uuid) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn server_info_reports_native_fcm_independently_of_ntfy(pool: sqlx::PgPool) {
+        let cfg = crate::config::Config {
+            database_url: String::new(),
+            jwt_secret: "x".repeat(32),
+            bind: "127.0.0.1".into(),
+            port: 0,
+            app_dist: None,
+            files_dir: String::new(),
+            upload_max_bytes: 0,
+            trust_proxy: false,
+            recall_attachment_ttl_secs: 86400,
+            recall_sweep_interval_secs: 3600,
+        };
+        let st = crate::state::AppState::new(pool.clone(), cfg.clone());
+        let Json(info) = crate::settings::server_info(State(st)).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(info).unwrap()["android_fcm_available"],
+            false
+        );
+
+        let path = std::env::temp_dir().join(format!("chat-fcm-info-{}.json", Uuid::new_v4()));
+        let st = crate::state::AppState::new_with_fcm(
+            pool,
+            cfg,
+            Some(FcmFile {
+                path: path.clone(),
+                cached: Mutex::new(None),
+            }),
+        );
+        for content in [None, Some("{}".to_string()), Some(json!({
+            "project_id": "test-project", "client_email": "service@example.invalid",
+            "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMB0CAQACAgyhAgERAgIKwQIBPQIBNQIBNQIBMQIBJg==\n-----END RSA PRIVATE KEY-----",
+        }).to_string())] {
+            if let Some(content) = &content { std::fs::write(&path, content).unwrap(); }
+            let Json(info) = crate::settings::server_info(State(st.clone())).await.unwrap();
+            assert!(!info.push_available);
+            assert_eq!(info.android_fcm_available, content.as_ref().is_some_and(|c| c != "{}"));
+        }
+        std::fs::remove_file(path).unwrap();
+        let Json(info) = crate::settings::server_info(State(st)).await.unwrap();
+        assert!(!info.android_fcm_available);
+    }
 
     #[tokio::test]
     async fn loads_a_service_account_added_after_startup_and_disables_it_on_removal() {
