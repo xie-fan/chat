@@ -80,9 +80,18 @@ pub fn run() {
             acp_host::acp_host_start,
             acp_host::acp_host_ticket,
             acp_host::acp_host_stop,
+            acp_host::acp_host_info,
+            acp_host::acp_host_list_dir,
+            acp_host::acp_host_probe_workspace,
+            acp_host::acp_host_git_checkout,
+            acp_host::acp_host_probe_agent,
             acp_host::acp_host_confirm_exec,
             acp_host::acp_host_local_policy,
-            acp_host::acp_host_set_local_allow_all
+            acp_host::acp_host_set_local_allow_all,
+            acp_host::acp_host_set_cloud_control,
+            acp_host::acp_host_local_prompt_start,
+            acp_host::acp_host_local_prompt_cancel,
+            acp_host::acp_host_local_permission_reply
         ])
         .setup(|app| {
             tray::install(app.handle())?;

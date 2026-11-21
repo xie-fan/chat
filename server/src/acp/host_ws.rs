@@ -1,4 +1,7 @@
-use super::{broadcast_acp, load_agent, load_host, load_session_meta, load_workspace, turn_from_row};
+use super::{
+    apply_agent_probed_models, broadcast_acp, load_agent, load_host, load_session_meta,
+    load_workspace, turn_from_row,
+};
 use crate::error::AppResult;
 use crate::state::{ConnMsg, SharedState};
 use axum::extract::ws::{Message, WebSocket};
@@ -199,8 +202,8 @@ pub async fn host_session(
         .await
         .unwrap_or_default();
 
-        for sess_id in paused_sessions {
-            if let Ok(s) = load_session_meta(&st.pool, uid, sess_id).await {
+        for sess_id in &paused_sessions {
+            if let Ok(s) = load_session_meta(&st.pool, uid, *sess_id).await {
                 broadcast_acp(&st, uid, "session_upserted", json!({ "session": s }));
             }
         }
@@ -228,6 +231,65 @@ pub async fn host_session(
                 uid,
                 "turn_upserted",
                 json!({ "session_id": tv.session_id, "turn": tv }),
+            );
+        }
+
+        let settled_streams = sqlx::query(
+            "UPDATE acp_turns t
+                SET status = 'done', updated_at = now()
+               FROM acp_sessions s
+               JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+              WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
+                AND t.role IN ('agent_text', 'agent_thought') AND t.status = 'streaming'
+              RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
+        )
+        .bind(host_id)
+        .fetch_all(&st.pool)
+        .await
+        .unwrap_or_default();
+
+        for r in &settled_streams {
+            let tv = turn_from_row(r);
+            broadcast_acp(
+                &st,
+                uid,
+                "turn_upserted",
+                json!({ "session_id": tv.session_id, "turn": tv }),
+            );
+        }
+
+        let failed_tools = sqlx::query(
+            "UPDATE acp_turns t
+                SET status = 'failed',
+                    payload = jsonb_set(t.payload, '{is_error}', 'true'::jsonb),
+                    updated_at = now()
+               FROM acp_sessions s
+               JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+              WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
+                AND t.role = 'tool_call' AND t.status IN ('pending', 'in_progress')
+              RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
+        )
+        .bind(host_id)
+        .fetch_all(&st.pool)
+        .await
+        .unwrap_or_default();
+
+        for r in &failed_tools {
+            let tv = turn_from_row(r);
+            broadcast_acp(
+                &st,
+                uid,
+                "turn_upserted",
+                json!({ "session_id": tv.session_id, "turn": tv }),
+            );
+        }
+
+        for sess_id in paused_sessions {
+            broadcast_acp(
+                &st,
+                uid,
+                "session_activity",
+                json!({ "session_id": sess_id, "phase": "idle", "detail": "" }),
             );
         }
 
@@ -299,6 +361,25 @@ async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str
                 }
             }
         }
+        "agent_models" => {
+            let Some(agent_id) = v["agent_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+                return;
+            };
+            let session_id = v["session_id"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+            let probed_default = v["default_model"].as_str();
+            let probed_options: Vec<String> =
+                serde_json::from_value(v["model_options"].clone()).unwrap_or_default();
+            let _ = apply_agent_probed_models(
+                st,
+                uid,
+                agent_id,
+                Some(host_id),
+                session_id,
+                probed_default,
+                &probed_options,
+            )
+            .await;
+        }
         "session_update" => {
             handle_session_update(st, uid, host_id, &v).await;
         }
@@ -367,98 +448,34 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
             }
         }
         "text_delta" | "text" => {
-            let turn_key: String = v["turn_key"].as_str().unwrap_or("").chars().take(120).collect();
-            let delta: String = v["delta"].as_str().unwrap_or("").chars().take(65536).collect();
-            let full_text: Option<String> = v["text"].as_str().map(|s| s.chars().take(262144).collect());
-            let done = v["done"].as_bool().unwrap_or(kind == "text");
-            let status = if done { "done" } else { "streaming" };
-
-            let mut tx = match st.pool.begin().await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(session_id = %sess_id, error = %e, "text_delta begin tx failed");
-                    return;
-                }
-            };
-            let locked = sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM acp_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
-            )
-            .bind(sess_id)
-            .bind(uid)
-            .fetch_optional(&mut *tx)
-            .await
-            .ok()
-            .flatten();
-            if locked.is_none() {
-                return;
-            }
-
-            let updated_existing = if !turn_key.is_empty() {
-                sqlx::query(
-                    "UPDATE acp_turns
-                        SET payload = jsonb_build_object(
-                                'turn_key', $3::text,
-                                'text', CASE WHEN $4::text IS NOT NULL
-                                             THEN left($4, 262144)
-                                             ELSE left(COALESCE(payload->>'text', '') || $5::text, 262144)
-                                        END
-                            ),
-                            status = $6,
-                            updated_at = now()
-                      WHERE id = (
-                          SELECT id FROM acp_turns
-                           WHERE acp_session_id = $1 AND role = 'agent_text'
-                             AND payload->>'turn_key' = $2
-                           LIMIT 1
-                      )
-                      RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
-                )
-                .bind(sess_id)
-                .bind(&turn_key)
-                .bind(&turn_key)
-                .bind(full_text.as_deref())
-                .bind(&delta)
-                .bind(status)
-                .fetch_optional(&mut *tx)
-                .await
-                .unwrap_or(None)
+            upsert_stream_turn(st, sess_id, uid, "agent_text", kind, v).await;
+        }
+        "thought_delta" | "thought" => {
+            upsert_stream_turn(st, sess_id, uid, "agent_thought", kind, v).await;
+        }
+        "tool_call" => {
+            handle_tool_call_update(st, sess_id, uid, v).await;
+        }
+        "activity" => {
+            let phase = truncate_chars(v["phase"].as_str().unwrap_or("").trim(), 40);
+            let detail = truncate_chars(v["detail"].as_str().unwrap_or("").trim(), 240);
+            let usage = if v["usage"].is_object() {
+                v["usage"].clone()
             } else {
-                None
+                Value::Null
             };
-
-            let row = match updated_existing {
-                Some(r) => Some(r),
-                None => {
-                    let initial = full_text.unwrap_or(delta);
-                    match insert_turn_tx(
-                        &mut *tx,
-                        sess_id,
-                        uid,
-                        "agent_text",
-                        status,
-                        &json!({ "turn_key": turn_key, "text": initial }),
-                    )
-                    .await
-                    {
-                        Ok(r) => Some(r),
-                        Err(e) => {
-                            tracing::warn!(session_id = %sess_id, error = %e, "insert text turn failed");
-                            None
-                        }
-                    }
-                }
-            };
-
-            if row.is_some() && tx.commit().await.is_ok() {
-                if let Some(r) = row {
-                    let tv = turn_from_row(&r);
-                    broadcast_acp(
-                        st,
-                        uid,
-                        "turn_upserted",
-                        json!({ "session_id": sess_id, "turn": tv }),
-                    );
-                }
+            if !phase.is_empty() || !usage.is_null() {
+                broadcast_acp(
+                    st,
+                    uid,
+                    "session_activity",
+                    json!({
+                        "session_id": sess_id,
+                        "phase": phase,
+                        "detail": detail,
+                        "usage": usage,
+                    }),
+                );
             }
         }
         "terminal_out" => {
@@ -553,16 +570,70 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
             .execute(&st.pool)
             .await;
 
-            // 标记未完成计划项 & 流式消息收敛为 done
-            let _ = sqlx::query(
+            // 将残留的流式正文与思考块收敛为 done
+            let settled_streams = sqlx::query(
                 "UPDATE acp_turns SET status = 'done', updated_at = now()
-                  WHERE acp_session_id = $1 AND role = 'agent_text' AND status = 'streaming'",
+                  WHERE acp_session_id = $1
+                    AND role IN ('agent_text', 'agent_thought')
+                    AND status = 'streaming'
+                  RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
             )
             .bind(sess_id)
-            .execute(&st.pool)
-            .await;
+            .fetch_all(&st.pool)
+            .await
+            .unwrap_or_default();
+            for r in &settled_streams {
+                let tv = turn_from_row(r);
+                broadcast_acp(
+                    st,
+                    uid,
+                    "turn_upserted",
+                    json!({ "session_id": sess_id, "turn": tv }),
+                );
+            }
 
-            if let Some(err_msg) = v["error"].as_str().filter(|s| !s.is_empty()) {
+            let err_msg_opt = v["error"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let settled_tools = if err_msg_opt.is_some() {
+                sqlx::query(
+                    "UPDATE acp_turns
+                        SET status = 'failed',
+                            payload = jsonb_set(payload, '{is_error}', 'true'::jsonb),
+                            updated_at = now()
+                      WHERE acp_session_id = $1
+                        AND role = 'tool_call'
+                        AND status IN ('pending', 'in_progress')
+                      RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+                )
+                .bind(sess_id)
+                .fetch_all(&st.pool)
+                .await
+                .unwrap_or_default()
+            } else {
+                sqlx::query(
+                    "UPDATE acp_turns
+                        SET status = 'completed',
+                            updated_at = now()
+                      WHERE acp_session_id = $1
+                        AND role = 'tool_call'
+                        AND status IN ('pending', 'in_progress')
+                      RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+                )
+                .bind(sess_id)
+                .fetch_all(&st.pool)
+                .await
+                .unwrap_or_default()
+            };
+            for r in &settled_tools {
+                let tv = turn_from_row(r);
+                broadcast_acp(
+                    st,
+                    uid,
+                    "turn_upserted",
+                    json!({ "session_id": sess_id, "turn": tv }),
+                );
+            }
+
+            if let Some(err_msg) = err_msg_opt {
                 if let Some(r) = insert_turn(
                     st,
                     sess_id,
@@ -610,8 +681,392 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
             if let Ok(s) = load_session_meta(&st.pool, uid, sess_id).await {
                 broadcast_acp(st, uid, "session_upserted", json!({ "session": s }));
             }
+            broadcast_acp(
+                st,
+                uid,
+                "session_activity",
+                json!({ "session_id": sess_id, "phase": "idle", "detail": "" }),
+            );
         }
         _ => {}
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+fn normalize_tool_status(raw: Option<&str>) -> Option<&'static str> {
+    match raw.map(str::trim) {
+        Some("pending") => Some("pending"),
+        Some("in_progress") => Some("in_progress"),
+        Some("completed") => Some("completed"),
+        Some("failed") => Some("failed"),
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_tool_call_payload(
+    existing: Option<&Value>,
+    incoming: &Value,
+    tool_call_id: &str,
+) -> Value {
+    let name = incoming["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 120))
+        .unwrap_or_else(|| {
+            existing
+                .and_then(|e| e["name"].as_str())
+                .unwrap_or("")
+                .to_string()
+        });
+
+    let kind = incoming["tool_kind"]
+        .as_str()
+        .or_else(|| incoming["kind"].as_str().filter(|s| *s != "tool_call"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 40))
+        .unwrap_or_else(|| {
+            existing
+                .and_then(|e| e["kind"].as_str())
+                .unwrap_or("other")
+                .to_string()
+        });
+
+    let title = incoming["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 300))
+        .unwrap_or_else(|| {
+            existing
+                .and_then(|e| e["title"].as_str())
+                .unwrap_or("")
+                .to_string()
+        });
+
+    let input = match &incoming["input"] {
+        Value::String(s) if !s.is_empty() => truncate_chars(s, 16_384),
+        Value::Object(_) | Value::Array(_) => {
+            let s = serde_json::to_string_pretty(&incoming["input"]).unwrap_or_default();
+            if s.is_empty() {
+                existing
+                    .and_then(|e| e["input"].as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                truncate_chars(&s, 16_384)
+            }
+        }
+        _ => existing
+            .and_then(|e| e["input"].as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+
+    let prev_output = existing.and_then(|e| e["output"].as_str()).unwrap_or("");
+    let output = if let Some(s) = incoming["output"].as_str().filter(|s| !s.is_empty()) {
+        truncate_chars(s, 65_536)
+    } else if let Some(delta) = incoming["output_delta"].as_str().filter(|d| !d.is_empty()) {
+        let mut combined = String::with_capacity(
+            prev_output
+                .len()
+                .saturating_add(delta.len())
+                .min(65_536 * 4),
+        );
+        combined.push_str(prev_output);
+        combined.push_str(delta);
+        truncate_chars(&combined, 65_536)
+    } else {
+        prev_output.to_string()
+    };
+
+    let locations: Vec<String> = incoming["locations"]
+        .as_array()
+        .filter(|arr| !arr.is_empty())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .take(20)
+                .map(|s| truncate_chars(s, 300))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            existing
+                .and_then(|e| serde_json::from_value::<Vec<String>>(e["locations"].clone()).ok())
+                .unwrap_or_default()
+        });
+
+    let diffs: Vec<Value> = incoming["diffs"]
+        .as_array()
+        .filter(|arr| !arr.is_empty())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    let path = d["path"].as_str()?.trim();
+                    if path.is_empty() {
+                        return None;
+                    }
+                    let old_text = d["old_text"].as_str().map(|s| truncate_chars(s, 32_768));
+                    let new_text = truncate_chars(d["new_text"].as_str().unwrap_or(""), 32_768);
+                    Some(json!({
+                        "path": truncate_chars(path, 300),
+                        "old_text": old_text,
+                        "new_text": new_text,
+                    }))
+                })
+                .take(10)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            existing
+                .and_then(|e| e["diffs"].as_array().cloned())
+                .unwrap_or_default()
+        });
+
+    let duration_ms = incoming["duration_ms"]
+        .as_u64()
+        .or_else(|| existing.and_then(|e| e["duration_ms"].as_u64()));
+
+    let status_norm = normalize_tool_status(incoming["status"].as_str());
+    let is_error = incoming["is_error"].as_bool().unwrap_or_else(|| {
+        if status_norm == Some("failed") {
+            true
+        } else if status_norm == Some("completed") {
+            false
+        } else {
+            existing
+                .and_then(|e| e["is_error"].as_bool())
+                .unwrap_or(false)
+        }
+    });
+
+    let mut out = json!({
+        "tool_call_id": tool_call_id,
+        "name": name,
+        "kind": kind,
+        "title": title,
+        "input": input,
+        "output": output,
+        "locations": locations,
+        "diffs": diffs,
+        "is_error": is_error,
+    });
+    if let Some(ms) = duration_ms {
+        out["duration_ms"] = json!(ms);
+    }
+    out
+}
+
+async fn upsert_stream_turn(
+    st: &SharedState,
+    sess_id: Uuid,
+    uid: Uuid,
+    role: &str,
+    kind: &str,
+    v: &Value,
+) {
+    let turn_key = truncate_chars(v["turn_key"].as_str().unwrap_or(""), 120);
+    let delta = truncate_chars(v["delta"].as_str().unwrap_or(""), 65_536);
+    let full_text: Option<String> = v["text"].as_str().map(|s| truncate_chars(s, 262_144));
+    let done = v["done"]
+        .as_bool()
+        .unwrap_or(kind == "text" || kind == "thought");
+    let duration_ms: Option<i64> = v["duration_ms"]
+        .as_u64()
+        .and_then(|n| i64::try_from(n).ok());
+    let status = if done { "done" } else { "streaming" };
+
+    let mut tx = match st.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(session_id = %sess_id, role, error = %e, "stream_turn begin tx failed");
+            return;
+        }
+    };
+    let locked = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM acp_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(sess_id)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .ok()
+    .flatten();
+    if locked.is_none() {
+        return;
+    }
+
+    let updated_existing = if !turn_key.is_empty() {
+        sqlx::query(
+            "UPDATE acp_turns
+                SET payload = jsonb_strip_nulls(jsonb_build_object(
+                        'turn_key', $4::text,
+                        'text', CASE WHEN $5::text IS NOT NULL
+                                     THEN left($5, 262144)
+                                     ELSE left(COALESCE(payload->>'text', '') || $6::text, 262144)
+                                END,
+                        'duration_ms', COALESCE(to_jsonb($7::bigint), payload->'duration_ms')
+                    )),
+                    status = $8,
+                    updated_at = now()
+              WHERE id = (
+                  SELECT id FROM acp_turns
+                   WHERE acp_session_id = $1 AND role = $2
+                     AND payload->>'turn_key' = $3
+                   LIMIT 1
+              )
+              RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+        )
+        .bind(sess_id)
+        .bind(role)
+        .bind(&turn_key)
+        .bind(&turn_key)
+        .bind(full_text.as_deref())
+        .bind(&delta)
+        .bind(duration_ms)
+        .bind(status)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap_or(None)
+    } else {
+        None
+    };
+
+    let row = match updated_existing {
+        Some(r) => Some(r),
+        None => {
+            let initial = full_text.unwrap_or(delta);
+            let mut initial_payload = json!({ "turn_key": turn_key, "text": initial });
+            if let Some(ms) = duration_ms {
+                initial_payload["duration_ms"] = json!(ms);
+            }
+            match insert_turn_tx(&mut *tx, sess_id, uid, role, status, &initial_payload).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(session_id = %sess_id, role, error = %e, "insert stream turn failed");
+                    None
+                }
+            }
+        }
+    };
+
+    if row.is_some() && tx.commit().await.is_ok() {
+        if let Some(r) = row {
+            let tv = turn_from_row(&r);
+            broadcast_acp(
+                st,
+                uid,
+                "turn_upserted",
+                json!({ "session_id": sess_id, "turn": tv }),
+            );
+        }
+    }
+}
+
+async fn handle_tool_call_update(st: &SharedState, sess_id: Uuid, uid: Uuid, v: &Value) {
+    let tool_call_id = v["tool_call_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 128))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut tx = match st.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(session_id = %sess_id, error = %e, "tool_call begin tx failed");
+            return;
+        }
+    };
+    let locked = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM acp_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(sess_id)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .ok()
+    .flatten();
+    if locked.is_none() {
+        return;
+    }
+
+    let existing = sqlx::query_as::<_, (Uuid, String, Value)>(
+        "SELECT id, status, payload FROM acp_turns
+          WHERE acp_session_id = $1 AND role = 'tool_call'
+            AND payload->>'tool_call_id' = $2
+          LIMIT 1",
+    )
+    .bind(sess_id)
+    .bind(&tool_call_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .ok()
+    .flatten();
+
+    let next_status = normalize_tool_status(v["status"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|(_, st_s, _)| st_s.clone())
+                .unwrap_or_else(|| "in_progress".to_string())
+        });
+
+    let merged_payload = merge_tool_call_payload(
+        existing.as_ref().map(|(_, _, p)| p),
+        v,
+        &tool_call_id,
+    );
+
+    let row = match existing {
+        Some((turn_id, _, _)) => sqlx::query(
+            "UPDATE acp_turns
+                SET status = $2, payload = $3, updated_at = now()
+              WHERE id = $1
+              RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+        )
+        .bind(turn_id)
+        .bind(&next_status)
+        .bind(&merged_payload)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten(),
+        None => {
+            match insert_turn_tx(
+                &mut *tx,
+                sess_id,
+                uid,
+                "tool_call",
+                &next_status,
+                &merged_payload,
+            )
+            .await
+            {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(session_id = %sess_id, error = %e, "insert tool_call turn failed");
+                    None
+                }
+            }
+        }
+    };
+
+    if row.is_some() && tx.commit().await.is_ok() {
+        if let Some(r) = row {
+            let tv = turn_from_row(&r);
+            broadcast_acp(
+                st,
+                uid,
+                "turn_upserted",
+                json!({ "session_id": sess_id, "turn": tv }),
+            );
+        }
     }
 }
 
@@ -684,5 +1139,81 @@ pub(crate) async fn insert_turn(
             tracing::warn!(session_id = %sess_id, error = %e, "insert_turn failed");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_tool_call_payload;
+    use serde_json::json;
+
+    #[test]
+    fn merge_tool_call_payload_supports_sparse_patch_delta_and_diffs() {
+        let initial = merge_tool_call_payload(
+            None,
+            &json!({
+                "kind": "tool_call",
+                "tool_call_id": "call-1",
+                "name": "edit",
+                "tool_kind": "edit",
+                "title": "修改 main.rs",
+                "input": "{\"path\":\"src/main.rs\"}",
+                "locations": ["src/main.rs:12"],
+                "diffs": [{ "path": "src/main.rs", "old_text": "old", "new_text": "new" }],
+                "status": "in_progress"
+            }),
+            "call-1",
+        );
+        assert_eq!(initial["tool_call_id"], "call-1");
+        assert_eq!(initial["kind"], "edit");
+        assert_eq!(initial["title"], "修改 main.rs");
+        assert_eq!(initial["locations"], json!(["src/main.rs:12"]));
+        assert_eq!(initial["diffs"][0]["new_text"], "new");
+        assert_eq!(initial["is_error"], false);
+
+        // 增量追加输出且保留既有 name / title / diffs
+        let chunk1 = merge_tool_call_payload(
+            Some(&initial),
+            &json!({
+                "kind": "tool_call",
+                "tool_call_id": "call-1",
+                "output_delta": "line 1\n"
+            }),
+            "call-1",
+        );
+        assert_eq!(chunk1["name"], "edit");
+        assert_eq!(chunk1["kind"], "edit");
+        assert_eq!(chunk1["output"], "line 1\n");
+        assert_eq!(chunk1["diffs"][0]["path"], "src/main.rs");
+
+        let chunk2 = merge_tool_call_payload(
+            Some(&chunk1),
+            &json!({
+                "output_delta": "line 2\n",
+                "duration_ms": 420,
+                "status": "completed"
+            }),
+            "call-1",
+        );
+        assert_eq!(chunk2["output"], "line 1\nline 2\n");
+        assert_eq!(chunk2["duration_ms"], 420);
+        assert_eq!(chunk2["is_error"], false);
+
+        // 全量 output 覆盖旧值且 failed 自动置 is_error=true
+        let failed = merge_tool_call_payload(
+            Some(&chunk2),
+            &json!({
+                "output": "final error output",
+                "status": "failed"
+            }),
+            "call-1",
+        );
+        assert_eq!(failed["output"], "final error output");
+        assert_eq!(failed["is_error"], true);
+
+        // 超长输出截断到 65536 字符
+        let huge = "x".repeat(70_000);
+        let capped = merge_tool_call_payload(None, &json!({ "output": huge }), "call-2");
+        assert_eq!(capped["output"].as_str().unwrap().chars().count(), 65_536);
     }
 }

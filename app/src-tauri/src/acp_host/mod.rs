@@ -4,6 +4,7 @@ mod command;
 mod dirs;
 mod permission;
 mod pi_rpc_client;
+mod stream_buf;
 
 use acp_client::{PendingPerms, PromptStartMsg};
 use futures_util::{SinkExt, StreamExt};
@@ -20,12 +21,28 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrustStore {
     #[serde(default)]
     allow_all_local: bool,
+    #[serde(default = "default_true")]
+    cloud_control_enabled: bool,
     #[serde(default)]
     approved: HashSet<String>,
+}
+
+impl Default for TrustStore {
+    fn default() -> Self {
+        Self {
+            allow_all_local: false,
+            cloud_control_enabled: true,
+            approved: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +55,7 @@ struct HeadlessAuthStore {
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalPolicyView {
     pub allow_all_local: bool,
+    pub cloud_control_enabled: bool,
     pub approved_count: usize,
 }
 
@@ -57,6 +75,11 @@ enum ExecGate {
 
 pub struct AcpHostState {
     stop_tx: Mutex<Option<watch::Sender<bool>>>,
+    current_host_id: Arc<Mutex<Option<String>>>,
+    probing_cmds: Arc<Mutex<HashSet<String>>>,
+    local_pending_perms: PendingPerms,
+    local_perm_cache: Arc<Mutex<PermissionCache>>,
+    local_running_cancels: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     ticket_wait: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>,
     exec_confirm_wait: ExecConfirmWait,
     trust: Arc<Mutex<TrustStore>>,
@@ -66,6 +89,11 @@ impl AcpHostState {
     pub fn new() -> Self {
         Self {
             stop_tx: Mutex::new(None),
+            current_host_id: Arc::new(Mutex::new(None)),
+            probing_cmds: Arc::new(Mutex::new(HashSet::new())),
+            local_pending_perms: Arc::new(Mutex::new(HashMap::new())),
+            local_perm_cache: Arc::new(Mutex::new(PermissionCache::default())),
+            local_running_cancels: Arc::new(Mutex::new(HashMap::new())),
             ticket_wait: Arc::new(Mutex::new(HashMap::new())),
             exec_confirm_wait: Arc::new(Mutex::new(HashMap::new())),
             trust: Arc::new(Mutex::new(load_trust_store())),
@@ -362,6 +390,9 @@ pub async fn acp_host_start(
     server_url: String,
     host_name: Option<String>,
 ) -> Result<(), String> {
+    if !state.trust.lock().unwrap().cloud_control_enabled {
+        return Ok(());
+    }
     ensure_rustls_ring();
     if let Some(prev) = state.stop_tx.lock().unwrap().take() {
         let _ = prev.send(true);
@@ -377,6 +408,7 @@ pub async fn acp_host_start(
         waiters: state.ticket_wait.clone(),
     });
     let trust = state.trust.clone();
+    let current_hid = state.current_host_id.clone();
     let gate = ExecGate::Desktop {
         app: app.clone(),
         waiters: state.exec_confirm_wait.clone(),
@@ -384,6 +416,9 @@ pub async fn acp_host_start(
 
     tauri::async_runtime::spawn(async move {
         let on_status = |online: bool, host_id: Option<String>| {
+            if let Some(ref id) = host_id {
+                *current_hid.lock().unwrap() = Some(id.clone());
+            }
             let _ = app.emit(
                 "acp-host:status",
                 json!({ "online": online, "host_id": host_id }),
@@ -431,6 +466,7 @@ pub async fn acp_host_local_policy(
     let guard = state.trust.lock().unwrap();
     Ok(LocalPolicyView {
         allow_all_local: guard.allow_all_local,
+        cloud_control_enabled: guard.cloud_control_enabled,
         approved_count: guard.approved.len(),
     })
 }
@@ -445,8 +481,107 @@ pub async fn acp_host_set_local_allow_all(
     save_trust_store(&guard)?;
     Ok(LocalPolicyView {
         allow_all_local: guard.allow_all_local,
+        cloud_control_enabled: guard.cloud_control_enabled,
         approved_count: guard.approved.len(),
     })
+}
+
+#[tauri::command]
+pub async fn acp_host_set_cloud_control(
+    state: State<'_, AcpHostState>,
+    enabled: bool,
+) -> Result<LocalPolicyView, String> {
+    let view = {
+        let mut guard = state.trust.lock().unwrap();
+        guard.cloud_control_enabled = enabled;
+        save_trust_store(&guard)?;
+        LocalPolicyView {
+            allow_all_local: guard.allow_all_local,
+            cloud_control_enabled: guard.cloud_control_enabled,
+            approved_count: guard.approved.len(),
+        }
+    };
+    if !enabled {
+        if let Some(prev) = state.stop_tx.lock().unwrap().take() {
+            let _ = prev.send(true);
+        }
+        *state.current_host_id.lock().unwrap() = None;
+        state.ticket_wait.lock().unwrap().clear();
+        state.exec_confirm_wait.lock().unwrap().clear();
+    }
+    Ok(view)
+}
+
+#[tauri::command]
+pub async fn acp_host_local_prompt_start(
+    app: AppHandle,
+    state: State<'_, AcpHostState>,
+    mut msg: PromptStartMsg,
+) -> Result<(), String> {
+    let raw_cwd = Path::new(&msg.cwd);
+    let canon_cwd = permission::resolve_path(raw_cwd)
+        .ok_or_else(|| format!("工作区路径无效：{}", msg.cwd))?;
+    if !canon_cwd.exists() || !canon_cwd.is_dir() {
+        return Err(format!("工作区目录不存在：{}", msg.cwd));
+    }
+    if dirs::is_sensitive_path(&canon_cwd) {
+        return Err("拒绝访问敏感系统目录".into());
+    }
+    let allow_all_local = state.trust.lock().unwrap().allow_all_local;
+    if !allow_all_local && msg.permission_policy == "allow_all" {
+        msg.permission_policy = "auto_read".to_string();
+    }
+
+    let sid = msg.session_id.clone();
+    let (ctx, crx) = watch::channel(false);
+    if let Some(old) = state
+        .local_running_cancels
+        .lock()
+        .unwrap()
+        .insert(sid.clone(), ctx)
+    {
+        let _ = old.send(true);
+    }
+
+    let (tx, mut rx) = mpsc::channel::<Value>(128);
+    let app_for_events = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let _ = app_for_events.emit("acp-host:local-event", ev);
+        }
+    });
+
+    let perms = state.local_pending_perms.clone();
+    let cache = state.local_perm_cache.clone();
+    let cancels = state.local_running_cancels.clone();
+    tauri::async_runtime::spawn(async move {
+        acp_client::run_prompt_task(msg, tx, perms, cache, crx).await;
+        cancels.lock().unwrap().remove(&sid);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn acp_host_local_prompt_cancel(
+    state: State<'_, AcpHostState>,
+    session_id: String,
+) -> Result<(), String> {
+    if let Some(ctx) = state.local_running_cancels.lock().unwrap().get(&session_id) {
+        let _ = ctx.send(true);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn acp_host_local_permission_reply(
+    state: State<'_, AcpHostState>,
+    req_id: String,
+    option_id: String,
+) -> Result<(), String> {
+    if let Some(tx) = state.local_pending_perms.lock().unwrap().remove(&req_id) {
+        let _ = tx.send(option_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -454,9 +589,98 @@ pub async fn acp_host_stop(state: State<'_, AcpHostState>) -> Result<(), String>
     if let Some(prev) = state.stop_tx.lock().unwrap().take() {
         let _ = prev.send(true);
     }
+    *state.current_host_id.lock().unwrap() = None;
     state.ticket_wait.lock().unwrap().clear();
     state.exec_confirm_wait.lock().unwrap().clear();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn acp_host_info(state: State<'_, AcpHostState>) -> Result<Value, String> {
+    let host_id = state.current_host_id.lock().unwrap().clone();
+    Ok(json!({
+        "host_id": host_id,
+        "install_id": install_id(),
+        "name": default_host_name(),
+        "os": host_os_label(),
+        "roots": dirs::roots(),
+    }))
+}
+
+#[tauri::command]
+pub async fn acp_host_list_dir(path: String) -> Result<Value, String> {
+    dirs::list_dir(&path)
+}
+
+#[tauri::command]
+pub async fn acp_host_probe_workspace(cwd: String) -> Result<Value, String> {
+    command::probe_workspace(&cwd).await
+}
+
+#[tauri::command]
+pub async fn acp_host_git_checkout(cwd: String, branch: String) -> Result<Value, String> {
+    command::git_checkout(&cwd, &branch).await
+}
+
+#[tauri::command]
+pub async fn acp_host_probe_agent(
+    state: State<'_, AcpHostState>,
+    preset: Option<String>,
+    cmd: String,
+    env: Option<HashMap<String, String>>,
+    cwd: Option<String>,
+    auto_install: Option<bool>,
+    probe_models: Option<bool>,
+) -> Result<Value, String> {
+    let preset_str = preset.unwrap_or_default();
+    let env_map = env.unwrap_or_default();
+    if has_unsafe_probe_env(&env_map) {
+        return Err("环境变量包含受限的系统加载器参数".into());
+    }
+
+    let mut info = command::probe_agent(&cmd);
+    let mut ready = info["ok"].as_bool() == Some(true);
+    let installable = info["installable"].as_bool() == Some(true);
+
+    if !ready && installable && auto_install.unwrap_or(false) {
+        if let Ok((prog, _)) = command::split_cmdline(&cmd) {
+            if let Some(spec) = adapters::lookup_npm_adapter(&prog) {
+                adapters::ensure_npm_adapter(spec, &host_data_dir(), None).await?;
+                ready = true;
+                info["ok"] = json!(true);
+            }
+        }
+    }
+
+    let status = if ready {
+        "online"
+    } else if installable {
+        "installing"
+    } else {
+        "standby"
+    };
+    info["status"] = json!(status);
+
+    if ready && probe_models.unwrap_or(false) {
+        let dedup_key = format!("{}::{}", preset_str.trim(), cmd.trim());
+        let acquired = state.probing_cmds.lock().unwrap().insert(dedup_key.clone());
+        if acquired {
+            let res = acp_client::probe_models(
+                &preset_str,
+                &cmd,
+                &env_map,
+                cwd.as_deref(),
+                Duration::from_secs(12),
+            )
+            .await;
+            state.probing_cmds.lock().unwrap().remove(&dedup_key);
+            let probed = res?;
+            info["default_model"] = json!(probed.default_model);
+            info["model_options"] = json!(probed.model_options);
+        }
+    }
+
+    Ok(info)
 }
 
 async fn run_host_loop(
@@ -547,6 +771,7 @@ async fn run_one_connection(
     let perm_cache = Arc::new(Mutex::new(PermissionCache::default()));
     let running_cancels: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let probing_agents: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let mut permanent_stop = false;
     loop {
@@ -593,26 +818,50 @@ async fn run_one_connection(
                             }
                             Some("rpc_call") => {
                                 let tx = out_tx.clone();
+                                let trust_clone = trust.clone();
+                                let gate_clone = exec_gate.clone();
                                 tokio::spawn(async move {
-                                    handle_rpc_call(v, tx).await;
+                                    handle_rpc_call(v, tx, trust_clone, gate_clone).await;
                                 });
                             }
                             Some("ensure_agent") => {
                                 let agent_id = v["agent_id"].as_str().unwrap_or("").to_string();
+                                let preset = v["preset"].as_str().unwrap_or("").to_string();
                                 let cmd_str = v["cmd"].as_str().unwrap_or("").to_string();
+                                let env_map = parse_env_map(&v["env"]);
                                 if !agent_id.is_empty() && !cmd_str.is_empty() {
                                     if let Ok((prog, _)) = command::split_cmdline(&cmd_str) {
+                                        let trust_clone = trust.clone();
+                                        let gate_clone = exec_gate.clone();
                                         if adapters::resolve_agent_program(&prog).is_some() {
-                                            let _ = out_tx
-                                                .send(json!({
-                                                    "type": "agent_status",
-                                                    "agent_id": agent_id,
-                                                    "status": "online",
-                                                }))
+                                            let tx = out_tx.clone();
+                                            let probing = probing_agents.clone();
+                                            tokio::spawn(async move {
+                                                let _ = tx
+                                                    .send(json!({
+                                                        "type": "agent_status",
+                                                        "agent_id": agent_id,
+                                                        "status": "online",
+                                                    }))
+                                                    .await;
+                                                spawn_dedup_model_probe(
+                                                    probing,
+                                                    tx,
+                                                    agent_id,
+                                                    None,
+                                                    preset,
+                                                    cmd_str,
+                                                    env_map,
+                                                    None,
+                                                    trust_clone,
+                                                    gate_clone,
+                                                )
                                                 .await;
+                                            });
                                         } else if let Some(spec) = adapters::lookup_npm_adapter(&prog) {
                                             let tx = out_tx.clone();
                                             let mut stop_watch = stop_rx.clone();
+                                            let probing = probing_agents.clone();
                                             tokio::spawn(async move {
                                                 let _ = tx
                                                     .send(json!({
@@ -621,16 +870,14 @@ async fn run_one_connection(
                                                         "status": "installing",
                                                     }))
                                                     .await;
-                                                let status = match adapters::ensure_npm_adapter(
+                                                let installed = adapters::ensure_npm_adapter(
                                                     spec,
                                                     &host_data_dir(),
                                                     Some(&mut stop_watch),
                                                 )
                                                 .await
-                                                {
-                                                    Ok(_) => "online",
-                                                    Err(_) => "standby",
-                                                };
+                                                .is_ok();
+                                                let status = if installed { "online" } else { "standby" };
                                                 let _ = tx
                                                     .send(json!({
                                                         "type": "agent_status",
@@ -638,13 +885,62 @@ async fn run_one_connection(
                                                         "status": status,
                                                     }))
                                                     .await;
+                                                if installed {
+                                                    spawn_dedup_model_probe(
+                                                        probing,
+                                                        tx,
+                                                        agent_id,
+                                                        None,
+                                                        preset,
+                                                        cmd_str,
+                                                        env_map,
+                                                        None,
+                                                        trust_clone,
+                                                        gate_clone,
+                                                    )
+                                                    .await;
+                                                }
                                             });
                                         }
                                     }
                                 }
                             }
+                            Some("probe_agent_models") => {
+                                let agent_id = v["agent_id"].as_str().unwrap_or("").to_string();
+                                let session_id = v["session_id"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string);
+                                let preset = v["preset"].as_str().unwrap_or("").to_string();
+                                let cmd_str = v["cmd"].as_str().unwrap_or("").to_string();
+                                let cwd = v["cwd"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string);
+                                let env_map = parse_env_map(&v["env"]);
+                                if !agent_id.is_empty() && !cmd_str.is_empty() {
+                                    let tx = out_tx.clone();
+                                    let probing = probing_agents.clone();
+                                    let trust_clone = trust.clone();
+                                    let gate_clone = exec_gate.clone();
+                                    tokio::spawn(async move {
+                                        spawn_dedup_model_probe(
+                                            probing,
+                                            tx,
+                                            agent_id,
+                                            session_id,
+                                            preset,
+                                            cmd_str,
+                                            env_map,
+                                            cwd,
+                                            trust_clone,
+                                            gate_clone,
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
                             Some("prompt_start") => {
-                                let turn_id_val = v["turn_id"].clone();
                                 if let Ok(mut msg) = serde_json::from_value::<PromptStartMsg>(v) {
                                     let sid = msg.session_id.clone();
                                     let (ctx, mut crx) = watch::channel(false);
@@ -677,11 +973,9 @@ async fn run_one_connection(
                                             Err(err_msg) => {
                                                 let _ = tx
                                                     .send(json!({
-                                                        "type": "prompt_done",
+                                                        "type": "session_update",
                                                         "session_id": msg.session_id,
-                                                        "turn_id": turn_id_val,
-                                                        "status": "error",
-                                                        "stop_reason": "refused",
+                                                        "kind": "prompt_done",
                                                         "error": err_msg,
                                                     }))
                                                     .await;
@@ -729,7 +1023,12 @@ async fn run_one_connection(
     permanent_stop
 }
 
-async fn handle_rpc_call(v: Value, out_tx: mpsc::Sender<Value>) {
+async fn handle_rpc_call(
+    v: Value,
+    out_tx: mpsc::Sender<Value>,
+    trust: Arc<Mutex<TrustStore>>,
+    exec_gate: ExecGate,
+) {
     let req_id = v["req_id"].as_str().unwrap_or("").to_string();
     let method = v["method"].as_str().unwrap_or("");
     let params = &v["params"];
@@ -745,6 +1044,30 @@ async fn handle_rpc_call(v: Value, out_tx: mpsc::Sender<Value>) {
             .await
         }
         "probe_agent" => Ok(command::probe_agent(params["cmd"].as_str().unwrap_or(""))),
+        "probe_agent_models" => {
+            let cmd_str = params["cmd"].as_str().unwrap_or("");
+            let preset = params["preset"].as_str().unwrap_or("");
+            let cwd = params["cwd"].as_str().filter(|s| !s.is_empty());
+            let env_map = parse_env_map(&params["env"]);
+            if !can_auto_probe_agent(cmd_str, &env_map, &trust, &exec_gate) {
+                Err("该自定义启动命令尚未通过本机安全授权，首次发送对话确认后将自动同步模型".into())
+            } else {
+                acp_client::probe_models(
+                    preset,
+                    cmd_str,
+                    &env_map,
+                    cwd,
+                    Duration::from_secs(10),
+                )
+                .await
+                .map(|probed| {
+                    json!({
+                        "default_model": probed.default_model,
+                        "model_options": probed.model_options,
+                    })
+                })
+            }
+        }
         other => Err(format!("unknown rpc method: {other}")),
     };
 
@@ -753,6 +1076,147 @@ async fn handle_rpc_call(v: Value, out_tx: mpsc::Sender<Value>) {
         Err(err) => json!({ "type": "rpc_result", "req_id": req_id, "ok": false, "error": err }),
     };
     let _ = out_tx.send(frame).await;
+}
+
+fn parse_env_map(raw: &Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(obj) = raw.as_object() else {
+        return out;
+    };
+    for (k, v) in obj {
+        if let Some(s) = v.as_str() {
+            if !k.trim().is_empty() && !s.is_empty() {
+                out.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_allowlisted_probe_invocation(prog: &str, args: &[String]) -> bool {
+    let trimmed = prog.trim();
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') {
+        return false;
+    }
+    let stem = if cfg!(windows) {
+        let low = trimmed.to_ascii_lowercase();
+        low.strip_suffix(".cmd")
+            .or_else(|| low.strip_suffix(".exe"))
+            .or_else(|| low.strip_suffix(".bat"))
+            .unwrap_or(&low)
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    match stem.as_str() {
+        "codex-acp" | "claude-agent-acp" => args.is_empty(),
+        "gemini" => args.len() == 1 && args[0] == "--acp",
+        "opencode" => args.len() == 1 && args[0] == "acp",
+        "pi" => {
+            args.is_empty()
+                || (args.len() == 1 && args[0] == "--mode=rpc")
+                || (args.len() == 2 && args[0] == "--mode" && args[1] == "rpc")
+        }
+        _ => false,
+    }
+}
+
+fn has_unsafe_probe_env(env: &HashMap<String, String>) -> bool {
+    env.keys().any(|k| {
+        let up = k.trim().to_ascii_uppercase();
+        up.starts_with("LD_")
+            || up.starts_with("DYLD_")
+            || matches!(
+                up.as_str(),
+                "PATH"
+                    | "PATHEXT"
+                    | "NODE_OPTIONS"
+                    | "COMSPEC"
+                    | "BASH_ENV"
+                    | "ENV"
+                    | "SHELL"
+                    | "PYTHONPATH"
+                    | "RUBYOPT"
+                    | "PERL5OPT"
+            )
+    })
+}
+
+fn can_auto_probe_agent(
+    cmd_str: &str,
+    env: &HashMap<String, String>,
+    trust: &Arc<Mutex<TrustStore>>,
+    exec_gate: &ExecGate,
+) -> bool {
+    let Ok((prog, args)) = command::split_cmdline(cmd_str) else {
+        return false;
+    };
+    if is_allowlisted_probe_invocation(&prog, &args) && !has_unsafe_probe_env(env) {
+        return true;
+    }
+    if let ExecGate::Headless { trust_agents: true, .. } = exec_gate {
+        return true;
+    }
+    let sorted_env_val = json!(env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<BTreeMap<_, _>>());
+    let guard = trust.lock().unwrap();
+    if guard.allow_all_local {
+        return true;
+    }
+    guard.approved.iter().any(|fp| {
+        serde_json::from_str::<Value>(fp)
+            .ok()
+            .is_some_and(|v| v["cmd"].as_str() == Some(cmd_str) && v["env"] == sorted_env_val)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_dedup_model_probe(
+    probing_agents: Arc<Mutex<HashSet<String>>>,
+    tx: mpsc::Sender<Value>,
+    agent_id: String,
+    session_id: Option<String>,
+    preset: String,
+    cmd_str: String,
+    env_map: HashMap<String, String>,
+    cwd: Option<String>,
+    trust: Arc<Mutex<TrustStore>>,
+    exec_gate: ExecGate,
+) {
+    if !can_auto_probe_agent(&cmd_str, &env_map, &trust, &exec_gate) {
+        return;
+    }
+    {
+        let mut g = probing_agents.lock().unwrap();
+        if !g.insert(agent_id.clone()) {
+            return;
+        }
+    }
+    let res = acp_client::probe_models(
+        &preset,
+        &cmd_str,
+        &env_map,
+        cwd.as_deref(),
+        Duration::from_secs(10),
+    )
+    .await;
+    probing_agents.lock().unwrap().remove(&agent_id);
+
+    if let Ok(probed) = res {
+        if !probed.model_options.is_empty() {
+            let _ = tx
+                .send(json!({
+                    "type": "agent_models",
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "default_model": probed.default_model,
+                    "model_options": probed.model_options,
+                }))
+                .await;
+        }
+    }
 }
 
 async fn authorize_prompt_exec(
@@ -1081,5 +1545,83 @@ mod tests {
         e2.insert("A".into(), "9".into());
         let fp_diff_env = exec_fingerprint(Path::new("/tmp/w"), "claude", &e2);
         assert_ne!(fp1, fp_diff_env);
+    }
+
+    #[test]
+    fn auto_probe_allowlist_and_trust_guards_block_unapproved_commands() {
+        let trust = Arc::new(Mutex::new(TrustStore::default()));
+        let untrusted_gate = ExecGate::Headless {
+            trust_agents: false,
+            allow_cwds: vec![],
+        };
+        let mut safe_env = HashMap::new();
+        safe_env.insert("OPENAI_API_KEY".into(), "sk-test".into());
+
+        assert!(can_auto_probe_agent(
+            "codex-acp",
+            &safe_env,
+            &trust,
+            &untrusted_gate
+        ));
+        assert!(can_auto_probe_agent(
+            "gemini --acp",
+            &safe_env,
+            &trust,
+            &untrusted_gate
+        ));
+        assert!(can_auto_probe_agent(
+            "pi --mode rpc",
+            &safe_env,
+            &trust,
+            &untrusted_gate
+        ));
+
+        let mut hijack_env = safe_env.clone();
+        hijack_env.insert("NODE_OPTIONS".into(), "--require /tmp/evil.js".into());
+        assert!(!can_auto_probe_agent(
+            "codex-acp",
+            &hijack_env,
+            &trust,
+            &untrusted_gate
+        ));
+
+        assert!(!can_auto_probe_agent(
+            "/opt/custom/my-agent --acp",
+            &safe_env,
+            &trust,
+            &untrusted_gate
+        ));
+
+        let sorted_env: BTreeMap<String, String> = safe_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        trust.lock().unwrap().approved.insert(exec_fingerprint(
+            Path::new("/tmp/w"),
+            "/opt/custom/my-agent --acp",
+            &sorted_env,
+        ));
+        assert!(can_auto_probe_agent(
+            "/opt/custom/my-agent --acp",
+            &safe_env,
+            &trust,
+            &untrusted_gate
+        ));
+    }
+
+    #[test]
+    fn trust_store_defaults_cloud_control_enabled_true_and_roundtrips() {
+        let def = TrustStore::default();
+        assert!(def.cloud_control_enabled);
+        assert!(!def.allow_all_local);
+
+        let legacy: TrustStore = serde_json::from_str(r#"{"allow_all_local":true}"#).unwrap();
+        assert!(legacy.allow_all_local);
+        assert!(legacy.cloud_control_enabled);
+
+        let disabled: TrustStore =
+            serde_json::from_str(r#"{"allow_all_local":false,"cloud_control_enabled":false}"#)
+                .unwrap();
+        assert!(!disabled.cloud_control_enabled);
     }
 }

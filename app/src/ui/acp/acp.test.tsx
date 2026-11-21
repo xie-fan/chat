@@ -7,6 +7,7 @@ import {
 } from "../../store";
 import { nextQuickTheme, resolveRenderedDark } from "../../theme";
 import type { AcpAgent, AcpBootstrap, AcpHost, AcpSession, AcpTurn, AcpWorkspace } from "../../types";
+import { groupTurnsForDisplay } from "./AcpTurnView";
 import { agentStatusLabel, autoInstallPackageForCmd } from "./adapterHint";
 
 function baseState(): AppState {
@@ -42,6 +43,7 @@ function baseState(): AppState {
     acpWorkspaces: [],
     acpSessions: [],
     acpLoaded: false,
+    acpActivity: {},
     activeAcpHostId: null,
     activeAcpWorkspaceId: null,
     activeAcpSessionId: null,
@@ -252,5 +254,192 @@ describe("Theme quick toggle helpers", () => {
     expect(nextQuickTheme("system", false)).toBe("dark");
     expect(nextQuickTheme("light", true)).toBe("dark");
     expect(nextQuickTheme("dark", false)).toBe("light");
+  });
+});
+
+describe("ACP session activity & lifecycle convergence", () => {
+  const sampleHost: AcpHost = {
+    id: "h1",
+    name: "devbox",
+    os: "linux",
+    ip: "127.0.0.1",
+    roots: ["/srv"],
+    online: true,
+    latency_ms: 5,
+    last_seen: "2026-11-21T00:00:00Z",
+  };
+  const sampleWs: AcpWorkspace = {
+    id: "w1",
+    host_id: "h1",
+    cwd: "/srv/app",
+    name: "app",
+    branch: "main",
+    branches: ["main"],
+    created_at: "2026-11-21T00:00:00Z",
+    updated_at: "2026-11-21T00:00:00Z",
+  };
+  const sampleSess: AcpSession = {
+    id: "s1",
+    workspace_id: "w1",
+    agent_id: "a1",
+    title: "Session 1",
+    selected_model: "default",
+    thinking_level: "中",
+    permission_policy: "auto_read",
+    acp_session_key: null,
+    running: true,
+    diffs: [],
+    rpc_logs: [],
+    created_at: "2026-11-21T00:00:00Z",
+    updated_at: "2026-11-21T00:00:00Z",
+    turns: [],
+  };
+
+  it("tracks session_activity phases, preserves startedAt, merges usage, settles on idle/session stop and prunes on delete", () => {
+    let st = baseState();
+    st = {
+      ...st,
+      acpHosts: [sampleHost],
+      acpWorkspaces: [sampleWs],
+      acpSessions: [sampleSess],
+    };
+
+    // 1. connecting -> thinking 保留同一 startedAt，并记录 usage
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "session_activity", {
+        session_id: "s1",
+        phase: "connecting",
+        detail: "等待响应…",
+      }),
+    };
+    const anchor = st.acpActivity.s1.startedAt;
+    expect(st.acpActivity.s1.phase).toBe("connecting");
+
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "session_activity", {
+        session_id: "s1",
+        phase: "thinking",
+        detail: "正在思考…",
+        usage: { input_tokens: 100, context_used: 100, context_size: 1000 },
+      }),
+    };
+    expect(st.acpActivity.s1.startedAt).toBe(anchor);
+    expect(st.acpActivity.s1.phase).toBe("thinking");
+    expect(st.acpActivity.s1.usage?.input_tokens).toBe(100);
+
+    // 2. session_upserted running=false 自动把活跃态收敛为 idle（保留 usage 以便头部继续显示）
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "session_upserted", {
+        session: { ...sampleSess, running: false },
+      }),
+    };
+    expect(st.acpActivity.s1.phase).toBe("idle");
+    expect(st.acpActivity.s1.usage?.input_tokens).toBe(100);
+
+    // 3. idle 且合并 output_tokens
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "session_activity", {
+        session_id: "s1",
+        phase: "idle",
+        detail: "",
+        usage: { output_tokens: 55 },
+      }),
+    };
+    expect(st.acpActivity.s1.phase).toBe("idle");
+    expect(st.acpActivity.s1.usage).toEqual({
+      input_tokens: 100,
+      output_tokens: 55,
+      context_used: 100,
+      context_size: 1000,
+    });
+
+    // 4. session_deleted / workspace_deleted 清理 acpActivity
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "session_deleted", { session_id: "s1" }),
+    };
+    expect(st.acpActivity.s1).toBeUndefined();
+
+    // 5. idle 且无 usage 时不保留空记录，host_deleted 也能联动清理
+    st = {
+      ...st,
+      acpWorkspaces: [sampleWs],
+      acpSessions: [sampleSess],
+      acpActivity: {
+        s1: { phase: "responding", detail: "输出中", startedAt: 1, updatedAt: 2 },
+      },
+    };
+    st = {
+      ...st,
+      ...applyAcpEvent(st, "host_deleted", { host_id: "h1" }),
+    };
+    expect(st.acpActivity.s1).toBeUndefined();
+  });
+
+  it("groupTurnsForDisplay groups process steps between user/agent_text/pending-permission boundaries with stable ids", () => {
+    const mk = (
+      id: string,
+      seq: number,
+      role: AcpTurn["role"],
+      status = "done",
+    ): AcpTurn => ({
+      id,
+      session_id: "s1",
+      seq,
+      role,
+      status,
+      payload: {},
+      created_at: "2026-11-21T00:00:00Z",
+      updated_at: "2026-11-21T00:00:00Z",
+    });
+
+    const baseTurns: AcpTurn[] = [
+      mk("u1", 1, "user"),
+      mk("th1", 2, "agent_thought", "done"),
+      mk("tc1", 3, "tool_call", "completed"),
+      mk("p1", 4, "permission", "approved"),
+      mk("a1", 5, "agent_text", "done"),
+      mk("th2", 6, "agent_thought", "done"),
+      mk("perm-pend", 7, "permission", "pending"),
+      mk("tc2", 8, "tool_call", "in_progress"),
+      mk("term1", 9, "terminal_out", "done"),
+      mk("a2", 10, "agent_text", "done"),
+    ];
+
+    const grouped = groupTurnsForDisplay(baseTurns);
+    expect(grouped.map((g) => g.kind)).toEqual([
+      "turn", // u1
+      "process_group", // th1, tc1, p1
+      "turn", // a1
+      "process_group", // th2
+      "turn", // perm-pend
+      "process_group", // tc2, term1
+      "turn", // a2
+    ]);
+    expect(grouped[1]).toMatchObject({
+      kind: "process_group",
+      id: "group-th1",
+    });
+    if (grouped[1].kind === "process_group") {
+      expect(grouped[1].turns.map((t) => t.id)).toEqual(["th1", "tc1", "p1"]);
+    }
+    expect(grouped[5]).toMatchObject({
+      kind: "process_group",
+      id: "group-tc2",
+    });
+
+    // 追加流式过程步骤时，组 id 仍保持首个 turn.id 不变
+    const appended = groupTurnsForDisplay([
+      ...baseTurns.slice(0, 2),
+      mk("tc-new", 3, "tool_call", "in_progress"),
+    ]);
+    expect(appended[1]).toMatchObject({
+      kind: "process_group",
+      id: "group-th1",
+    });
   });
 });

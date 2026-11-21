@@ -1,15 +1,28 @@
 import { useSyncExternalStore } from "react";
+import { mergeLocalVaultWithBootstrap } from "./acpLocalVault";
+import {
+  applyAgentOverlay,
+  applySessionOverlay,
+  applySettingsOverlay,
+  applyWorkspaceOverlay,
+  clearPendingAgentPatch,
+  clearPendingSessionPatch,
+  clearPendingWorkspacePatch,
+} from "./acpOverlay";
 import { loadSession, serverScope } from "./api";
 import { writeDrafts, type DraftEntry, type DraftReuse } from "./drafts";
 import { cacheKey, getRecent, touchRecent, writeLocalCache } from "./localCache";
 import { recordLabel } from "./ui/chat/chatRecord";
 import type {
+  AcpActivityPhase,
+  AcpActivityState,
   AcpAgent,
   AcpBootstrap,
   AcpHost,
   AcpSession,
   AcpSettings,
   AcpTurn,
+  AcpUsageStats,
   AcpWorkspace,
   ConversationPref,
   ConversationView,
@@ -71,6 +84,7 @@ export interface AppState {
   acpWorkspaces: AcpWorkspace[];
   acpSessions: AcpSession[];
   acpLoaded: boolean;
+  acpActivity: Record<string, AcpActivityState>;
   activeAcpHostId: string | null;
   activeAcpWorkspaceId: string | null;
   activeAcpSessionId: string | null;
@@ -109,6 +123,7 @@ const emptySessionData = () => ({
   acpWorkspaces: [] as AcpWorkspace[],
   acpSessions: [] as AcpSession[],
   acpLoaded: false,
+  acpActivity: {} as Record<string, AcpActivityState>,
   activeAcpHostId: null as string | null,
   activeAcpWorkspaceId: null as string | null,
   activeAcpSessionId: null as string | null,
@@ -709,14 +724,95 @@ function reconcileAcpSelection(
   };
 }
 
-export function applyAcpBootstrap(s: AppState, bs: AcpBootstrap): Partial<AppState> {
+const VALID_ACTIVITY_PHASES = new Set<AcpActivityPhase>([
+  "connecting",
+  "thinking",
+  "tooling",
+  "responding",
+  "waiting_permission",
+  "compacting",
+  "retrying",
+  "idle",
+]);
+
+function normalizeActivityUsage(raw: unknown): AcpUsageStats | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const u: AcpUsageStats = {};
+  let hasAny = false;
+  for (const key of [
+    "input_tokens",
+    "output_tokens",
+    "cache_read",
+    "total_tokens",
+    "context_used",
+    "context_size",
+  ] as const) {
+    const val = obj[key];
+    if (typeof val === "number" && Number.isFinite(val)) {
+      u[key] = val;
+      hasAny = true;
+    }
+  }
+  return hasAny ? u : undefined;
+}
+
+function pruneAcpActivity(
+  cur: Record<string, AcpActivityState>,
+  sessions: AcpSession[],
+): Record<string, AcpActivityState> {
+  const keep = new Set(sessions.map((s) => s.id));
+  let changed = false;
+  const next: Record<string, AcpActivityState> = {};
+  for (const [id, act] of Object.entries(cur)) {
+    if (keep.has(id)) next[id] = act;
+    else changed = true;
+  }
+  return changed ? next : cur;
+}
+
+function settleInactiveActivity(
+  cur: Record<string, AcpActivityState>,
+  sess: AcpSession,
+): Record<string, AcpActivityState> | undefined {
+  if (sess.running) return undefined;
+  const prev = cur[sess.id];
+  if (!prev || prev.phase === "idle") return undefined;
+  const next = { ...cur };
+  if (prev.usage) {
+    next[sess.id] = {
+      ...prev,
+      phase: "idle",
+      detail: "",
+      updatedAt: Date.now(),
+    };
+  } else {
+    delete next[sess.id];
+  }
+  return next;
+}
+
+export function applyAcpBootstrap(s: AppState, bsRaw: AcpBootstrap): Partial<AppState> {
+  const bs = mergeLocalVaultWithBootstrap(bsRaw);
+  const acpSessions = bs.sessions.map(applySessionOverlay);
+  const pruned = pruneAcpActivity(s.acpActivity, acpSessions);
+  let acpActivity = pruned;
+  const sessById = new Map(acpSessions.map((x) => [x.id, x]));
+  for (const [id, act] of Object.entries(pruned)) {
+    const sess = sessById.get(id);
+    if (sess && !sess.running && act.phase !== "idle") {
+      const settled = settleInactiveActivity(acpActivity, sess);
+      if (settled) acpActivity = settled;
+    }
+  }
   const nextBase = {
-    acpSettings: bs.settings,
+    acpSettings: applySettingsOverlay(bs.settings),
     acpHosts: bs.hosts,
-    acpAgents: bs.agents,
-    acpWorkspaces: bs.workspaces,
-    acpSessions: bs.sessions,
+    acpAgents: bs.agents.map(applyAgentOverlay),
+    acpWorkspaces: bs.workspaces.map(applyWorkspaceOverlay),
+    acpSessions,
     acpLoaded: true,
+    acpActivity,
     activeAcpHostId: s.activeAcpHostId,
     activeAcpWorkspaceId: s.activeAcpWorkspaceId,
     activeAcpSessionId: s.activeAcpSessionId,
@@ -746,7 +842,7 @@ export function applyAcpEvent(
   switch (event) {
     case "settings_updated": {
       const settings = data.settings as AcpSettings | undefined;
-      return settings ? { acpSettings: settings } : {};
+      return settings ? { acpSettings: applySettingsOverlay(settings) } : {};
     }
     case "host_upserted": {
       const host = data.host as AcpHost | undefined;
@@ -763,14 +859,25 @@ export function applyAcpEvent(
       const removedWsIds = new Set(
         s.acpWorkspaces.filter((w) => w.host_id === hostId).map((w) => w.id),
       );
+      for (const a of s.acpAgents) {
+        if (a.host_id === hostId) clearPendingAgentPatch(a.id);
+      }
+      for (const ws of s.acpWorkspaces) {
+        if (ws.host_id === hostId) clearPendingWorkspacePatch(ws.id);
+      }
+      for (const sess of s.acpSessions) {
+        if (removedWsIds.has(sess.workspace_id)) clearPendingSessionPatch(sess.id);
+      }
       const acpWorkspaces = s.acpWorkspaces.filter((w) => w.host_id !== hostId);
       const acpAgents = s.acpAgents.filter((a) => a.host_id !== hostId);
       const acpSessions = s.acpSessions.filter((x) => !removedWsIds.has(x.workspace_id));
+      const acpActivity = pruneAcpActivity(s.acpActivity, acpSessions);
       return {
         acpHosts,
         acpAgents,
         acpWorkspaces,
         acpSessions,
+        ...(acpActivity !== s.acpActivity ? { acpActivity } : {}),
         ...reconcileAcpSelection({
           ...s,
           acpHosts,
@@ -782,22 +889,25 @@ export function applyAcpEvent(
     case "agent_upserted": {
       const agent = data.agent as AcpAgent | undefined;
       if (!agent) return {};
-      return { acpAgents: upsertById(s.acpAgents, agent) };
+      return { acpAgents: upsertById(s.acpAgents, applyAgentOverlay(agent)) };
     }
     case "agent_deleted": {
       const agentId = String(data.agent_id ?? "");
+      clearPendingAgentPatch(agentId);
       const acpAgents = s.acpAgents.filter((a) => a.id !== agentId);
       const acpSessions = s.acpSessions.filter((x) => x.agent_id !== agentId);
+      const acpActivity = pruneAcpActivity(s.acpActivity, acpSessions);
       return {
         acpAgents,
         acpSessions,
+        ...(acpActivity !== s.acpActivity ? { acpActivity } : {}),
         ...reconcileAcpSelection({ ...s, acpSessions }),
       };
     }
     case "workspace_upserted": {
       const ws = data.workspace as AcpWorkspace | undefined;
       if (!ws) return {};
-      const acpWorkspaces = upsertById(s.acpWorkspaces, ws, false);
+      const acpWorkspaces = upsertById(s.acpWorkspaces, applyWorkspaceOverlay(ws), false);
       return {
         acpWorkspaces,
         ...reconcileAcpSelection({ ...s, acpWorkspaces }),
@@ -805,11 +915,14 @@ export function applyAcpEvent(
     }
     case "workspace_deleted": {
       const wsId = String(data.workspace_id ?? "");
+      clearPendingWorkspacePatch(wsId);
       const acpWorkspaces = s.acpWorkspaces.filter((w) => w.id !== wsId);
       const acpSessions = s.acpSessions.filter((x) => x.workspace_id !== wsId);
+      const acpActivity = pruneAcpActivity(s.acpActivity, acpSessions);
       return {
         acpWorkspaces,
         acpSessions,
+        ...(acpActivity !== s.acpActivity ? { acpActivity } : {}),
         ...reconcileAcpSelection({ ...s, acpWorkspaces, acpSessions }),
       };
     }
@@ -817,21 +930,26 @@ export function applyAcpEvent(
       const incoming = data.session as AcpSession | undefined;
       if (!incoming) return {};
       const prev = s.acpSessions.find((x) => x.id === incoming.id);
-      const merged: AcpSession = {
+      const merged: AcpSession = applySessionOverlay({
         ...incoming,
         turns: incoming.turns ?? prev?.turns ?? [],
-      };
+      });
       const acpSessions = upsertById(s.acpSessions, merged, false);
+      const settledActivity = settleInactiveActivity(s.acpActivity, merged);
       return {
         acpSessions,
+        ...(settledActivity ? { acpActivity: settledActivity } : {}),
         ...reconcileAcpSelection({ ...s, acpSessions }),
       };
     }
     case "session_deleted": {
       const sessId = String(data.session_id ?? "");
+      clearPendingSessionPatch(sessId);
       const acpSessions = s.acpSessions.filter((x) => x.id !== sessId);
+      const acpActivity = pruneAcpActivity(s.acpActivity, acpSessions);
       return {
         acpSessions,
+        ...(acpActivity !== s.acpActivity ? { acpActivity } : {}),
         ...reconcileAcpSelection({ ...s, acpSessions }),
       };
     }
@@ -846,6 +964,51 @@ export function applyAcpEvent(
         return { ...sess, turns };
       });
       return { acpSessions };
+    }
+    case "session_activity": {
+      const sessId = String(data.session_id ?? "");
+      if (!sessId) return {};
+      const rawPhase = String(data.phase ?? "idle").trim() as AcpActivityPhase;
+      const phase: AcpActivityPhase = VALID_ACTIVITY_PHASES.has(rawPhase) ? rawPhase : "idle";
+      const detail = String(data.detail ?? "").trim();
+      const incomingUsage = normalizeActivityUsage(data.usage);
+      const prev = s.acpActivity[sessId];
+      const now = Date.now();
+      if (phase === "idle") {
+        if (!prev && !incomingUsage) return {};
+        const mergedUsage = incomingUsage
+          ? { ...(prev?.usage ?? {}), ...incomingUsage }
+          : prev?.usage;
+        const next = { ...s.acpActivity };
+        if (mergedUsage) {
+          next[sessId] = {
+            phase: "idle",
+            detail: "",
+            startedAt: prev?.startedAt ?? now,
+            updatedAt: now,
+            usage: mergedUsage,
+          };
+        } else {
+          delete next[sessId];
+        }
+        return { acpActivity: next };
+      }
+      const wasActive = prev && prev.phase !== "idle";
+      const nextUsage = incomingUsage
+        ? { ...(prev?.usage ?? {}), ...incomingUsage }
+        : prev?.usage;
+      return {
+        acpActivity: {
+          ...s.acpActivity,
+          [sessId]: {
+            phase,
+            detail,
+            startedAt: wasActive ? prev.startedAt : now,
+            updatedAt: now,
+            ...(nextUsage ? { usage: nextUsage } : {}),
+          },
+        },
+      };
     }
     default:
       return {};

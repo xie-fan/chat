@@ -606,11 +606,57 @@ export interface AcpTurn {
   id: string;
   session_id: string;
   seq: number;
-  role: "user" | "agent_plan" | "permission" | "terminal_out" | "agent_text";
+  role: "user" | "agent_thought" | "tool_call" | "agent_plan" | "permission" | "terminal_out" | "agent_text";
   status: string;
   payload: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+export interface AcpToolDiff {
+  path: string;
+  old_text?: string | null;
+  new_text: string;
+}
+
+export interface AcpToolCallPayload {
+  tool_call_id?: string;
+  name?: string;
+  kind?: string;
+  title?: string;
+  input?: string;
+  output?: string;
+  locations?: string[];
+  diffs?: AcpToolDiff[];
+  duration_ms?: number;
+  is_error?: boolean;
+}
+
+export interface AcpUsageStats {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read?: number;
+  total_tokens?: number;
+  context_used?: number;
+  context_size?: number;
+}
+
+export type AcpActivityPhase =
+  | "connecting"
+  | "thinking"
+  | "tooling"
+  | "responding"
+  | "waiting_permission"
+  | "compacting"
+  | "retrying"
+  | "idle";
+
+export interface AcpActivityState {
+  phase: AcpActivityPhase;
+  detail: string;
+  startedAt: number;
+  updatedAt: number;
+  usage?: AcpUsageStats;
 }
 
 export interface AcpDiffItem {

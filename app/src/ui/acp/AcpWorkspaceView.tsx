@@ -8,17 +8,31 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  cancelSessionLocalFirst,
+  deleteSessionLocalFirst,
+  deleteWorkspaceLocalFirst,
+  gitCheckoutLocalFirst,
+  isLocalAcpHost,
+  mutateSessionLocalFirst,
+  probeAgentModelsLocalFirst,
+  replyPermissionLocalFirst,
+  sendPromptLocalFirst,
+  uploadAttachmentLocalFirst,
+} from "../../acpHost";
 import { acp } from "../../api";
 import { applyAcpBootstrap, getState, setState, useApp } from "../../store";
 import type {
+  AcpActivityPhase,
   AcpAttachment,
   AcpPermissionPolicy,
-  AcpPlanStep,
   AcpThinkingLevel,
-  AcpTurn,
+  AcpUsageStats,
 } from "../../types";
 import { confirmDialog } from "../Modal";
 import {
+  ActivityIcon,
+  ArrowDownIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
@@ -27,7 +41,6 @@ import {
   GitBranchIcon,
   MoreVerticalIcon,
   PlusIcon,
-  TerminalIcon,
   TrashIcon,
   XIcon,
 } from "../icons";
@@ -36,6 +49,11 @@ import {
   AttachAgentModal,
   NewSessionModal,
 } from "./AcpModals";
+import {
+  AcpTurnItem,
+  groupTurnsForDisplay,
+  ProcessGroupCard,
+} from "./AcpTurnView";
 
 const THINKING_LEVELS: AcpThinkingLevel[] = ["关", "低", "中", "高"];
 const PERMISSION_POLICIES: { v: AcpPermissionPolicy; label: string }[] = [
@@ -43,6 +61,39 @@ const PERMISSION_POLICIES: { v: AcpPermissionPolicy; label: string }[] = [
   { v: "auto_read", label: "权限：自动只读" },
   { v: "allow_all", label: "权限：全部允许" },
 ];
+const ACTIVITY_PHASE_LABELS: Record<AcpActivityPhase, string> = {
+  connecting: "连接中",
+  thinking: "深度思考",
+  tooling: "执行工具",
+  responding: "生成回复",
+  waiting_permission: "等待授权",
+  compacting: "压缩上下文",
+  retrying: "重试请求",
+  idle: "就绪",
+};
+
+function formatCompactNum(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+function formatUsageSummary(u?: AcpUsageStats): string | null {
+  if (!u) return null;
+  const parts: string[] = [];
+  if (typeof u.total_tokens === "number") {
+    parts.push(`${formatCompactNum(u.total_tokens)} tok`);
+  } else if (typeof u.input_tokens === "number" || typeof u.output_tokens === "number") {
+    const inp = typeof u.input_tokens === "number" ? `↑${formatCompactNum(u.input_tokens)}` : "";
+    const out = typeof u.output_tokens === "number" ? `↓${formatCompactNum(u.output_tokens)}` : "";
+    const joined = [inp, out].filter(Boolean).join(" ");
+    if (joined) parts.push(joined);
+  }
+  if (typeof u.context_used === "number" && typeof u.context_size === "number" && u.context_size > 0) {
+    const pct = Math.min(100, Math.round((u.context_used / u.context_size) * 100));
+    parts.push(`ctx ${pct}%`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
 
 export default function AcpWorkspaceView() {
   const s = useApp();
@@ -58,11 +109,18 @@ export default function AcpWorkspaceView() {
   const [sending, setSending] = useState(false);
   const [errMsg, setErrMsg] = useState("");
   const [diffsOpen, setDiffsOpen] = useState(false);
+  const [rpcOpen, setRpcOpen] = useState(false);
+  const [stickToBottom, setStickToBottom] = useState(true);
+  const [elapsedMs, setElapsedMs] = useState(0);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
 
   const fileRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const stickRef = useRef(true);
+  const runAnchorRef = useRef<number>(Date.now());
+  const probedAgentAtRef = useRef<Record<string, number>>({});
 
   // 若进入 Agent 工作区时尚未 bootstrap，则补拉一次状态
   useEffect(() => {
@@ -120,17 +178,116 @@ export default function AcpWorkspaceView() {
     [activeWs, s.acpHosts, activeHost],
   );
 
+  const activeActivity = activeSession ? s.acpActivity[activeSession.id] : undefined;
+
   useEffect(() => {
     setPendingAtts([]);
     setErrMsg("");
     setEditingTitle(false);
     setDiffsOpen(false);
+    setRpcOpen(false);
+    stickRef.current = true;
+    setStickToBottom(true);
   }, [activeSession?.id]);
+
+  // 实时运行耗时计时器：优先对齐服务端/宿主的 activity startedAt
+  useEffect(() => {
+    if (!activeSession?.running) {
+      setElapsedMs(0);
+      return;
+    }
+    const anchor =
+      activeActivity && activeActivity.phase !== "idle"
+        ? activeActivity.startedAt
+        : Date.now();
+    runAnchorRef.current = anchor;
+    setElapsedMs(Math.max(0, Date.now() - anchor));
+    const timer = window.setInterval(() => {
+      setElapsedMs(Math.max(0, Date.now() - runAnchorRef.current));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [
+    activeSession?.id,
+    activeSession?.running,
+    activeActivity?.phase,
+    activeActivity?.startedAt,
+  ]);
+
+  // 打开尚未开始对话的新会话时，本机直连（或远端后台）异步刷新该 Agent 的可用模型列表
+  useEffect(() => {
+    const hostAvailable =
+      Boolean(activeHostOfSess?.online) || isLocalAcpHost(activeHostOfSess?.id);
+    if (!activeSession || !activeAgent || activeSession.running || !hostAvailable) return;
+    const isFreshSession =
+      !activeSession.acp_session_key && (activeSession.turns ?? []).length === 0;
+    if (!isFreshSession) return;
+    const now = Date.now();
+    const last = probedAgentAtRef.current[activeSession.agent_id] ?? 0;
+    if (now - last < 15_000) return;
+    probedAgentAtRef.current[activeSession.agent_id] = now;
+    void probeAgentModelsLocalFirst(activeAgent, {
+      sessionId: activeSession.id,
+      cwd: activeWs?.cwd,
+      wait: false,
+    }).catch(() => {});
+  }, [
+    activeSession?.id,
+    activeSession?.agent_id,
+    activeSession?.acp_session_key,
+    activeSession?.turns?.length,
+    activeSession?.running,
+    activeAgent,
+    activeWs?.cwd,
+    activeHostOfSess?.id,
+    activeHostOfSess?.online,
+  ]);
+
+  const displayEntries = useMemo(
+    () => groupTurnsForDisplay(activeSession?.turns ?? []),
+    [activeSession?.turns],
+  );
+
+  const turnsScrollKey = useMemo(() => {
+    const turns = activeSession?.turns ?? [];
+    const last = turns[turns.length - 1];
+    if (!last) return "0";
+    const textLen = typeof last.payload.text === "string" ? last.payload.text.length : 0;
+    const outLen = typeof last.payload.output === "string" ? last.payload.output.length : 0;
+    return `${turns.length}:${last.status}:${last.updated_at}:${textLen}:${outLen}`;
+  }, [activeSession?.turns]);
 
   useEffect(() => {
     const el = streamRef.current;
+    if (el && stickRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [activeSession?.id, turnsScrollKey]);
+
+  const onStreamScroll = () => {
+    const el = streamRef.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = dist <= 80;
+    if (nearBottom !== stickRef.current) {
+      stickRef.current = nearBottom;
+      setStickToBottom(nearBottom);
+    }
+  };
+
+  const scrollToBottom = () => {
+    const el = streamRef.current;
+    stickRef.current = true;
+    setStickToBottom(true);
     if (el) el.scrollTop = el.scrollHeight;
-  }, [activeSession?.id, activeSession?.turns?.length]);
+  };
+
+  useLayoutEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const nextH = promptText ? Math.min(Math.max(ta.scrollHeight, 52), 160) : 52;
+    ta.style.height = `${nextH}px`;
+  }, [promptText]);
 
   const selectHost = (hostId: string) => {
     setHostMenuOpen(false);
@@ -163,7 +320,7 @@ export default function AcpWorkspaceView() {
     )
       return;
     try {
-      await acp.deleteWorkspace(wsId);
+      await deleteWorkspaceLocalFirst(wsId);
       setState((cur) => {
         const acpWorkspaces = cur.acpWorkspaces.filter((w) => w.id !== wsId);
         const acpSessions = cur.acpSessions.filter((x) => x.workspace_id !== wsId);
@@ -193,7 +350,7 @@ export default function AcpWorkspaceView() {
     )
       return;
     try {
-      await acp.deleteSession(sessId);
+      await deleteSessionLocalFirst(sessId);
       setState((cur) => {
         const acpSessions = cur.acpSessions.filter((x) => x.id !== sessId);
         return {
@@ -216,16 +373,14 @@ export default function AcpWorkspaceView() {
     }));
   };
 
-  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const picked = Array.from(e.target.files ?? []);
-    e.target.value = "";
+  const uploadFilesList = async (picked: File[]) => {
     if (!picked.length || !activeSession) return;
     const targetSessId = activeSession.id;
     setUploading(true);
     setErrMsg("");
     try {
       const uploaded = await Promise.all(
-        picked.map((f) => acp.uploadFile(f, targetSessId)),
+        picked.map((f) => uploadAttachmentLocalFirst(f, targetSessId)),
       );
       if (getState().activeAcpSessionId === targetSessId) {
         setPendingAtts((cur) => [...cur, ...uploaded]);
@@ -239,6 +394,27 @@ export default function AcpWorkspaceView() {
     }
   };
 
+  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    await uploadFilesList(picked);
+  };
+
+  const onPasteComposer = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const images: File[] = [];
+    for (const item of items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const f = item.getAsFile();
+        if (f) images.push(f);
+      }
+    }
+    if (images.length > 0) {
+      e.preventDefault();
+      void uploadFilesList(images);
+    }
+  };
+
   const sendPrompt = async () => {
     if (!activeSession || activeSession.running || sending) return;
     const targetSessId = activeSession.id;
@@ -247,33 +423,42 @@ export default function AcpWorkspaceView() {
     const fileRefs = Array.from(raw.matchAll(/@([^\s@]+)/g)).map((m) => m[1]);
     setSending(true);
     setErrMsg("");
+    stickRef.current = true;
+    setStickToBottom(true);
     try {
-      const turn = await acp.sendPrompt(targetSessId, {
-        text: raw,
-        files: fileRefs,
-        attachment_ids: pendingAtts.map((a) => a.id),
-        model: activeSession.selected_model,
-        thinking_level: activeSession.thinking_level,
-        permission_policy: activeSession.permission_policy,
-      });
+      const { localHandled, turn } = await sendPromptLocalFirst(
+        activeSession,
+        activeWs,
+        activeAgent,
+        {
+          text: raw,
+          files: fileRefs,
+          attachments: pendingAtts,
+          model: activeSession.selected_model,
+          thinking_level: activeSession.thinking_level,
+          permission_policy: activeSession.permission_policy,
+        },
+      );
       if (getState().activeAcpSessionId === targetSessId) {
         setPromptText("");
         setPendingAtts([]);
       }
-      setState((cur) => ({
-        acpSessions: cur.acpSessions.map((x) => {
-          if (x.id !== targetSessId) return x;
-          const prevTurns = x.turns ?? [];
-          const has = prevTurns.some((t) => t.id === turn.id);
-          return {
-            ...x,
-            running: true,
-            turns: has
-              ? prevTurns.map((t) => (t.id === turn.id ? turn : t))
-              : [...prevTurns, turn],
-          };
-        }),
-      }));
+      if (!localHandled) {
+        setState((cur) => ({
+          acpSessions: cur.acpSessions.map((x) => {
+            if (x.id !== targetSessId) return x;
+            const prevTurns = x.turns ?? [];
+            const has = prevTurns.some((t) => t.id === turn.id);
+            return {
+              ...x,
+              running: true,
+              turns: has
+                ? prevTurns.map((t) => (t.id === turn.id ? turn : t))
+                : [...prevTurns, turn],
+            };
+          }),
+        }));
+      }
     } catch (ex) {
       setErrMsg(ex instanceof Error ? ex.message : "发送指令失败");
     } finally {
@@ -281,197 +466,35 @@ export default function AcpWorkspaceView() {
     }
   };
 
-  const replyPermission = async (
-    turnId: string,
-    opt: "allow_once" | "allow_always" | "reject_once" | "reject_always",
-  ) => {
-    try {
-      const updatedTurn = await acp.replyPermission(turnId, opt);
-      setState((cur) => ({
-        acpSessions: cur.acpSessions.map((sess) => ({
-          ...sess,
-          turns: (sess.turns ?? []).map((t) =>
-            t.id === updatedTurn.id ? updatedTurn : t,
-          ),
-        })),
-      }));
-    } catch (ex) {
-      setErrMsg(ex instanceof Error ? ex.message : "权限应答失败");
-    }
-  };
+  const replyPermission = useCallback(
+    async (
+      turnId: string,
+      opt: "allow_once" | "allow_always" | "reject_once" | "reject_always",
+    ) => {
+      const sessId = getState().activeAcpSessionId;
+      if (!sessId) return;
+      try {
+        const updatedTurn = await replyPermissionLocalFirst(sessId, turnId, opt);
+        setState((cur) => ({
+          acpSessions: cur.acpSessions.map((sess) => ({
+            ...sess,
+            turns: (sess.turns ?? []).map((t) =>
+              t.id === updatedTurn.id ? updatedTurn : t,
+            ),
+          })),
+        }));
+      } catch (ex) {
+        setErrMsg(ex instanceof Error ? ex.message : "权限应答失败");
+      }
+    },
+    [],
+  );
 
-  const renderTurn = (t: AcpTurn) => {
-    if (t.role === "user") {
-      const text = String(t.payload.text ?? "");
-      const files = Array.isArray(t.payload.files)
-        ? (t.payload.files as string[])
-        : [];
-      const atts = Array.isArray(t.payload.attachments)
-        ? (t.payload.attachments as AcpAttachment[])
-        : [];
-      return (
-        <div key={t.id} className="acp-turn-user">
-          {text && <div>{text}</div>}
-          {(files.length > 0 || atts.length > 0) && (
-            <div className="acp-composer-pills" style={{ marginTop: 8 }}>
-              {files.map((f, i) => (
-                <span
-                  key={`${f}-${i}`}
-                  className="acp-chip mono-code"
-                  style={{ background: "rgba(255,255,255,0.16)", color: "#fff", borderColor: "transparent" }}
-                >
-                  @{f}
-                </span>
-              ))}
-              {atts.map((a) => (
-                <button
-                  key={a.id}
-                  type="button"
-                  onClick={() =>
-                    void acp.downloadFile(a.id, a.file_name).catch((ex) =>
-                      setErrMsg(ex instanceof Error ? ex.message : "下载附件失败"),
-                    )
-                  }
-                  className="acp-chip"
-                  style={{
-                    background: "rgba(255,255,255,0.16)",
-                    color: "#fff",
-                    borderColor: "transparent",
-                    cursor: "pointer",
-                  }}
-                >
-                  📎 {a.file_name}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    if (t.role === "agent_plan") {
-      const steps = Array.isArray(t.payload.steps)
-        ? (t.payload.steps as AcpPlanStep[])
-        : [];
-      return (
-        <div key={t.id} className="acp-turn-card">
-          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>
-            执行计划 ({steps.filter((st) => st.state === "done").length}/{steps.length})
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {steps.map((st, idx) => (
-              <div
-                key={idx}
-                style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
-              >
-                <span
-                  style={{
-                    width: 18,
-                    textAlign: "center",
-                    color:
-                      st.state === "done"
-                        ? "var(--ok)"
-                        : st.state === "active"
-                          ? "var(--accent)"
-                          : "var(--text-muted)",
-                  }}
-                >
-                  {st.state === "done" ? "✓" : st.state === "active" ? "●" : "○"}
-                </span>
-                <span
-                  style={{
-                    color: st.state === "pending" ? "var(--text-muted)" : "var(--text-main)",
-                  }}
-                >
-                  {st.label}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      );
-    }
-
-    if (t.role === "permission") {
-      const pending = t.status === "pending";
-      const chosen = String(t.payload.chosen_option ?? "");
-      return (
-        <div key={t.id} className="acp-turn-card acp-perm-card">
-          <div className="row between" style={{ marginBottom: 6 }}>
-            <b style={{ fontSize: 13 }}>
-              {pending ? "⚠️ 需要授权执行操作" : "已处理的授权请求"}
-            </b>
-            <span className="acp-chip">{String(t.payload.tool_kind ?? "tool")}</span>
-          </div>
-          <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-            {String(t.payload.reason ?? "")}
-          </div>
-          {Boolean(t.payload.command) && (
-            <pre className="acp-term-pre">{String(t.payload.command)}</pre>
-          )}
-          {pending ? (
-            <div className="acp-perm-actions">
-              <button
-                type="button"
-                className="btn-accent"
-                onClick={() => void replyPermission(t.id, "allow_once")}
-              >
-                允许一次
-              </button>
-              <button
-                type="button"
-                className="btn-ghost"
-                onClick={() => void replyPermission(t.id, "allow_always")}
-              >
-                始终允许
-              </button>
-              <button
-                type="button"
-                className="btn-danger-soft"
-                onClick={() => void replyPermission(t.id, "reject_once")}
-              >
-                拒绝一次
-              </button>
-              <button
-                type="button"
-                className="btn-danger-soft"
-                onClick={() => void replyPermission(t.id, "reject_always")}
-              >
-                始终拒绝
-              </button>
-            </div>
-          ) : (
-            <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-              结果：{chosen || t.status}
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    if (t.role === "terminal_out") {
-      const exit = Number(t.payload.exit_code ?? 0);
-      return (
-        <div key={t.id} className="acp-turn-card">
-          <div className="row between" style={{ fontSize: 12.5 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
-              <TerminalIcon size={14} />
-              <span className="mono-code">{String(t.payload.command ?? "终端输出")}</span>
-            </div>
-            <span className="acp-chip">exit {exit}</span>
-          </div>
-          <pre className="acp-term-pre">{String(t.payload.output ?? "")}</pre>
-        </div>
-      );
-    }
-
-    return (
-      <div key={t.id} className="acp-turn-agent">
-        {String(t.payload.text ?? "")}
-        {t.status === "streaming" && <span className="muted"> ▌</span>}
-      </div>
+  const downloadAttachment = useCallback((id: string, fileName: string) => {
+    void acp.downloadFile(id, fileName).catch((ex) =>
+      setErrMsg(ex instanceof Error ? ex.message : "下载附件失败"),
     );
-  };
+  }, []);
 
   const newSessionTargetWs =
     s.acpWorkspaces.find((w) => w.id === newSessWsId) ?? null;
@@ -513,7 +536,7 @@ export default function AcpWorkspaceView() {
               <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 {activeHost?.online && (
                   <span className="muted" style={{ fontSize: 11 }}>
-                    {activeHost.latency_ms}ms
+                    {activeHost.ip === "Local-Only" ? "仅本机" : `${activeHost.latency_ms}ms`}
                   </span>
                 )}
                 <ChevronDownIcon size={15} />
@@ -544,7 +567,11 @@ export default function AcpWorkspaceView() {
                         <span>@{h.name}</span>
                       </span>
                       <span className="muted" style={{ fontSize: 11 }}>
-                        {h.online ? `${h.latency_ms}ms` : "离线"}
+                        {h.ip === "Local-Only"
+                          ? "仅本机"
+                          : h.online
+                            ? `${h.latency_ms}ms`
+                            : "离线"}
                       </span>
                     </button>
                   ))
@@ -650,7 +677,7 @@ export default function AcpWorkspaceView() {
                               }
                             >
                               <span
-                                className="dot"
+                                className={`dot${sess.running && !hasPendingPerm ? " acp-pulse-dot" : ""}`}
                                 style={{
                                   flexShrink: 0,
                                   background: hasPendingPerm
@@ -724,15 +751,8 @@ export default function AcpWorkspaceView() {
                       onChange={(e) => setTitleDraft(e.target.value)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && titleDraft.trim()) {
-                          void acp
-                            .updateSession(activeSession.id, { title: titleDraft.trim() })
-                            .then((u) => {
-                              patchSessionState(u);
-                              setEditingTitle(false);
-                            })
-                            .catch((ex) =>
-                              setErrMsg(ex instanceof Error ? ex.message : "更新会话标题失败"),
-                            );
+                          mutateSessionLocalFirst(activeSession.id, { title: titleDraft.trim() });
+                          setEditingTitle(false);
                         }
                       }}
                     />
@@ -741,15 +761,8 @@ export default function AcpWorkspaceView() {
                       className="btn-accent"
                       onClick={() => {
                         if (!titleDraft.trim()) return;
-                        void acp
-                          .updateSession(activeSession.id, { title: titleDraft.trim() })
-                          .then((u) => {
-                            patchSessionState(u);
-                            setEditingTitle(false);
-                          })
-                          .catch((ex) =>
-                            setErrMsg(ex instanceof Error ? ex.message : "更新会话标题失败"),
-                          );
+                        mutateSessionLocalFirst(activeSession.id, { title: titleDraft.trim() });
+                        setEditingTitle(false);
                       }}
                     >
                       <CheckIcon size={14} /> 保存
@@ -785,10 +798,15 @@ export default function AcpWorkspaceView() {
                     {(() => {
                       const installing = !activeSession.running && activeAgent?.status === "installing";
                       const active = activeSession.running || installing;
+                      const phase = activeActivity?.phase ?? "idle";
+                      const phaseLabel =
+                        phase !== "idle" ? ACTIVITY_PHASE_LABELS[phase] : "运行中…";
                       return (
-                        <span className={`status-pill${active ? " online" : ""}`}>
+                        <span
+                          className={`status-pill${active ? " online" : ""}${activeSession.running ? " is-pulsing" : ""}`}
+                        >
                           {activeSession.running
-                            ? "运行中…"
+                            ? phaseLabel
                             : installing
                               ? "正在安装 ACP 适配器…"
                               : "就绪"}
@@ -798,14 +816,27 @@ export default function AcpWorkspaceView() {
                   </div>
                 )}
 
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  title="删除对话"
-                  onClick={() => void removeSession(activeSession.id)}
-                >
-                  <TrashIcon size={14} />
-                </button>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    className={`btn-ghost${rpcOpen ? " is-active" : ""}`}
+                    title="查看 RPC 通信日志"
+                    aria-expanded={rpcOpen}
+                    onClick={() => setRpcOpen((v) => !v)}
+                    style={{ fontSize: 12, padding: "4px 8px" }}
+                  >
+                    <ActivityIcon size={14} />
+                    <span>RPC ({activeSession.rpc_logs.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    title="删除对话"
+                    onClick={() => void removeSession(activeSession.id)}
+                  >
+                    <TrashIcon size={14} />
+                  </button>
+                </div>
               </div>
 
               <div className="acp-header-meta">
@@ -825,19 +856,93 @@ export default function AcpWorkspaceView() {
                     <GitBranchIcon size={12} /> {activeWs.branch}
                   </span>
                 )}
+                {(() => {
+                  const tok = formatUsageSummary(activeActivity?.usage);
+                  return tok ? (
+                    <span className="acp-chip mono-code" title="Token / 上下文用量">
+                      {tok}
+                    </span>
+                  ) : null;
+                })()}
               </div>
+
+              {rpcOpen && (
+                <div className="acp-rpc-drawer">
+                  <div className="row between" style={{ marginBottom: 6 }}>
+                    <span style={{ fontWeight: 600, fontSize: 12 }}>
+                      RPC 通信日志（最近 {activeSession.rpc_logs.length} 条）
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      style={{ padding: "2px 6px", fontSize: 11 }}
+                      onClick={() => setRpcOpen(false)}
+                    >
+                      收起
+                    </button>
+                  </div>
+                  {activeSession.rpc_logs.length === 0 ? (
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      暂无 RPC 日志
+                    </div>
+                  ) : (
+                    <div className="acp-rpc-list mono-code">
+                      {activeSession.rpc_logs.map((entry, idx) => (
+                        <div key={idx} className="acp-rpc-item">
+                          <span className={`acp-rpc-dir dir-${entry.dir}`}>
+                            {entry.dir === "out" ? "→" : "←"}
+                          </span>
+                          <span className="acp-rpc-method">{entry.method}</span>
+                          {entry.summary && (
+                            <span className="acp-rpc-summary">{entry.summary}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </header>
 
-            <div className="acp-turns" ref={streamRef}>
-              {(activeSession.turns ?? []).length === 0 ? (
-                <div className="empty-state" style={{ margin: "auto" }}>
-                  <div className="empty-title">对话已就绪</div>
-                  <div className="empty-hint-sm">
-                    支持 `@文件路径` 引用代码库文件、直接上传附件，或在下方选择模型与思考深度。
+            <div className="acp-turns-stage">
+              <div className="acp-turns" ref={streamRef} onScroll={onStreamScroll}>
+                {displayEntries.length === 0 ? (
+                  <div className="empty-state" style={{ margin: "auto" }}>
+                    <div className="empty-title">对话已就绪</div>
+                    <div className="empty-hint-sm">
+                      支持 `@文件路径` 引用代码库文件、直接上传或粘贴图片，或在下方选择模型与思考深度。
+                    </div>
                   </div>
-                </div>
-              ) : (
-                (activeSession.turns ?? []).map(renderTurn)
+                ) : (
+                  displayEntries.map((entry) =>
+                    entry.kind === "process_group" ? (
+                      <ProcessGroupCard
+                        key={entry.id}
+                        turns={entry.turns}
+                        onDownloadAttachment={downloadAttachment}
+                        onReplyPermission={replyPermission}
+                      />
+                    ) : (
+                      <AcpTurnItem
+                        key={entry.turn.id}
+                        turn={entry.turn}
+                        onDownloadAttachment={downloadAttachment}
+                        onReplyPermission={replyPermission}
+                      />
+                    ),
+                  )
+                )}
+              </div>
+
+              {!stickToBottom && (activeSession.turns ?? []).length > 0 && (
+                <button
+                  type="button"
+                  className="acp-scroll-down-btn"
+                  onClick={scrollToBottom}
+                >
+                  <span>回到底部</span>
+                  <ArrowDownIcon size={13} />
+                </button>
               )}
             </div>
 
@@ -850,8 +955,14 @@ export default function AcpWorkspaceView() {
                 >
                   <span>
                     代码变更：{activeSession.diffs.length} 个文件（
-                    +{activeSession.diffs.reduce((n, d) => n + d.added, 0)} / -
-                    {activeSession.diffs.reduce((n, d) => n + d.removed, 0)}）
+                    <span className="acp-diff-add-num">
+                      +{activeSession.diffs.reduce((n, d) => n + d.added, 0)}
+                    </span>
+                    {" / "}
+                    <span className="acp-diff-del-num">
+                      -{activeSession.diffs.reduce((n, d) => n + d.removed, 0)}
+                    </span>
+                    ）
                   </span>
                   <span>{diffsOpen ? "收起 ▲" : "展开 ▼"}</span>
                 </div>
@@ -859,7 +970,9 @@ export default function AcpWorkspaceView() {
                   <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
                     {activeSession.diffs.map((d, i) => (
                       <div key={i} className="mono-code" style={{ fontSize: 11.5 }}>
-                        <b>{d.file}</b> (+{d.added} / -{d.removed}) · {d.status}
+                        <b>{d.file}</b> (
+                        <span className="acp-diff-add-num">+{d.added}</span> /{" "}
+                        <span className="acp-diff-del-num">-{d.removed}</span>) · {d.status}
                         {d.diff_lines && d.diff_lines.length > 0 && (
                           <pre className="acp-term-pre">{d.diff_lines.join("\n")}</pre>
                         )}
@@ -867,6 +980,34 @@ export default function AcpWorkspaceView() {
                     ))}
                   </div>
                 )}
+              </div>
+            )}
+
+            {(activeSession.running ||
+              (activeActivity && activeActivity.phase !== "idle")) && (
+              <div className="acp-activity-bar" role="status" aria-live="polite">
+                <div className="acp-activity-left">
+                  <span
+                    className={`acp-pulse-dot${activeActivity?.phase === "waiting_permission" ? " is-warn" : ""}`}
+                  />
+                  <span className="acp-activity-phase">
+                    {ACTIVITY_PHASE_LABELS[activeActivity?.phase ?? "connecting"]}
+                  </span>
+                  <span className="acp-activity-detail">
+                    {activeActivity?.detail || "等待 Agent 响应…"}
+                  </span>
+                </div>
+                <div className="acp-activity-right mono-code">
+                  {activeSession.running && (
+                    <span className="acp-activity-timer">
+                      {(elapsedMs / 1000).toFixed(1)}s
+                    </span>
+                  )}
+                  {(() => {
+                    const tok = formatUsageSummary(activeActivity?.usage);
+                    return tok ? <span>{tok}</span> : null;
+                  })()}
+                </div>
               </div>
             )}
 
@@ -899,9 +1040,11 @@ export default function AcpWorkspaceView() {
                 <input ref={fileRef} type="file" multiple hidden onChange={onPickFiles} />
 
                 <textarea
+                  ref={textareaRef}
                   value={promptText}
                   onChange={(e) => setPromptText(e.target.value)}
-                  placeholder="输入任务指令，支持 @文件 引用，Enter 发送，Shift+Enter 换行…"
+                  onPaste={onPasteComposer}
+                  placeholder="输入任务指令，支持 @文件 引用、粘贴截图，Enter 发送，Shift+Enter 换行…"
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
@@ -929,22 +1072,26 @@ export default function AcpWorkspaceView() {
                       aria-label="选择模型"
                       value={activeSession.selected_model}
                       onChange={(e) =>
-                        void acp
-                          .updateSession(activeSession.id, { selected_model: e.target.value })
-                          .then(patchSessionState)
-                          .catch((ex) =>
-                            setErrMsg(ex instanceof Error ? ex.message : "切换模型失败"),
-                          )
+                        mutateSessionLocalFirst(activeSession.id, {
+                          selected_model: e.target.value,
+                        })
                       }
                     >
-                      {(activeAgent?.model_options.length
-                        ? activeAgent.model_options
-                        : [activeSession.selected_model]
-                      ).map((m) => (
-                        <option key={m} value={m}>
-                          模型: {m}
-                        </option>
-                      ))}
+                      {(() => {
+                        const base = activeAgent?.model_options.length
+                          ? activeAgent.model_options
+                          : [activeSession.selected_model];
+                        const opts =
+                          activeSession.selected_model &&
+                          !base.includes(activeSession.selected_model)
+                            ? [activeSession.selected_model, ...base]
+                            : base;
+                        return opts.map((m) => (
+                          <option key={m} value={m}>
+                            模型: {m}
+                          </option>
+                        ));
+                      })()}
                     </select>
 
                     <select
@@ -952,14 +1099,9 @@ export default function AcpWorkspaceView() {
                       aria-label="思考深度"
                       value={activeSession.thinking_level}
                       onChange={(e) =>
-                        void acp
-                          .updateSession(activeSession.id, {
-                            thinking_level: e.target.value as AcpThinkingLevel,
-                          })
-                          .then(patchSessionState)
-                          .catch((ex) =>
-                            setErrMsg(ex instanceof Error ? ex.message : "更新思考深度失败"),
-                          )
+                        mutateSessionLocalFirst(activeSession.id, {
+                          thinking_level: e.target.value as AcpThinkingLevel,
+                        })
                       }
                     >
                       {THINKING_LEVELS.map((lv) => (
@@ -974,14 +1116,9 @@ export default function AcpWorkspaceView() {
                       aria-label="权限策略"
                       value={activeSession.permission_policy}
                       onChange={(e) =>
-                        void acp
-                          .updateSession(activeSession.id, {
-                            permission_policy: e.target.value as AcpPermissionPolicy,
-                          })
-                          .then(patchSessionState)
-                          .catch((ex) =>
-                            setErrMsg(ex instanceof Error ? ex.message : "更新权限策略失败"),
-                          )
+                        mutateSessionLocalFirst(activeSession.id, {
+                          permission_policy: e.target.value as AcpPermissionPolicy,
+                        })
                       }
                     >
                       {PERMISSION_POLICIES.map((p) => (
@@ -997,18 +1134,9 @@ export default function AcpWorkspaceView() {
                         aria-label="Git 分支"
                         value={activeWs.branch}
                         onChange={(e) =>
-                          void acp
-                            .gitCheckout(activeWs.id, e.target.value)
-                            .then((ws) =>
-                              setState((cur) => ({
-                                acpWorkspaces: cur.acpWorkspaces.map((x) =>
-                                  x.id === ws.id ? ws : x,
-                                ),
-                              })),
-                            )
-                            .catch((ex) =>
-                              setErrMsg(ex instanceof Error ? ex.message : "切换分支失败"),
-                            )
+                          void gitCheckoutLocalFirst(activeWs, e.target.value).catch((ex) =>
+                            setErrMsg(ex instanceof Error ? ex.message : "切换分支失败"),
+                          )
                         }
                       >
                         {activeWs.branches.map((b) => (
@@ -1025,8 +1153,7 @@ export default function AcpWorkspaceView() {
                       type="button"
                       className="btn-danger-soft"
                       onClick={() =>
-                        void acp
-                          .cancelSession(activeSession.id)
+                        void cancelSessionLocalFirst(activeSession)
                           .then(patchSessionState)
                           .catch((ex) =>
                             setErrMsg(ex instanceof Error ? ex.message : "停止运行失败"),

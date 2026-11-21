@@ -125,12 +125,8 @@ pub(crate) fn preset_defaults(preset: &str) -> PresetDefaults {
             short_tag: "CC",
             badge_bg: "from-orange-500 to-amber-600",
             adapter: "claude-agent-acp",
-            default_model: "Claude Sonnet 4.5",
-            model_options: vec![
-                "Claude Sonnet 4.5".into(),
-                "Claude Opus 4.1".into(),
-                "Claude Haiku 4.5".into(),
-            ],
+            default_model: "Default Model",
+            model_options: vec!["Default Model".into()],
             capabilities: vec![
                 "fs.read".into(),
                 "fs.write".into(),
@@ -142,28 +138,24 @@ pub(crate) fn preset_defaults(preset: &str) -> PresetDefaults {
             short_tag: "GM",
             badge_bg: "from-indigo-500 to-sky-500",
             adapter: "gemini --acp",
-            default_model: "Gemini 2.5 Pro",
-            model_options: vec!["Gemini 2.5 Pro".into(), "Gemini 2.5 Flash".into()],
+            default_model: "Default Model",
+            model_options: vec!["Default Model".into()],
             capabilities: vec!["fs.read".into(), "fs.write".into(), "terminal.run".into()],
         },
         "codex" => PresetDefaults {
             short_tag: "CX",
             badge_bg: "from-emerald-500 to-teal-600",
             adapter: "codex-acp",
-            default_model: "GPT-5 Codex",
-            model_options: vec!["GPT-5 Codex".into(), "o3-pro".into(), "GPT-4.1".into()],
+            default_model: "Default Model",
+            model_options: vec!["Default Model".into()],
             capabilities: vec!["fs.read".into(), "fs.write".into(), "terminal.run".into()],
         },
         "opencode" => PresetDefaults {
             short_tag: "OC",
             badge_bg: "from-violet-500 to-purple-600",
             adapter: "opencode acp",
-            default_model: "Claude Sonnet 4.5",
-            model_options: vec![
-                "Claude Sonnet 4.5".into(),
-                "Gemini 2.5 Pro".into(),
-                "GPT-5 Codex".into(),
-            ],
+            default_model: "Default Model",
+            model_options: vec!["Default Model".into()],
             capabilities: vec!["fs.read".into(), "fs.write".into(), "terminal.run".into()],
         },
         "pi" => PresetDefaults {
@@ -188,6 +180,73 @@ pub(crate) fn preset_defaults(preset: &str) -> PresetDefaults {
             capabilities: vec!["fs.read".into(), "fs.write".into(), "terminal.run".into()],
         },
     }
+}
+
+pub(crate) fn is_placeholder_or_legacy_model(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        ""
+            | "default model"
+            | "default"
+            | "默认"
+            | "默认模型"
+            | "gpt-5 codex"
+            | "o3-pro"
+            | "gpt-4.1"
+            | "claude sonnet 4.5"
+            | "claude opus 4.1"
+            | "claude haiku 4.5"
+            | "gemini 2.5 pro"
+            | "gemini 2.5 flash"
+    )
+}
+
+pub(crate) fn sanitize_model_list(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in raw {
+        let trimmed: String = item.trim().chars().take(120).collect();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|x| x == &trimmed) {
+            out.push(trimmed);
+            if out.len() >= 64 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn resolve_probed_models(
+    cur_default: &str,
+    probed_default: Option<&str>,
+    probed_options: &[String],
+) -> Option<(String, Vec<String>)> {
+    let real_options: Vec<String> = sanitize_model_list(probed_options)
+        .into_iter()
+        .filter(|m| !is_placeholder_or_legacy_model(m))
+        .collect();
+    if real_options.is_empty() {
+        return None;
+    }
+
+    let cur_trimmed = cur_default.trim();
+    let next_default = if !is_placeholder_or_legacy_model(cur_trimmed)
+        && real_options.iter().any(|x| x == cur_trimmed)
+    {
+        cur_trimmed.to_string()
+    } else if let Some(pd) = probed_default
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|pd| real_options.iter().find(|x| x.as_str() == pd))
+    {
+        pd.clone()
+    } else {
+        real_options[0].clone()
+    };
+
+    Some((next_default, real_options))
 }
 
 pub(crate) fn derive_workspace_name(cwd: &str, alias: Option<&str>) -> String {
@@ -369,8 +428,100 @@ fn agent_from_row_inner(row: &sqlx::postgres::PgRow, mask_env: bool) -> AcpAgent
     }
 }
 
-fn agent_from_row(row: &sqlx::postgres::PgRow) -> AcpAgentView {
+pub(crate) fn agent_from_row(row: &sqlx::postgres::PgRow) -> AcpAgentView {
     agent_from_row_inner(row, true)
+}
+
+pub(crate) async fn apply_agent_probed_models(
+    st: &SharedState,
+    uid: Uuid,
+    agent_id: Uuid,
+    expected_host_id: Option<Uuid>,
+    target_session_id: Option<Uuid>,
+    probed_default: Option<&str>,
+    probed_options: &[String],
+) -> AppResult<AcpAgentView> {
+    let cur = load_agent(&st.pool, uid, agent_id).await?;
+    if let Some(hid) = expected_host_id {
+        if cur.host_id != hid {
+            return Err(AppError::not_found("agent not found"));
+        }
+    }
+
+    let Some((next_default, next_options)) =
+        resolve_probed_models(&cur.default_model, probed_default, probed_options)
+    else {
+        return Ok(cur);
+    };
+
+    let agent_changed =
+        cur.default_model != next_default || cur.model_options != next_options || cur.status != "online";
+    let updated_agent = if agent_changed {
+        let row = sqlx::query(
+            "UPDATE acp_agents
+                SET default_model = $3,
+                    model_options = $4,
+                    status = 'online',
+                    updated_at = now()
+              WHERE id = $1 AND user_id = $2
+              RETURNING id, acp_host_id, preset, name, adapter, cmd, env_json, short_tag, badge_bg,
+                        default_model, model_options, permission_override, capabilities, status,
+                        created_at, updated_at",
+        )
+        .bind(agent_id)
+        .bind(uid)
+        .bind(&next_default)
+        .bind(json!(&next_options))
+        .fetch_one(&st.pool)
+        .await?;
+        let view = agent_from_row(&row);
+        broadcast_acp(st, uid, "agent_upserted", json!({ "agent": view }));
+        view
+    } else {
+        cur.clone()
+    };
+
+    // 对尚未真正启动过对话（acp_session_key IS NULL 且非运行态）的会话，若仍处于占位/旧默认模型或不在有效列表中则同步到新默认模型
+    let candidate_sessions = sqlx::query(
+        "SELECT id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
+                permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                created_at, updated_at
+           FROM acp_sessions
+          WHERE user_id = $1 AND acp_agent_id = $2 AND running = false AND acp_session_key IS NULL",
+    )
+    .bind(uid)
+    .bind(agent_id)
+    .fetch_all(&st.pool)
+    .await?;
+
+    for srow in candidate_sessions {
+        let sid: Uuid = srow.get("id");
+        let sel: String = srow.get("selected_model");
+        let should_sync = is_placeholder_or_legacy_model(&sel)
+            || sel == cur.default_model
+            || (target_session_id == Some(sid) && !next_options.iter().any(|x| x == &sel));
+        if should_sync && sel != next_default {
+            if let Ok(urow) = sqlx::query(
+                "UPDATE acp_sessions
+                    SET selected_model = $3, updated_at = now()
+                  WHERE id = $1 AND user_id = $2 AND running = false
+                  RETURNING id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
+                            permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                            created_at, updated_at",
+            )
+            .bind(sid)
+            .bind(uid)
+            .bind(&next_default)
+            .fetch_one(&st.pool)
+            .await
+            {
+                let sview = session_from_row(&urow, None);
+                broadcast_acp(st, uid, "session_upserted", json!({ "session": sview }));
+            }
+        }
+    }
+
+    Ok(updated_agent)
 }
 
 pub(crate) async fn load_agent_raw(
@@ -390,21 +541,6 @@ pub(crate) async fn load_agent_raw(
     .await?
     .ok_or_else(|| AppError::not_found("agent not found"))?;
     Ok(agent_from_row_inner(&row, false))
-}
-
-pub(crate) async fn load_agent_env_map(
-    pool: &PgPool,
-    uid: Uuid,
-    agent_id: Uuid,
-) -> AppResult<Value> {
-    sqlx::query_scalar::<_, Value>(
-        "SELECT env_json FROM acp_agents WHERE id = $1 AND user_id = $2",
-    )
-    .bind(agent_id)
-    .bind(uid)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| AppError::not_found("agent not found"))
 }
 
 pub(crate) async fn delete_acp_attachment_files(files_dir: &str, paths: &[String]) {
@@ -430,6 +566,23 @@ pub async fn reset_stale_acp_state(pool: &PgPool) -> Result<(), sqlx::Error> {
                 payload = jsonb_set(payload, '{chosen_option}', '\"server_restarted\"'::jsonb),
                 updated_at = now()
           WHERE role = 'permission' AND status = 'pending'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE acp_turns
+            SET status = 'done',
+                updated_at = now()
+          WHERE role IN ('agent_text', 'agent_thought') AND status = 'streaming'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE acp_turns
+            SET status = 'failed',
+                payload = jsonb_set(payload, '{is_error}', 'true'::jsonb),
+                updated_at = now()
+          WHERE role = 'tool_call' AND status IN ('pending', 'in_progress')",
     )
     .execute(pool)
     .await?;
@@ -652,15 +805,46 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::preset_defaults;
+    use super::{preset_defaults, resolve_probed_models};
 
     #[test]
-    fn pi_preset_defaults_match_rpc_driver() {
-        let p = preset_defaults("pi");
-        assert_eq!(p.short_tag, "PI");
-        assert_eq!(p.adapter, "pi-rpc");
-        assert_eq!(p.default_model, "Default Model");
-        assert!(p.capabilities.contains(&"fs.read".to_string()));
-        assert!(p.capabilities.contains(&"terminal.run".to_string()));
+    fn preset_defaults_use_neutral_placeholder_until_probed() {
+        for id in ["claude", "codex", "gemini", "opencode", "pi", "custom"] {
+            let p = preset_defaults(id);
+            assert_eq!(p.default_model, "Default Model");
+            assert_eq!(p.model_options, vec!["Default Model".to_string()]);
+        }
+        let pi = preset_defaults("pi");
+        assert_eq!(pi.short_tag, "PI");
+        assert_eq!(pi.adapter, "pi-rpc");
+        assert!(pi.capabilities.contains(&"fs.read".to_string()));
+        assert!(pi.capabilities.contains(&"terminal.run".to_string()));
+    }
+
+    #[test]
+    fn resolve_probed_models_replaces_legacy_placeholders_and_preserves_valid_user_choice() {
+        let probed = vec![
+            "xy-open/glm-5.3".to_string(),
+            "xy-openai/gpt-6.2-astra".to_string(),
+        ];
+
+        // 旧预设占位名应被探测返回的默认模型替换
+        let (def1, opts1) = resolve_probed_models(
+            "GPT-5 Codex",
+            Some("xy-openai/gpt-6.2-astra"),
+            &probed,
+        )
+        .unwrap();
+        assert_eq!(def1, "xy-openai/gpt-6.2-astra");
+        assert_eq!(opts1, probed);
+
+        // 用户已手动选中的真实模型若仍在探测列表中，应保留用户选择
+        let (def2, _) = resolve_probed_models(
+            "xy-open/glm-5.3",
+            Some("xy-openai/gpt-6.2-astra"),
+            &probed,
+        )
+        .unwrap();
+        assert_eq!(def2, "xy-open/glm-5.3");
     }
 }

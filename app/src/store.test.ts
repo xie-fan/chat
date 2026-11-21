@@ -95,6 +95,7 @@ function state(patch: Partial<AppState> = {}): AppState {
     acpWorkspaces: [],
     acpSessions: [],
     acpLoaded: false,
+    acpActivity: {},
     activeAcpHostId: null,
     activeAcpWorkspaceId: null,
     activeAcpSessionId: null,

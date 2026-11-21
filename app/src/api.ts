@@ -1239,6 +1239,10 @@ export const acp = {
     adapter?: string;
     cmd: string;
     env?: Record<string, string>;
+    local_probed?: boolean;
+    status?: string;
+    default_model?: string;
+    model_options?: string[];
   }) => post<AcpAgent>("/acp/agents", body),
   updateAgent: (
     id: string,
@@ -1252,13 +1256,30 @@ export const acp = {
     },
   ) => patch<AcpAgent>(`/acp/agents/${id}`, body),
   deleteAgent: (id: string) => del<void>(`/acp/agents/${id}`),
-  createWorkspace: (body: { host_id: string; cwd: string; name?: string }) =>
-    post<AcpWorkspace>("/acp/workspaces", body),
+  probeAgentModels: (
+    id: string,
+    body?: { session_id?: string; wait?: boolean },
+  ) => post<AcpAgent>(`/acp/agents/${id}/probe-models`, body ?? {}),
+  createWorkspace: (body: {
+    host_id: string;
+    cwd: string;
+    name?: string;
+    local_probed?: boolean;
+    branch?: string;
+    branches?: string[];
+  }) => post<AcpWorkspace>("/acp/workspaces", body),
   deleteWorkspace: (id: string) => del<void>(`/acp/workspaces/${id}`),
-  gitCheckout: (workspaceId: string, branch: string) =>
-    post<AcpWorkspace>(`/acp/workspaces/${workspaceId}/git-checkout`, { branch }),
-  createSession: (body: { workspace_id: string; agent_id: string; title?: string }) =>
-    post<AcpSession>("/acp/sessions", body),
+  gitCheckout: (
+    workspaceId: string,
+    branch: string,
+    extra?: { local_probed?: boolean; branches?: string[] },
+  ) => post<AcpWorkspace>(`/acp/workspaces/${workspaceId}/git-checkout`, { branch, ...extra }),
+  createSession: (body: {
+    workspace_id: string;
+    agent_id: string;
+    title?: string;
+    skip_model_probe?: boolean;
+  }) => post<AcpSession>("/acp/sessions", body),
   updateSession: (
     id: string,
     body: {

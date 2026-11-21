@@ -843,3 +843,478 @@ async fn create_installable_agent_triggers_ensure_and_status_updates() {
     assert_eq!(online_ev["data"]["agent"]["id"], agent_id);
     assert_eq!(online_ev["data"]["agent"]["status"], "online");
 }
+
+#[tokio::test]
+async fn agent_model_probe_on_attach_new_session_async_sync_and_option_delete_fallback() {
+    let base = spawn().await;
+    let u = register(&base, &format!("acpm_{}", uniq())).await;
+
+    let (mut client_ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await)
+        .await
+        .unwrap();
+    let mut host_ws = host_ws_connect(&base, &u).await;
+
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "host_hello",
+                "install_id": Uuid::new_v4(),
+                "name": "DevHost",
+                "os": "windows · x86_64",
+                "ip": "127.0.0.1",
+                "roots": ["C:\\work"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ready = next_of(&mut host_ws, "host_ready").await;
+    let host_id = ready["host_id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "host_upserted").await;
+
+    // 1. 接入时 probe_agent 直接返回真实模型列表
+    let ag_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/acp/agents"))
+                .header("authorization", authz(&access))
+                .json(&json!({
+                    "host_id": host_id,
+                    "preset": "codex",
+                    "name": "Codex CLI",
+                    "cmd": "codex-acp"
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+
+    let probe_ag = next_of(&mut host_ws, "rpc_call").await;
+    assert_eq!(probe_ag["method"], "probe_agent");
+    assert_eq!(probe_ag["params"]["preset"], "codex");
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "rpc_result",
+                "req_id": probe_ag["req_id"],
+                "ok": true,
+                "data": {
+                    "ok": true,
+                    "installable": true,
+                    "default_model": "xy-openai/gpt-6.2-astra",
+                    "model_options": [
+                        "xy-open/glm-5.3",
+                        "xy-openai/gpt-6.2-astra"
+                    ]
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let ag_res: Value = ag_req.await.unwrap().json().await.unwrap();
+    let agent_id = ag_res["id"].as_str().unwrap().to_string();
+    assert_eq!(ag_res["default_model"], "xy-openai/gpt-6.2-astra");
+    assert_eq!(
+        ag_res["model_options"],
+        json!(["xy-open/glm-5.3", "xy-openai/gpt-6.2-astra"])
+    );
+    let _ = next_acp_event(&mut client_ws, "agent_upserted").await;
+
+    // 2. 删除当前默认模型选项时，default_model 自动回退到首项
+    let after_del: Value = http()
+        .patch(format!("{base}/v1/acp/agents/{agent_id}"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "model_options": ["xy-open/glm-5.3"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_del["default_model"], "xy-open/glm-5.3");
+    assert_eq!(after_del["model_options"], json!(["xy-open/glm-5.3"]));
+    let _ = next_acp_event(&mut client_ws, "agent_upserted").await;
+
+    // 3. 创建工作区并新建会话：服务端立即返回会话，同时异步向宿主机发送 probe_agent_models
+    let ws_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/acp/workspaces"))
+                .header("authorization", authz(&access))
+                .json(&json!({ "host_id": host_id, "cwd": "C:\\work\\repo" }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    let probe_ws = next_of(&mut host_ws, "rpc_call").await;
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "rpc_result",
+                "req_id": probe_ws["req_id"],
+                "ok": true,
+                "data": { "cwd": "C:\\work\\repo", "branch": "main", "branches": ["main"] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ws_json: Value = ws_req.await.unwrap().json().await.unwrap();
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "workspace_upserted").await;
+
+    // 模拟历史旧预设残留（如 GPT-5 Codex），验证新建会话后异步探测能同步刷新 Agent 与新会话模型
+    let _ = http()
+        .patch(format!("{base}/v1/acp/agents/{agent_id}"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "default_model": "GPT-5 Codex",
+            "model_options": ["GPT-5 Codex", "o3-pro"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let _ = next_acp_event(&mut client_ws, "agent_upserted").await;
+
+    let sess: Value = http()
+        .post(format!("{base}/v1/acp/sessions"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "workspace_id": ws_id, "agent_id": agent_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sess_id = sess["id"].as_str().unwrap().to_string();
+    assert_eq!(sess["selected_model"], "GPT-5 Codex");
+    let _ = next_acp_event(&mut client_ws, "session_upserted").await;
+
+    let probe_msg = next_of(&mut host_ws, "probe_agent_models").await;
+    assert_eq!(probe_msg["agent_id"], agent_id);
+    assert_eq!(probe_msg["session_id"], sess_id);
+    assert_eq!(probe_msg["cwd"], "C:\\work\\repo");
+
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "agent_models",
+                "agent_id": agent_id,
+                "session_id": sess_id,
+                "default_model": "xy-openai/gpt-6.2-sol",
+                "model_options": [
+                    "xy-open/glm-5.3",
+                    "xy-openai/gpt-6.2-sol",
+                    "xy-openai/gpt-6.2-astra"
+                ]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let ag_ev = next_acp_event(&mut client_ws, "agent_upserted").await;
+    assert_eq!(ag_ev["data"]["agent"]["default_model"], "xy-openai/gpt-6.2-sol");
+    assert_eq!(
+        ag_ev["data"]["agent"]["model_options"],
+        json!([
+            "xy-open/glm-5.3",
+            "xy-openai/gpt-6.2-sol",
+            "xy-openai/gpt-6.2-astra"
+        ])
+    );
+
+    let sess_ev = next_acp_event(&mut client_ws, "session_upserted").await;
+    assert_eq!(sess_ev["data"]["session"]["id"], sess_id);
+    assert_eq!(sess_ev["data"]["session"]["selected_model"], "xy-openai/gpt-6.2-sol");
+}
+
+#[tokio::test]
+async fn acp_streams_thoughts_tool_calls_and_activity_events() {
+    let base = spawn().await;
+    let u = register(&base, &format!("acpact_{}", uniq())).await;
+
+    let (mut client_ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await)
+        .await
+        .unwrap();
+    let mut host_ws = host_ws_connect(&base, &u).await;
+
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "host_hello",
+                "install_id": Uuid::new_v4(),
+                "name": "StreamBox",
+                "os": "Linux 6.8",
+                "ip": "127.0.0.1",
+                "roots": ["/tmp/repo"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ready = next_of(&mut host_ws, "host_ready").await;
+    let host_id = ready["host_id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "host_upserted").await;
+
+    let ag_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/acp/agents"))
+                .header("authorization", authz(&access))
+                .json(&json!({
+                    "host_id": host_id,
+                    "preset": "pi",
+                    "name": "Pi",
+                    "cmd": "pi --mode rpc",
+                    "local_probed": true,
+                    "status": "online"
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    let ag_res: Value = ag_req.await.unwrap().json().await.unwrap();
+    let agent_id = ag_res["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "agent_upserted").await;
+
+    let ws_json: Value = http()
+        .post(format!("{base}/v1/acp/workspaces"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "host_id": host_id,
+            "cwd": "/tmp/repo",
+            "local_probed": true,
+            "branch": "main",
+            "branches": ["main"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "workspace_upserted").await;
+
+    let sess: Value = http()
+        .post(format!("{base}/v1/acp/sessions"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "workspace_id": ws_id,
+            "agent_id": agent_id,
+            "skip_model_probe": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sess_id = sess["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "session_upserted").await;
+
+    let p_res = http()
+        .post(format!("{base}/v1/acp/sessions/{sess_id}/prompts"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "text": "检查代码" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(p_res.status(), 200);
+    let _ = next_of(&mut host_ws, "prompt_start").await;
+
+    // 1. 实时状态广播（不落库）
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "activity",
+                "phase": "thinking",
+                "detail": "正在思考…",
+                "usage": { "input_tokens": 120, "output_tokens": 15, "total_tokens": 135 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let act_ev = next_acp_event(&mut client_ws, "session_activity").await;
+    assert_eq!(act_ev["data"]["phase"], "thinking");
+    assert_eq!(act_ev["data"]["usage"]["total_tokens"], 135);
+
+    // 2. 思考流增量 + 完成耗时
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "thought_delta",
+                "turn_key": "th-1",
+                "delta": "先看下目录",
+                "done": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "thought_delta",
+                "turn_key": "th-1",
+                "delta": "结构。",
+                "done": true,
+                "duration_ms": 950
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    // 3. 工具调用生命周期：pending -> in_progress + output_delta -> completed + duration_ms
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "tool_call",
+                "tool_call_id": "tc-1",
+                "name": "bash",
+                "tool_kind": "execute",
+                "title": "bash: cargo check",
+                "input": "cargo check",
+                "status": "pending"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "tool_call",
+                "tool_call_id": "tc-1",
+                "status": "in_progress",
+                "output_delta": "Checking crate...\n"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "tool_call",
+                "tool_call_id": "tc-1",
+                "status": "completed",
+                "output_delta": "Finished dev profile\n",
+                "duration_ms": 620
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    // 4. 正文流 + prompt_done
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "text_delta",
+                "turn_key": "txt-1",
+                "delta": "检查通过。",
+                "done": true
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "prompt_done",
+                "acp_session_key": "pi-k-1"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut verified = false;
+    for _ in 0..20 {
+        let bs: Value = http()
+            .get(format!("{base}/v1/acp/bootstrap"))
+            .header("authorization", authz(&u.access))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let s = &bs["sessions"][0];
+        if s["running"] == false && s["acp_session_key"] == "pi-k-1" {
+            let turns = s["turns"].as_array().unwrap();
+            let th = turns.iter().find(|t| t["role"] == "agent_thought").unwrap();
+            assert_eq!(th["status"], "done");
+            assert_eq!(th["payload"]["text"], "先看下目录结构。");
+            assert_eq!(th["payload"]["duration_ms"], 950);
+
+            let tc = turns.iter().find(|t| t["role"] == "tool_call").unwrap();
+            assert_eq!(tc["status"], "completed");
+            assert_eq!(tc["payload"]["kind"], "execute");
+            assert_eq!(tc["payload"]["title"], "bash: cargo check");
+            assert_eq!(
+                tc["payload"]["output"],
+                "Checking crate...\nFinished dev profile\n"
+            );
+            assert_eq!(tc["payload"]["duration_ms"], 620);
+
+            let txt = turns.iter().find(|t| t["role"] == "agent_text").unwrap();
+            assert_eq!(txt["status"], "done");
+            assert_eq!(txt["payload"]["text"], "检查通过。");
+            verified = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(verified, "bootstrap should persist thought, tool_call, and text turns");
+}

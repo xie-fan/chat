@@ -1,8 +1,9 @@
 use super::{
-    base64_encode, broadcast_acp, call_host_rpc, delete_acp_attachment_files, derive_workspace_name,
-    host_ws::insert_turn_tx, load_agent, load_agent_env_map, load_agent_raw, load_bootstrap,
-    load_host, load_session_meta, load_settings, load_workspace, preset_defaults, turn_from_row,
-    AcpAttachmentView, AcpBootstrapView, AcpSettingsView,
+    agent_from_row, apply_agent_probed_models, base64_encode, broadcast_acp, call_host_rpc,
+    delete_acp_attachment_files, derive_workspace_name, host_ws::insert_turn_tx, load_agent_raw,
+    load_bootstrap, load_host, load_session_meta, load_settings, load_workspace, preset_defaults,
+    resolve_probed_models, sanitize_model_list, turn_from_row, AcpAttachmentView, AcpBootstrapView,
+    AcpSettingsView,
 };
 use crate::api::{
     inline_safe, pct_encode, quota_message, read_upload, serve_stored, stored_file_path,
@@ -43,6 +44,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/hosts/{id}/dirs", get(list_host_dirs))
         .route("/agents", post(create_agent))
         .route("/agents/{id}", patch(update_agent).delete(delete_agent))
+        .route("/agents/{id}/probe-models", post(probe_agent_models))
         .route("/workspaces", post(create_workspace))
         .route("/workspaces/{id}", delete(delete_workspace))
         .route("/workspaces/{id}/git-checkout", post(git_checkout))
@@ -296,36 +298,101 @@ struct CreateAgentReq {
     cmd: String,
     #[serde(default)]
     env: Option<Value>,
+    #[serde(default)]
+    local_probed: bool,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    model_options: Option<Vec<String>>,
 }
 
 fn default_custom_preset() -> String {
     "custom".to_string()
 }
 
-async fn probe_and_resolve_status(
+async fn probe_and_resolve_agent(
     st: &SharedState,
     uid: Uuid,
     host_id: Uuid,
+    preset: &str,
     cmd: &str,
-) -> (&'static str, bool) {
+    env: &Value,
+    cur_default: &str,
+) -> (&'static str, bool, Option<(String, Vec<String>)>) {
     if !st.acp_hosts.contains_key(&host_id) {
-        return ("standby", false);
+        return ("standby", false, None);
     }
-    match call_host_rpc(st, uid, host_id, "probe_agent", json!({ "cmd": cmd })).await {
-        Ok(res) if res["ok"].as_bool() == Some(true) => ("online", false),
-        Ok(res) if res["installable"].as_bool() == Some(true) => ("installing", true),
-        _ => ("standby", false),
+    let rpc_res = call_host_rpc(
+        st,
+        uid,
+        host_id,
+        "probe_agent",
+        json!({ "cmd": cmd, "preset": preset, "env": env }),
+    )
+    .await;
+    match rpc_res {
+        Ok(res) if res["ok"].as_bool() == Some(true) => {
+            let probed_default = res["default_model"].as_str();
+            let probed_opts: Vec<String> =
+                serde_json::from_value(res["model_options"].clone()).unwrap_or_default();
+            let resolved = resolve_probed_models(cur_default, probed_default, &probed_opts);
+            ("online", false, resolved)
+        }
+        Ok(res) if res["installable"].as_bool() == Some(true) => ("installing", true, None),
+        _ => ("standby", false, None),
     }
 }
 
-fn trigger_ensure_agent(st: &SharedState, uid: Uuid, host_id: Uuid, agent_id: Uuid, cmd: &str) {
+fn trigger_ensure_agent(
+    st: &SharedState,
+    uid: Uuid,
+    host_id: Uuid,
+    agent_id: Uuid,
+    preset: &str,
+    cmd: &str,
+    env: &Value,
+) {
     if let Some(conn) = st.acp_hosts.get(&host_id) {
         if conn.uid == uid {
             let _ = conn.tx.try_send(ConnMsg::Frame(
                 json!({
                     "type": "ensure_agent",
                     "agent_id": agent_id,
+                    "preset": preset,
                     "cmd": cmd,
+                    "env": env,
+                })
+                .to_string(),
+            ));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trigger_probe_agent_models(
+    st: &SharedState,
+    uid: Uuid,
+    host_id: Uuid,
+    agent_id: Uuid,
+    session_id: Option<Uuid>,
+    cwd: Option<&str>,
+    preset: &str,
+    cmd: &str,
+    env: &Value,
+) {
+    if let Some(conn) = st.acp_hosts.get(&host_id) {
+        if conn.uid == uid {
+            let _ = conn.tx.try_send(ConnMsg::Frame(
+                json!({
+                    "type": "probe_agent_models",
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "cwd": cwd,
+                    "preset": preset,
+                    "cmd": cmd,
+                    "env": env,
                 })
                 .to_string(),
             ));
@@ -354,7 +421,8 @@ async fn create_agent(
     if name.is_empty() || cmd.is_empty() {
         return Err(AppError::bad_request("name and cmd are required"));
     }
-    let defaults = preset_defaults(req.preset.trim());
+    let preset = req.preset.trim();
+    let defaults = preset_defaults(preset);
     let adapter = req
         .adapter
         .as_deref()
@@ -366,36 +434,78 @@ async fn create_agent(
         _ => json!({}),
     };
 
-    // 如果宿主机在线，尝试探测本地可执行文件；若为官方可安装适配器则返回 installing 并后台预装
-    let (status, should_ensure) = probe_and_resolve_status(&st, uid, req.host_id, &cmd).await;
+    let (status, should_ensure, probed_models) = if req.local_probed {
+        let st_norm = match req.status.as_deref() {
+            Some("online") => "online",
+            Some("installing") => "installing",
+            _ => "standby",
+        };
+        let resolved = req
+            .model_options
+            .as_deref()
+            .and_then(|opts| {
+                resolve_probed_models(defaults.default_model, req.default_model.as_deref(), opts)
+            });
+        (st_norm, false, resolved)
+    } else {
+        probe_and_resolve_agent(
+            &st,
+            uid,
+            req.host_id,
+            preset,
+            &cmd,
+            &env_json,
+            defaults.default_model,
+        )
+        .await
+    };
+    let has_probed_models = probed_models.is_some();
+    let (init_default_model, init_model_options) = probed_models
+        .unwrap_or_else(|| (defaults.default_model.to_string(), defaults.model_options));
 
-    let agent_id = sqlx::query_scalar::<_, Uuid>(
+    let row = sqlx::query(
         "INSERT INTO acp_agents
              (user_id, acp_host_id, preset, name, adapter, cmd, env_json, short_tag, badge_bg,
               default_model, model_options, permission_override, capabilities, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'inherit', $12, $13)
-         RETURNING id",
+         RETURNING id, acp_host_id, preset, name, adapter, cmd, env_json, short_tag, badge_bg,
+                   default_model, model_options, permission_override, capabilities, status,
+                   created_at, updated_at",
     )
     .bind(uid)
     .bind(req.host_id)
-    .bind(req.preset.trim())
+    .bind(preset)
     .bind(&name)
     .bind(adapter)
     .bind(&cmd)
     .bind(&env_json)
     .bind(defaults.short_tag)
     .bind(defaults.badge_bg)
-    .bind(defaults.default_model)
-    .bind(json!(defaults.model_options))
+    .bind(&init_default_model)
+    .bind(json!(init_model_options))
     .bind(json!(defaults.capabilities))
     .bind(status)
     .fetch_one(&st.pool)
     .await?;
 
-    let view = load_agent(&st.pool, uid, agent_id).await?;
+    let view = agent_from_row(&row);
     broadcast_acp(&st, uid, "agent_upserted", json!({ "agent": view }));
-    if should_ensure {
-        trigger_ensure_agent(&st, uid, req.host_id, agent_id, &cmd);
+    if !req.local_probed {
+        if should_ensure {
+            trigger_ensure_agent(&st, uid, req.host_id, view.id, preset, &cmd, &env_json);
+        } else if status == "online" && !has_probed_models {
+            trigger_probe_agent_models(
+                &st,
+                uid,
+                req.host_id,
+                view.id,
+                None,
+                None,
+                preset,
+                &cmd,
+                &env_json,
+            );
+        }
     }
     Ok(Json(view))
 }
@@ -417,8 +527,7 @@ async fn update_agent(
     Json(req): Json<UpdateAgentReq>,
 ) -> AppResult<Json<super::AcpAgentView>> {
     let uid = uid_of(&headers, &st).await?;
-    let cur = load_agent(&st.pool, uid, agent_id).await?;
-    let cur_raw_env = load_agent_env_map(&st.pool, uid, agent_id).await?;
+    let cur = load_agent_raw(&st.pool, uid, agent_id).await?;
 
     let name = match req.name {
         Some(n) => {
@@ -441,10 +550,10 @@ async fn update_agent(
         }
         None => (cur.cmd, false),
     };
-    let next_env = match req.env {
+    let (next_env, env_changed) = match req.env {
         Some(Value::Object(map)) => {
             let mut merged = serde_json::Map::new();
-            let prev_obj = cur_raw_env.as_object();
+            let prev_obj = cur.env.as_object();
             for (k, v) in map {
                 let s = v.as_str().unwrap_or("");
                 if s == "••••••••" {
@@ -455,20 +564,37 @@ async fn update_agent(
                     merged.insert(k, Value::String(s.to_string()));
                 }
             }
-            Value::Object(merged)
+            let val = Value::Object(merged);
+            let changed = val != cur.env;
+            (val, changed)
         }
-        _ => cur_raw_env,
+        _ => (cur.env, false),
     };
-    let mut model_options = req.model_options.unwrap_or(cur.model_options);
-    let default_model = match req.default_model {
+    let mut model_options = match req.model_options {
+        Some(opts) => {
+            let cleaned = sanitize_model_list(&opts);
+            if cleaned.is_empty() {
+                return Err(AppError::bad_request("model_options cannot be empty"));
+            }
+            cleaned
+        }
+        None => cur.model_options,
+    };
+    let mut default_model = match req.default_model {
         Some(m) => {
-            let trimmed = m.trim().to_string();
+            let trimmed: String = m.trim().chars().take(120).collect();
             if !trimmed.is_empty() && !model_options.contains(&trimmed) {
                 model_options.push(trimmed.clone());
             }
             trimmed
         }
-        None => cur.default_model,
+        None => {
+            if !model_options.is_empty() && !model_options.contains(&cur.default_model) {
+                model_options[0].clone()
+            } else {
+                cur.default_model
+            }
+        }
     };
     let permission_override = match req.permission_override {
         Some(p) => {
@@ -484,18 +610,35 @@ async fn update_agent(
         None => cur.permission_override,
     };
 
-    let (next_status, should_ensure) = if cmd_changed {
-        let (st_str, ens) = probe_and_resolve_status(&st, uid, cur.host_id, &cmd).await;
-        (st_str.to_string(), ens)
+    let (next_status, should_ensure, has_probed_models) = if cmd_changed {
+        let (st_str, ens, probed) = probe_and_resolve_agent(
+            &st,
+            uid,
+            cur.host_id,
+            &cur.preset,
+            &cmd,
+            &next_env,
+            &default_model,
+        )
+        .await;
+        let has_probed = probed.is_some();
+        if let Some((pd, popts)) = probed {
+            default_model = pd;
+            model_options = popts;
+        }
+        (st_str.to_string(), ens, has_probed)
     } else {
-        (cur.status.clone(), false)
+        (cur.status.clone(), false, false)
     };
 
-    sqlx::query(
+    let row = sqlx::query(
         "UPDATE acp_agents
             SET name = $2, cmd = $3, env_json = $4, default_model = $5, model_options = $6,
                 permission_override = $7, status = $8, updated_at = now()
-          WHERE id = $1 AND user_id = $9",
+          WHERE id = $1 AND user_id = $9
+          RETURNING id, acp_host_id, preset, name, adapter, cmd, env_json, short_tag, badge_bg,
+                    default_model, model_options, permission_override, capabilities, status,
+                    created_at, updated_at",
     )
     .bind(agent_id)
     .bind(&name)
@@ -506,15 +649,123 @@ async fn update_agent(
     .bind(&permission_override)
     .bind(&next_status)
     .bind(uid)
-    .execute(&st.pool)
+    .fetch_one(&st.pool)
     .await?;
 
-    let view = load_agent(&st.pool, uid, agent_id).await?;
+    let view = agent_from_row(&row);
     broadcast_acp(&st, uid, "agent_upserted", json!({ "agent": view }));
     if should_ensure {
-        trigger_ensure_agent(&st, uid, cur.host_id, agent_id, &cmd);
+        trigger_ensure_agent(
+            &st,
+            uid,
+            cur.host_id,
+            agent_id,
+            &cur.preset,
+            &cmd,
+            &next_env,
+        );
+    } else if (cmd_changed || env_changed) && next_status == "online" && !has_probed_models {
+        trigger_probe_agent_models(
+            &st,
+            uid,
+            cur.host_id,
+            agent_id,
+            None,
+            None,
+            &cur.preset,
+            &cmd,
+            &next_env,
+        );
     }
     Ok(Json(view))
+}
+
+#[derive(Default, Deserialize)]
+struct ProbeAgentModelsReq {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    wait: bool,
+}
+
+async fn probe_agent_models(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<Uuid>,
+    body: Option<Json<ProbeAgentModelsReq>>,
+) -> AppResult<Json<super::AcpAgentView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let ag = load_agent_raw(&st.pool, uid, agent_id).await?;
+
+    let cwd: Option<String> = if let Some(sid) = req.session_id {
+        sqlx::query_scalar(
+            "SELECT w.cwd
+               FROM acp_sessions s
+               JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+              WHERE s.id = $1 AND s.user_id = $2 AND s.acp_agent_id = $3",
+        )
+        .bind(sid)
+        .bind(uid)
+        .bind(agent_id)
+        .fetch_optional(&st.pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT cwd FROM acp_workspaces
+              WHERE user_id = $1 AND acp_host_id = $2
+              ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(uid)
+        .bind(ag.host_id)
+        .fetch_optional(&st.pool)
+        .await?
+    };
+
+    if req.wait {
+        let res = call_host_rpc(
+            &st,
+            uid,
+            ag.host_id,
+            "probe_agent_models",
+            json!({
+                "preset": ag.preset,
+                "cmd": ag.cmd,
+                "env": ag.env,
+                "cwd": cwd,
+            }),
+        )
+        .await?;
+        let probed_default = res["default_model"].as_str();
+        let probed_options: Vec<String> =
+            serde_json::from_value(res["model_options"].clone()).unwrap_or_default();
+        let updated = apply_agent_probed_models(
+            &st,
+            uid,
+            agent_id,
+            Some(ag.host_id),
+            req.session_id,
+            probed_default,
+            &probed_options,
+        )
+        .await?;
+        Ok(Json(updated))
+    } else {
+        trigger_probe_agent_models(
+            &st,
+            uid,
+            ag.host_id,
+            agent_id,
+            req.session_id,
+            cwd.as_deref(),
+            &ag.preset,
+            &ag.cmd,
+            &ag.env,
+        );
+        let mut masked = ag;
+        masked.env = super::mask_env_secrets(masked.env);
+        Ok(Json(masked))
+    }
 }
 
 async fn delete_agent(
@@ -566,6 +817,12 @@ struct CreateWorkspaceReq {
     cwd: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    local_probed: bool,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    branches: Option<Vec<String>>,
 }
 
 async fn create_workspace(
@@ -589,9 +846,9 @@ async fn create_workspace(
         return Err(AppError::bad_request("invalid cwd path"));
     }
 
-    let mut branch = String::new();
-    let mut branches: Vec<String> = Vec::new();
-    if st.acp_hosts.contains_key(&req.host_id) {
+    let mut branch = req.branch.unwrap_or_default();
+    let mut branches: Vec<String> = req.branches.unwrap_or_default();
+    if !req.local_probed && st.acp_hosts.contains_key(&req.host_id) {
         let probed = call_host_rpc(
             &st,
             uid,
@@ -689,6 +946,10 @@ async fn delete_workspace(
 #[derive(Deserialize)]
 struct GitCheckoutReq {
     branch: String,
+    #[serde(default)]
+    local_probed: bool,
+    #[serde(default)]
+    branches: Option<Vec<String>>,
 }
 
 async fn git_checkout(
@@ -704,19 +965,25 @@ async fn git_checkout(
         return Err(AppError::bad_request("branch cannot be empty"));
     }
 
-    let data = call_host_rpc(
-        &st,
-        uid,
-        ws.host_id,
-        "git_checkout",
-        json!({ "cwd": ws.cwd, "branch": branch }),
-    )
-    .await?;
-    let next_branch = data["branch"].as_str().unwrap_or(branch).to_string();
-    let next_branches: Vec<String> = serde_json::from_value(data["branches"].clone())
-        .ok()
-        .filter(|b: &Vec<String>| !b.is_empty())
-        .unwrap_or(ws.branches);
+    let (next_branch, next_branches) = if req.local_probed {
+        let bs = req.branches.filter(|b| !b.is_empty()).unwrap_or(ws.branches);
+        (branch.to_string(), bs)
+    } else {
+        let data = call_host_rpc(
+            &st,
+            uid,
+            ws.host_id,
+            "git_checkout",
+            json!({ "cwd": ws.cwd, "branch": branch }),
+        )
+        .await?;
+        let nb = data["branch"].as_str().unwrap_or(branch).to_string();
+        let nbs: Vec<String> = serde_json::from_value(data["branches"].clone())
+            .ok()
+            .filter(|b: &Vec<String>| !b.is_empty())
+            .unwrap_or(ws.branches);
+        (nb, nbs)
+    };
 
     sqlx::query(
         "UPDATE acp_workspaces SET branch = $2, branches = $3, updated_at = now()
@@ -745,6 +1012,8 @@ struct CreateSessionReq {
     agent_id: Uuid,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    skip_model_probe: bool,
 }
 
 async fn create_session(
@@ -754,7 +1023,7 @@ async fn create_session(
 ) -> AppResult<Json<super::AcpSessionView>> {
     let uid = uid_of(&headers, &st).await?;
     let ws = load_workspace(&st.pool, uid, req.workspace_id).await?;
-    let ag = load_agent(&st.pool, uid, req.agent_id).await?;
+    let ag = load_agent_raw(&st.pool, uid, req.agent_id).await?;
     if ws.host_id != ag.host_id {
         return Err(AppError::bad_request(
             "workspace and agent must belong to the same host",
@@ -794,6 +1063,19 @@ async fn create_session(
 
     let view = super::session_from_row(&row, Some(Vec::new()));
     broadcast_acp(&st, uid, "session_upserted", json!({ "session": view }));
+    if !req.skip_model_probe {
+        trigger_probe_agent_models(
+            &st,
+            uid,
+            ws.host_id,
+            ag.id,
+            Some(view.id),
+            Some(&ws.cwd),
+            &ag.preset,
+            &ag.cmd,
+            &ag.env,
+        );
+    }
     Ok(Json(view))
 }
 
@@ -1156,8 +1438,60 @@ async fn cancel_prompt(
         .bind(sess_id)
         .execute(&st.pool)
         .await?;
+
+    let settled_streams = sqlx::query(
+        "UPDATE acp_turns SET status = 'done', updated_at = now()
+          WHERE acp_session_id = $1
+            AND role IN ('agent_text', 'agent_thought')
+            AND status = 'streaming'
+          RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+    )
+    .bind(sess_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for r in &settled_streams {
+        let tv = turn_from_row(r);
+        broadcast_acp(
+            &st,
+            uid,
+            "turn_upserted",
+            json!({ "session_id": sess_id, "turn": tv }),
+        );
+    }
+
+    let failed_tools = sqlx::query(
+        "UPDATE acp_turns
+            SET status = 'failed',
+                payload = jsonb_set(payload, '{is_error}', 'true'::jsonb),
+                updated_at = now()
+          WHERE acp_session_id = $1
+            AND role = 'tool_call'
+            AND status IN ('pending', 'in_progress')
+          RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+    )
+    .bind(sess_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for r in &failed_tools {
+        let tv = turn_from_row(r);
+        broadcast_acp(
+            &st,
+            uid,
+            "turn_upserted",
+            json!({ "session_id": sess_id, "turn": tv }),
+        );
+    }
+
     let updated = load_session_meta(&st.pool, uid, sess_id).await?;
     broadcast_acp(&st, uid, "session_upserted", json!({ "session": updated }));
+    broadcast_acp(
+        &st,
+        uid,
+        "session_activity",
+        json!({ "session_id": sess_id, "phase": "idle", "detail": "" }),
+    );
     Ok(Json(updated))
 }
 

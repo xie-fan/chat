@@ -1,11 +1,29 @@
 import { useEffect, useState } from "react";
 import { acp, isDesktopShell } from "../../api";
-import { getLocalAllowAll, setLocalAllowAll } from "../../acpHost";
+import {
+  deleteAgentLocalFirst,
+  getLocalPolicy,
+  isLocalAcpHost,
+  mutateAgentLocalFirst,
+  mutateSettingsLocalFirst,
+  probeAgentModelsLocalFirst,
+  renameHostLocalFirst,
+  setCloudControlEnabled,
+  setLocalAllowAll,
+} from "../../acpHost";
 import { applyAcpBootstrap, setState, useApp } from "../../store";
-import type { AcpPermissionPolicy } from "../../types";
+import type { AcpAgent, AcpPermissionPolicy } from "../../types";
 import { AttachAgentModal } from "../acp/AcpModals";
 import { agentStatusLabel } from "../acp/adapterHint";
-import { ChevronDownIcon, ChevronRightIcon, CpuIcon, PlusIcon, TrashIcon, XIcon } from "../icons";
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CpuIcon,
+  PlusIcon,
+  RefreshIcon,
+  TrashIcon,
+  XIcon,
+} from "../icons";
 import { confirmDialog } from "../Modal";
 
 const GLOBAL_POLICIES: {
@@ -38,12 +56,18 @@ export default function AgentSettingsSection() {
   const [hostNameDraft, setHostNameDraft] = useState("");
   const [attachHostId, setAttachHostId] = useState<string | null | undefined>(undefined);
   const [err, setErr] = useState("");
+  const [probingAgents, setProbingAgents] = useState<Record<string, boolean>>({});
   const [localAllowAll, setLocalAllowAllState] = useState(false);
+  const [cloudControl, setCloudControlState] = useState(true);
   const [localPolicyBusy, setLocalPolicyBusy] = useState(false);
+  const [cloudControlBusy, setCloudControlBusy] = useState(false);
 
   useEffect(() => {
     if (isDesktopShell()) {
-      void getLocalAllowAll().then(setLocalAllowAllState);
+      void getLocalPolicy().then((p) => {
+        setLocalAllowAllState(p.allow_all_local);
+        setCloudControlState(p.cloud_control_enabled);
+      });
     }
   }, []);
 
@@ -56,14 +80,9 @@ export default function AgentSettingsSection() {
     }
   }, [s.acpLoaded]);
 
-  const setPolicy = async (policy: AcpPermissionPolicy) => {
+  const setPolicy = (policy: AcpPermissionPolicy) => {
     setErr("");
-    try {
-      const settings = await acp.updateSettings(policy);
-      setState({ acpSettings: settings });
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "保存权限策略失败");
-    }
+    mutateSettingsLocalFirst(policy);
   };
 
   const toggleHost = (id: string) => {
@@ -75,34 +94,41 @@ export default function AgentSettingsSection() {
     });
   };
 
-  const addModelOption = async (agentId: string, curOptions: string[]) => {
-    const val = (customInputs[agentId] ?? "").trim();
-    if (!val || curOptions.includes(val)) return;
+  const addModelOption = (ag: AcpAgent) => {
+    const val = (customInputs[ag.id] ?? "").trim();
+    if (!val || ag.model_options.includes(val)) return;
+    const nextOptions = [...ag.model_options, val];
     setErr("");
-    try {
-      const updated = await acp.updateAgent(agentId, {
-        model_options: [...curOptions, val],
-      });
-      setCustomInputs((m) => ({ ...m, [agentId]: "" }));
-      setState((cur) => ({
-        acpAgents: cur.acpAgents.map((a) => (a.id === updated.id ? updated : a)),
-      }));
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "添加模型失败");
-    }
+    setCustomInputs((m) => ({ ...m, [ag.id]: "" }));
+    mutateAgentLocalFirst(ag.id, { model_options: nextOptions });
   };
 
-  const removeModelOption = async (agentId: string, curOptions: string[], target: string) => {
-    const next = curOptions.filter((m) => m !== target);
-    if (next.length === 0) return;
+  const removeModelOption = (ag: AcpAgent, target: string) => {
+    const nextOptions = ag.model_options.filter((m) => m !== target);
+    if (nextOptions.length === 0) return;
+    const nextDefault = nextOptions.includes(ag.default_model)
+      ? ag.default_model
+      : nextOptions[0];
     setErr("");
+    mutateAgentLocalFirst(ag.id, {
+      model_options: nextOptions,
+      default_model: nextDefault,
+    });
+  };
+
+  const refreshAgentModels = async (ag: AcpAgent) => {
+    if (probingAgents[ag.id]) return;
+    setErr("");
+    setProbingAgents((m) => ({ ...m, [ag.id]: true }));
     try {
-      const updated = await acp.updateAgent(agentId, { model_options: next });
+      const updated = await probeAgentModelsLocalFirst(ag, { wait: true });
       setState((cur) => ({
         acpAgents: cur.acpAgents.map((a) => (a.id === updated.id ? updated : a)),
       }));
     } catch (e) {
-      setErr(e instanceof Error ? e.message : "移除模型失败");
+      setErr(e instanceof Error ? e.message : "探测模型失败");
+    } finally {
+      setProbingAgents((m) => ({ ...m, [ag.id]: false }));
     }
   };
 
@@ -115,7 +141,7 @@ export default function AgentSettingsSection() {
     )
       return;
     try {
-      await acp.deleteAgent(agentId);
+      await deleteAgentLocalFirst(agentId);
       setState((cur) => ({
         acpAgents: cur.acpAgents.filter((a) => a.id !== agentId),
         acpSessions: cur.acpSessions.filter((sess) => sess.agent_id !== agentId),
@@ -172,37 +198,77 @@ export default function AgentSettingsSection() {
         </div>
 
         {isDesktopShell() && (
-          <div
-            className="row between"
-            style={{
-              marginTop: 12,
-              paddingTop: 12,
-              borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.08))",
-              gap: 12,
-            }}
-          >
-            <div>
-              <div style={{ fontSize: 13.5, fontWeight: 600 }}>本机允许完全自动执行 (allow_all)</div>
-              <div className="muted" style={{ fontSize: 12 }}>
-                未开启本机放行时，远程传入的 allow_all 将在本机自动降级为 auto_read。
-              </div>
-            </div>
-            <input
-              type="checkbox"
-              aria-label="本机允许完全自动执行"
-              checked={localAllowAll}
-              disabled={localPolicyBusy}
-              onChange={(e) => {
-                const next = e.target.checked;
-                setErr("");
-                setLocalPolicyBusy(true);
-                void setLocalAllowAll(next)
-                  .then((v) => setLocalAllowAllState(v.allow_all_local))
-                  .catch((ex) => setErr(ex instanceof Error ? ex.message : "更新本机策略失败"))
-                  .finally(() => setLocalPolicyBusy(false));
+          <>
+            <div
+              className="row between"
+              style={{
+                marginTop: 12,
+                paddingTop: 12,
+                borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.08))",
+                gap: 12,
               }}
-            />
-          </div>
+            >
+              <div>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                  本机允许被云端控制（多端同步）
+                </div>
+                <div className="muted" style={{ fontSize: 12 }}>
+                  开启时手机与网页端可查看并远程操控本机 Agent；关闭后其他端不可见，且本机数据立即从云端全部删除、不再同步（本机自身仍可纯本地正常使用）。
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                aria-label="本机允许被云端控制"
+                checked={cloudControl}
+                disabled={cloudControlBusy}
+                onChange={(e) => {
+                  const next = e.target.checked;
+                  setErr("");
+                  setCloudControlBusy(true);
+                  void setCloudControlEnabled(next)
+                    .then((v) => setCloudControlState(v.cloud_control_enabled))
+                    .catch((ex) =>
+                      setErr(ex instanceof Error ? ex.message : "切换云端控制状态失败"),
+                    )
+                    .finally(() => setCloudControlBusy(false));
+                }}
+              />
+            </div>
+
+            <div
+              className="row between"
+              style={{
+                marginTop: 12,
+                paddingTop: 12,
+                borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.08))",
+                gap: 12,
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                  本机允许完全自动执行 (allow_all)
+                </div>
+                <div className="muted" style={{ fontSize: 12 }}>
+                  未开启本机放行时，传入的 allow_all 将在本机自动降级为 auto_read。
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                aria-label="本机允许完全自动执行"
+                checked={localAllowAll}
+                disabled={localPolicyBusy}
+                onChange={(e) => {
+                  const next = e.target.checked;
+                  setErr("");
+                  setLocalPolicyBusy(true);
+                  void setLocalAllowAll(next)
+                    .then((v) => setLocalAllowAllState(v.allow_all_local))
+                    .catch((ex) => setErr(ex instanceof Error ? ex.message : "更新本机策略失败"))
+                    .finally(() => setLocalPolicyBusy(false));
+                }}
+              />
+            </div>
+          </>
         )}
       </section>
 
@@ -260,13 +326,9 @@ export default function AgentSettingsSection() {
                             className="btn-accent"
                             onClick={() => {
                               setErr("");
-                              void acp
-                                .renameHost(h.id, hostNameDraft.trim())
-                                .then((uh) => {
+                              void renameHostLocalFirst(h.id, hostNameDraft.trim())
+                                .then(() => {
                                   setRenamingHostId(null);
-                                  setState((cur) => ({
-                                    acpHosts: cur.acpHosts.map((x) => (x.id === uh.id ? uh : x)),
-                                  }));
                                 })
                                 .catch((e) =>
                                   setErr(e instanceof Error ? e.message : "重命名主机失败"),
@@ -281,7 +343,11 @@ export default function AgentSettingsSection() {
                       )}
                       <span className="acp-chip">{h.os}</span>
                       <span className="acp-chip">
-                        {h.online ? `${h.latency_ms}ms` : "离线"}
+                        {h.ip === "Local-Only"
+                          ? "仅本机"
+                          : h.online
+                            ? `${h.latency_ms}ms`
+                            : "离线"}
                       </span>
                     </div>
 
@@ -305,14 +371,16 @@ export default function AgentSettingsSection() {
                       >
                         重命名
                       </button>
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        title="解绑节点"
-                        onClick={() => void removeHost(h.id, h.name)}
-                      >
-                        <TrashIcon size={14} />
-                      </button>
+                      {h.ip !== "Local-Only" && (
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          title="解绑节点"
+                          onClick={() => void removeHost(h.id, h.name)}
+                        >
+                          <TrashIcon size={14} />
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -358,18 +426,7 @@ export default function AgentSettingsSection() {
                                   value={ag.default_model}
                                   onChange={(e) => {
                                     setErr("");
-                                    void acp
-                                      .updateAgent(ag.id, { default_model: e.target.value })
-                                      .then((u) =>
-                                        setState((cur) => ({
-                                          acpAgents: cur.acpAgents.map((a) =>
-                                            a.id === u.id ? u : a,
-                                          ),
-                                        })),
-                                      )
-                                      .catch((ex) =>
-                                        setErr(ex instanceof Error ? ex.message : "更新模型失败"),
-                                      );
+                                    mutateAgentLocalFirst(ag.id, { default_model: e.target.value });
                                   }}
                                 >
                                   {ag.model_options.map((m) => (
@@ -378,6 +435,24 @@ export default function AgentSettingsSection() {
                                     </option>
                                   ))}
                                 </select>
+                                <button
+                                  type="button"
+                                  className="btn-ghost"
+                                  style={{ padding: "4px 8px", fontSize: 12 }}
+                                  disabled={
+                                    (!h.online && !isLocalAcpHost(h.id)) ||
+                                    Boolean(probingAgents[ag.id])
+                                  }
+                                  title={
+                                    h.online || isLocalAcpHost(h.id)
+                                      ? "重新探测可用模型列表"
+                                      : "宿主节点离线，无法探测模型"
+                                  }
+                                  onClick={() => void refreshAgentModels(ag)}
+                                >
+                                  <RefreshIcon size={12} />{" "}
+                                  {probingAgents[ag.id] ? "探测中…" : "探测模型"}
+                                </button>
                               </label>
 
                               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5 }}>
@@ -387,22 +462,11 @@ export default function AgentSettingsSection() {
                                   value={ag.permission_override}
                                   onChange={(e) => {
                                     setErr("");
-                                    void acp
-                                      .updateAgent(ag.id, {
-                                        permission_override: e.target.value as
-                                          | "inherit"
-                                          | AcpPermissionPolicy,
-                                      })
-                                      .then((u) =>
-                                        setState((cur) => ({
-                                          acpAgents: cur.acpAgents.map((a) =>
-                                            a.id === u.id ? u : a,
-                                          ),
-                                        })),
-                                      )
-                                      .catch((ex) =>
-                                        setErr(ex instanceof Error ? ex.message : "更新权限策略失败"),
-                                      );
+                                    mutateAgentLocalFirst(ag.id, {
+                                      permission_override: e.target.value as
+                                        | "inherit"
+                                        | AcpPermissionPolicy,
+                                    });
                                   }}
                                 >
                                   <option value="inherit">继承全局策略</option>
@@ -422,9 +486,8 @@ export default function AgentSettingsSection() {
                                       type="button"
                                       style={{ border: "none", background: "none", cursor: "pointer", padding: 0 }}
                                       title="移除模型选项"
-                                      onClick={() =>
-                                        void removeModelOption(ag.id, ag.model_options, m)
-                                      }
+                                      aria-label={`移除模型 ${m}`}
+                                      onClick={() => removeModelOption(ag, m)}
                                     >
                                       <XIcon size={11} />
                                     </button>
@@ -443,15 +506,14 @@ export default function AgentSettingsSection() {
                                   }
                                   placeholder="自定义模型名…"
                                   onKeyDown={(e) =>
-                                    e.key === "Enter" &&
-                                    void addModelOption(ag.id, ag.model_options)
+                                    e.key === "Enter" && addModelOption(ag)
                                   }
                                 />
                                 <button
                                   type="button"
                                   className="btn-ghost"
                                   style={{ padding: "4px 8px", fontSize: 12 }}
-                                  onClick={() => void addModelOption(ag.id, ag.model_options)}
+                                  onClick={() => addModelOption(ag)}
                                 >
                                   添加模型
                                 </button>

@@ -1,4 +1,10 @@
 import { useEffect, useState } from "react";
+import {
+  createAgentLocalFirst,
+  createSessionLocalFirst,
+  createWorkspaceLocalFirst,
+  listDirsLocalFirst,
+} from "../../acpHost";
 import { acp, getServer, inTauri } from "../../api";
 import { copyPlainText } from "../../clipboard";
 import { setState, useApp } from "../../store";
@@ -62,7 +68,7 @@ export function FolderPickerModal({
     setLoading(true);
     setErr("");
     try {
-      const res = await acp.listDirs(hostId, target);
+      const res = await listDirsLocalFirst(hostId, target);
       setListing(res);
       setPath(res.path);
     } catch (e) {
@@ -203,7 +209,7 @@ export function AddWorkspaceModal({
     setBusy(true);
     setErr("");
     try {
-      const ws = await acp.createWorkspace({
+      const ws = await createWorkspaceLocalFirst({
         host_id: hostId,
         cwd: cwd.trim(),
         name: name.trim() || undefined,
@@ -338,17 +344,11 @@ export function NewSessionModal({
     setBusy(true);
     setErr("");
     try {
-      const sess = await acp.createSession({
-        workspace_id: workspace.id,
+      await createSessionLocalFirst({
+        workspace,
         agent_id: agentId,
         title: title.trim() || undefined,
       });
-      setState((cur) => ({
-        acpSessions: [sess, ...cur.acpSessions.filter((x) => x.id !== sess.id)],
-        activeAcpHostId: workspace.host_id,
-        activeAcpWorkspaceId: workspace.id,
-        activeAcpSessionId: sess.id,
-      }));
       onClose();
     } catch (ex) {
       setErr(ex instanceof Error ? ex.message : "新建会话失败");
@@ -505,17 +505,13 @@ export function AttachAgentModal({
     setBusy(true);
     setErr("");
     try {
-      const ag = await acp.createAgent({
+      await createAgentLocalFirst({
         host_id: hostId,
         preset,
         name: name.trim(),
         cmd: cmd.trim(),
         env: Object.keys(env).length ? env : undefined,
       });
-      setState((cur) => ({
-        acpAgents: [...cur.acpAgents.filter((x) => x.id !== ag.id), ag],
-        activeAcpHostId: hostId,
-      }));
       onClose();
     } catch (ex) {
       setErr(ex instanceof Error ? ex.message : "添加 Agent 失败");
