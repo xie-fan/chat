@@ -635,3 +635,206 @@ it("两次正式回答之间与待确认授权隔离分组成各自默认折叠�
     vi.unstubAllGlobals();
   }
 });
+
+it("Agent 对话支持预览已发送附件、待发送 @文件 引用及模型返回文件地址（桌面右侧栏 / 移动右侧抽屉）", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: 1280,
+  });
+
+  const readFileSpy = vi.spyOn(acp, "readHostFile").mockImplementation(async (_hostId, path) => {
+    if (path === "src/config.ts") {
+      return {
+        path: "C:/repo/src/config.ts",
+        file_name: "config.ts",
+        mime: "text/typescript",
+        size: 32,
+        encoding: "utf8",
+        content: "export const PORT = 8080;\n",
+        truncated: false,
+      };
+    }
+    return {
+      path: "C:/repo/src/engine.rs",
+      file_name: "engine.rs",
+      mime: "text/x-rust",
+      size: 40,
+      encoding: "utf8",
+      content: "pub fn init() {}\npub fn run() { /* target */ }\n",
+      truncated: false,
+    };
+  });
+
+  const fetchBlobSpy = vi
+    .spyOn(acp, "fetchFileBlob")
+    .mockResolvedValue(new Blob(["# 已发送规格说明\n\n详细需求"], { type: "text/markdown" }));
+
+  const agent: AcpAgent = {
+    id: "a1",
+    host_id: "h1",
+    preset: "codex",
+    name: "Codex CLI",
+    adapter: "codex-acp",
+    cmd: "codex-acp",
+    env: {},
+    short_tag: "CX",
+    badge_bg: "from-emerald-500 to-teal-600",
+    default_model: "gpt-5",
+    model_options: ["gpt-5"],
+    permission_override: "inherit",
+    capabilities: [],
+    status: "online",
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+  };
+
+  const sess: AcpSession = {
+    id: "s-preview",
+    workspace_id: "w1",
+    agent_id: "a1",
+    title: "文件预览验证",
+    selected_model: "gpt-5",
+    thinking_level: "高",
+    permission_policy: "ask",
+    acp_session_key: null,
+    running: false,
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+    diffs: [],
+    rpc_logs: [],
+    turns: [
+      {
+        id: "u1",
+        session_id: "s-preview",
+        seq: 1,
+        role: "user",
+        status: "done",
+        payload: {
+          text: "请结合附件排查问题",
+          file_refs: [],
+          attachments: [
+            {
+              id: "att-1",
+              file_name: "spec.md",
+              mime: "text/markdown",
+              size: 28,
+            },
+          ],
+        },
+        created_at: "2026-11-20T00:00:00Z",
+        updated_at: "2026-11-20T00:00:00Z",
+      },
+      {
+        id: "m1",
+        session_id: "s-preview",
+        seq: 2,
+        role: "agent_text",
+        status: "done",
+        payload: {
+          text: "问题定位在 `src/engine.rs:2`，请点击查看。",
+        },
+        created_at: "2026-11-20T00:00:01Z",
+        updated_at: "2026-11-20T00:00:01Z",
+      },
+    ],
+  };
+
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  try {
+    act(() => {
+      setState({
+        acpLoaded: true,
+        acpHosts: [sampleHost],
+        acpAgents: [agent],
+        acpWorkspaces: [sampleWorkspace],
+        acpSessions: [sess],
+        activeAcpHostId: sampleHost.id,
+        activeAcpWorkspaceId: sampleWorkspace.id,
+        activeAcpSessionId: sess.id,
+      });
+      root.render(<AcpWorkspaceView />);
+    });
+
+    // 1) 点击用户已发送的附件 -> 桌面端右侧边栏打开并展示 Markdown 内容
+    const sentAttBtn = Array.from(container.querySelectorAll(".acp-turn-user button")).find((b) =>
+      b.textContent?.includes("spec.md"),
+    ) as HTMLButtonElement;
+    expect(sentAttBtn).not.toBeUndefined();
+    await act(async () => {
+      sentAttBtn.click();
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        container.querySelector('[data-testid="acp-preview-sidebar"]')?.textContent,
+      ).toContain("已发送规格说明");
+    });
+    expect(fetchBlobSpy).toHaveBeenCalledWith("att-1");
+
+    // 2) 在输入框输入待发送 @src/config.ts 引用并点击预览
+    const textarea = container.querySelector(".acp-composer textarea") as HTMLTextAreaElement;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(textarea, "请修改 @src/config.ts 端口");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const pendingRefChip = container.querySelector(
+      '[data-testid="acp-pending-file-ref"]',
+    ) as HTMLButtonElement;
+    expect(pendingRefChip).not.toBeNull();
+    await act(async () => {
+      pendingRefChip.click();
+    });
+
+    await vi.waitFor(() => {
+      const sidebar = container.querySelector('[data-testid="acp-preview-sidebar"]');
+      expect(sidebar?.textContent).toContain("PORT = 8080");
+      expect(sidebar?.querySelector(".pv-badge")?.textContent).toBe("待发送");
+    });
+    expect(readFileSpy).toHaveBeenCalledWith("h1", "src/config.ts", sampleWorkspace.cwd);
+
+    // 3) 点击模型回复中的文件地址 `src/engine.rs:2` -> 定位并高亮第 2 行
+    const modelFileBtn = container.querySelector(".acp-md-file-code-btn") as HTMLButtonElement;
+    expect(modelFileBtn).not.toBeNull();
+    await act(async () => {
+      modelFileBtn.click();
+    });
+
+    await vi.waitFor(() => {
+      const hlRow = container.querySelector(
+        '[data-testid="acp-preview-sidebar"] .pv-code-row.is-hl',
+      );
+      expect(hlRow?.getAttribute("data-line")).toBe("2");
+      expect(hlRow?.textContent).toContain("pub fn run()");
+    });
+
+    // 4) 切换到窄屏移动端视口 -> 自动切换为右侧弹出覆盖层且支持收起
+    act(() => {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 390,
+      });
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    expect(container.querySelector('[data-testid="acp-preview-sidebar"]')).toBeNull();
+    expect(container.querySelector('[data-testid="pv-mobile-drawer"]')).not.toBeNull();
+  } finally {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 1024,
+    });
+    act(() => root.unmount());
+    container.remove();
+    setState(resetSessionState());
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});

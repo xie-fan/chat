@@ -711,3 +711,14 @@ export interface AcpDirListing {
   roots: string[];
   entries: AcpDirEntry[];
 }
+
+export interface AcpHostFileContent {
+  path: string;
+  file_name: string;
+  mime: string;
+  size: number;
+  encoding: "utf8" | "base64" | "none";
+  content: string | null;
+  truncated: boolean;
+  reason?: string | null;
+}

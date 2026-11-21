@@ -1,10 +1,12 @@
 import React, { memo, useState } from "react";
 import { openExternal } from "../../richText";
+import { parseFileReference, type ParsedFileRef } from "../filePathRef";
 import { CheckIcon, CopyIcon } from "../icons";
 
 export interface AcpMarkdownProps {
   text: string;
   streaming?: boolean;
+  onOpenFilePath?: (ref: ParsedFileRef) => void;
 }
 
 type MdBlock =
@@ -170,15 +172,20 @@ function parseMarkdownBlocks(rawText: string): MdBlock[] {
   return blocks;
 }
 
-function renderInline(text: string, keyPrefix: string, depth = 0): React.ReactNode[] {
+function renderInline(
+  text: string,
+  keyPrefix: string,
+  onOpenFilePath?: (ref: ParsedFileRef) => void,
+  depth = 0,
+): React.ReactNode[] {
   if (!text || depth > 4) return [text];
   const out: React.ReactNode[] = [];
   let pos = 0;
   let tokenIdx = 0;
 
-  // 匹配行内代码、Markdown 链接、加粗、删除线、斜体或裸 HTTP(S) 链接；_斜体_ 要求两侧为非字母数字边界以避免拆散 snake_case
+  // 匹配行内代码、Markdown 链接（含 https?://、file:// 与相对/绝对文件地址）、加粗、删除线、斜体或裸 HTTP(S)/file 链接；_斜体_ 要求两侧为非字母数字边界以避免拆散 snake_case
   const tokenRe =
-    /`([^`\n]+)`|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^\n*](?:[\s\S]*?[^\n*])?)\*\*|~~([^\n~][\s\S]*?)~~|(?<![A-Za-z0-9_])_([^\n_][\s\S]*?)_(?![A-Za-z0-9_])|\*([^\n*][\s\S]*?)\*|(https?:\/\/[^\s<>"'`)\]]+)/g;
+    /`([^`\n]+)`|\[([^\]]+)\]\(([^\s)]+)\)|\*\*([^\n*](?:[\s\S]*?[^\n*])?)\*\*|~~([^\n~][\s\S]*?)~~|(?<![A-Za-z0-9_])_([^\n_][\s\S]*?)_(?![A-Za-z0-9_])|\*([^\n*][\s\S]*?)\*|((?:https?|file):\/\/[^\s<>"'`)\]]+)/g;
 
   let m: RegExpExecArray | null;
   while ((m = tokenRe.exec(text)) !== null) {
@@ -187,11 +194,30 @@ function renderInline(text: string, keyPrefix: string, depth = 0): React.ReactNo
     }
     const k = `${keyPrefix}-${tokenIdx++}`;
     if (m[1] !== undefined) {
-      out.push(
-        <code key={k} className="acp-md-inline-code">
-          {m[1]}
-        </code>,
-      );
+      const codeStr = m[1];
+      const fileRef = onOpenFilePath ? parseFileReference(codeStr) : null;
+      if (fileRef && onOpenFilePath) {
+        out.push(
+          <button
+            key={k}
+            type="button"
+            className="acp-md-file-code-btn"
+            title={`预览文件：${fileRef.path}${fileRef.lineStart ? ` (L${fileRef.lineStart})` : ""}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenFilePath(fileRef);
+            }}
+          >
+            <code className="acp-md-inline-code acp-md-file-code">{codeStr}</code>
+          </button>,
+        );
+      } else {
+        out.push(
+          <code key={k} className="acp-md-inline-code">
+            {codeStr}
+          </code>,
+        );
+      }
     } else if (m[2] !== undefined && m[3] !== undefined) {
       const url = m[3];
       if (SAFE_URL_RE.test(url)) {
@@ -205,38 +231,83 @@ function renderInline(text: string, keyPrefix: string, depth = 0): React.ReactNo
               void openExternal(url);
             }}
           >
-            {renderInline(m[2], k, depth + 1)}
+            {renderInline(m[2], k, onOpenFilePath, depth + 1)}
           </a>,
         );
       } else {
-        out.push(m[0]);
+        const fileRef = onOpenFilePath
+          ? parseFileReference(url, { fromMarkdownLink: true })
+          : null;
+        if (fileRef && onOpenFilePath) {
+          out.push(
+            <a
+              key={k}
+              href={`#file-preview:${encodeURIComponent(fileRef.path)}`}
+              className="acp-md-link acp-md-file-link"
+              title={`预览文件：${fileRef.path}${fileRef.lineStart ? ` (L${fileRef.lineStart})` : ""}`}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onOpenFilePath(fileRef);
+              }}
+            >
+              {renderInline(m[2], k, onOpenFilePath, depth + 1)}
+            </a>,
+          );
+        } else {
+          out.push(m[0]);
+        }
       }
     } else if (m[4] !== undefined) {
-      out.push(<strong key={k}>{renderInline(m[4], k, depth + 1)}</strong>);
+      out.push(<strong key={k}>{renderInline(m[4], k, onOpenFilePath, depth + 1)}</strong>);
     } else if (m[5] !== undefined) {
-      out.push(<del key={k}>{renderInline(m[5], k, depth + 1)}</del>);
+      out.push(<del key={k}>{renderInline(m[5], k, onOpenFilePath, depth + 1)}</del>);
     } else if (m[6] !== undefined) {
-      out.push(<em key={k}>{renderInline(m[6], k, depth + 1)}</em>);
+      out.push(<em key={k}>{renderInline(m[6], k, onOpenFilePath, depth + 1)}</em>);
     } else if (m[7] !== undefined) {
-      out.push(<em key={k}>{renderInline(m[7], k, depth + 1)}</em>);
+      out.push(<em key={k}>{renderInline(m[7], k, onOpenFilePath, depth + 1)}</em>);
     } else if (m[8] !== undefined) {
       const rawUrl = m[8];
-      const cleaned = rawUrl.replace(/[.,;:!?]+$/, "");
+      const cleaned = rawUrl.replace(/[.,;:!?。，；：！？、）》】」』]+$/, "");
       const trailing = rawUrl.slice(cleaned.length);
-      out.push(
-        <a
-          key={k}
-          href={cleaned}
-          className="acp-md-link"
-          onClick={(e) => {
-            e.preventDefault();
-            void openExternal(cleaned);
-          }}
-        >
-          {cleaned}
-        </a>,
-      );
-      if (trailing) out.push(trailing);
+      if (/^file:\/\//i.test(cleaned)) {
+        const fileRef = onOpenFilePath ? parseFileReference(cleaned) : null;
+        if (fileRef && onOpenFilePath) {
+          out.push(
+            <a
+              key={k}
+              href={`#file-preview:${encodeURIComponent(fileRef.path)}`}
+              className="acp-md-link acp-md-file-link"
+              title={`预览文件：${fileRef.path}`}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onOpenFilePath(fileRef);
+              }}
+            >
+              {cleaned}
+            </a>,
+          );
+          if (trailing) out.push(trailing);
+        } else {
+          out.push(rawUrl);
+        }
+      } else {
+        out.push(
+          <a
+            key={k}
+            href={cleaned}
+            className="acp-md-link"
+            onClick={(e) => {
+              e.preventDefault();
+              void openExternal(cleaned);
+            }}
+          >
+            {cleaned}
+          </a>,
+        );
+        if (trailing) out.push(trailing);
+      }
     }
     pos = m.index + m[0].length;
   }
@@ -295,6 +366,7 @@ function CodeBlockCard({
 export const AcpMarkdown = memo(function AcpMarkdown({
   text,
   streaming = false,
+  onOpenFilePath,
 }: AcpMarkdownProps) {
   const blocks = parseMarkdownBlocks(text);
   if (blocks.length === 0) {
@@ -335,7 +407,7 @@ export const AcpMarkdown = memo(function AcpMarkdown({
               | "h6");
             return (
               <Tag key={idx} className={`acp-md-h acp-md-h${Math.min(b.level, 4)}`}>
-                {renderInline(b.text, `h${idx}`)}
+                {renderInline(b.text, `h${idx}`, onOpenFilePath)}
                 {showTrailingCaret ? <span className="acp-md-caret" aria-hidden="true" /> : null}
               </Tag>
             );
@@ -347,7 +419,7 @@ export const AcpMarkdown = memo(function AcpMarkdown({
               <blockquote key={idx} className="acp-md-quote">
                 {b.lines.map((line, li) => (
                   <p key={li}>
-                    {renderInline(line, `q${idx}-${li}`)}
+                    {renderInline(line, `q${idx}-${li}`, onOpenFilePath)}
                     {showTrailingCaret && li === b.lines.length - 1 ? (
                       <span className="acp-md-caret" aria-hidden="true" />
                     ) : null}
@@ -361,7 +433,7 @@ export const AcpMarkdown = memo(function AcpMarkdown({
               <ListTag key={idx} className="acp-md-list">
                 {b.items.map((item, li) => (
                   <li key={li}>
-                    {renderInline(item, `l${idx}-${li}`)}
+                    {renderInline(item, `l${idx}-${li}`, onOpenFilePath)}
                     {showTrailingCaret && li === b.items.length - 1 ? (
                       <span className="acp-md-caret" aria-hidden="true" />
                     ) : null}
@@ -378,7 +450,7 @@ export const AcpMarkdown = memo(function AcpMarkdown({
                     <tr>
                       {b.headers.map((h, ci) => (
                         <th key={ci} style={{ textAlign: b.aligns[ci] ?? "left" }}>
-                          {renderInline(h, `th${idx}-${ci}`)}
+                          {renderInline(h, `th${idx}-${ci}`, onOpenFilePath)}
                         </th>
                       ))}
                     </tr>
@@ -388,7 +460,7 @@ export const AcpMarkdown = memo(function AcpMarkdown({
                       <tr key={ri}>
                         {b.headers.map((_, ci) => (
                           <td key={ci} style={{ textAlign: b.aligns[ci] ?? "left" }}>
-                            {renderInline(row[ci] ?? "", `td${idx}-${ri}-${ci}`)}
+                            {renderInline(row[ci] ?? "", `td${idx}-${ri}-${ci}`, onOpenFilePath)}
                           </td>
                         ))}
                       </tr>
@@ -403,7 +475,7 @@ export const AcpMarkdown = memo(function AcpMarkdown({
                 {b.lines.map((line, li) => (
                   <React.Fragment key={li}>
                     {li > 0 ? <br /> : null}
-                    {renderInline(line, `p${idx}-${li}`)}
+                    {renderInline(line, `p${idx}-${li}`, onOpenFilePath)}
                   </React.Fragment>
                 ))}
                 {showTrailingCaret ? <span className="acp-md-caret" aria-hidden="true" /> : null}

@@ -112,4 +112,59 @@ describe("AcpMarkdown", () => {
       unmount();
     }
   });
+
+  it("turns inline code paths, markdown file links and file:// URIs into preview triggers when onOpenFilePath is provided", () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const onOpenFilePath = vi.fn();
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    try {
+      act(() => {
+        root.render(
+          <AcpMarkdown
+            text={[
+              "请查看 `src/app.ts:42`、[组件源码](file:///C:/repo/src/View.tsx#L10-L20) 以及 file:///home/dev/README.md。",
+              "普通代码 `console.log` 与外链 [官网](https://example.com) 不走文件预览。",
+            ].join("\n\n")}
+            onOpenFilePath={onOpenFilePath}
+          />,
+        );
+      });
+
+      const codeBtn = host.querySelector(".acp-md-file-code-btn") as HTMLButtonElement;
+      expect(codeBtn).not.toBeNull();
+      expect(codeBtn.textContent).toBe("src/app.ts:42");
+
+      // console.log 不应被误判为文件按钮
+      expect(host.querySelectorAll(".acp-md-file-code-btn")).toHaveLength(1);
+
+      const fileLinks = host.querySelectorAll("a.acp-md-file-link");
+      expect(fileLinks).toHaveLength(2);
+
+      act(() => {
+        codeBtn.click();
+        (fileLinks[0] as HTMLAnchorElement).click();
+        (fileLinks[1] as HTMLAnchorElement).click();
+      });
+
+      expect(onOpenFilePath).toHaveBeenCalledTimes(3);
+      expect(onOpenFilePath.mock.calls[0][0]).toMatchObject({
+        path: "src/app.ts",
+        lineStart: 42,
+      });
+      expect(onOpenFilePath.mock.calls[1][0]).toMatchObject({
+        path: "C:/repo/src/View.tsx",
+        lineStart: 10,
+        lineEnd: 20,
+      });
+      expect(onOpenFilePath.mock.calls[2][0]).toMatchObject({
+        path: "/home/dev/README.md",
+      });
+      expect(openExternalMock).not.toHaveBeenCalled();
+    } finally {
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

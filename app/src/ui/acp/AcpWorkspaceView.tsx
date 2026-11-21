@@ -12,10 +12,13 @@ import {
   cancelSessionLocalFirst,
   deleteSessionLocalFirst,
   deleteWorkspaceLocalFirst,
+  downloadAcpAttachmentLocalFirst,
+  fetchAcpAttachmentBlobLocalFirst,
   gitCheckoutLocalFirst,
   isLocalAcpHost,
   mutateSessionLocalFirst,
   probeAgentModelsLocalFirst,
+  readHostFileLocalFirst,
   replyPermissionLocalFirst,
   sendPromptLocalFirst,
   uploadAttachmentLocalFirst,
@@ -29,7 +32,13 @@ import type {
   AcpThinkingLevel,
   AcpUsageStats,
 } from "../../types";
+import FilePreview, {
+  type FilePreviewTarget,
+  useIsMobilePreview,
+} from "../FilePreview";
 import { confirmDialog } from "../Modal";
+import { pushBackLayer } from "../chat/backStack";
+import { parseFileReference, type ParsedFileRef } from "../filePathRef";
 import {
   ActivityIcon,
   ArrowDownIcon,
@@ -114,6 +123,10 @@ export default function AcpWorkspaceView() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
+  const [previewTarget, setPreviewTarget] = useState<FilePreviewTarget | null>(null);
+  const [previewSeq, setPreviewSeq] = useState(0);
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
+  const isMobilePreview = useIsMobilePreview();
 
   const fileRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<HTMLDivElement>(null);
@@ -186,9 +199,37 @@ export default function AcpWorkspaceView() {
     setEditingTitle(false);
     setDiffsOpen(false);
     setRpcOpen(false);
+    setPreviewTarget(null);
+    setPreviewCollapsed(false);
     stickRef.current = true;
     setStickToBottom(true);
   }, [activeSession?.id]);
+
+  const mobilePreviewBlocksBack = Boolean(
+    isMobilePreview && previewTarget && !previewCollapsed,
+  );
+  useEffect(
+    () =>
+      mobilePreviewBlocksBack
+        ? pushBackLayer(() => {
+            setPreviewTarget(null);
+            setPreviewCollapsed(false);
+          })
+        : undefined,
+    [mobilePreviewBlocksBack],
+  );
+  useEffect(() => {
+    if (!mobilePreviewBlocksBack) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setPreviewTarget(null);
+        setPreviewCollapsed(false);
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [mobilePreviewBlocksBack]);
 
   // 实时运行耗时计时器：优先对齐服务端/宿主的 activity startedAt
   useEffect(() => {
@@ -491,10 +532,74 @@ export default function AcpWorkspaceView() {
   );
 
   const downloadAttachment = useCallback((id: string, fileName: string) => {
-    void acp.downloadFile(id, fileName).catch((ex) =>
+    void downloadAcpAttachmentLocalFirst(id, fileName).catch((ex) =>
       setErrMsg(ex instanceof Error ? ex.message : "下载附件失败"),
     );
   }, []);
+
+  const openAcpAttachmentPreview = useCallback(
+    (att: AcpAttachment, badge?: string) => {
+      setPreviewTarget({
+        kind: "acp-attachment",
+        key: `acp-att:${att.id}:${badge ?? ""}`,
+        att,
+        badge,
+        loadBlob: () => fetchAcpAttachmentBlobLocalFirst(att),
+        onDownload: () => downloadAttachment(att.id, att.file_name),
+      });
+      setPreviewSeq((n) => n + 1);
+    },
+    [downloadAttachment],
+  );
+
+  const previewSentAttachment = useCallback(
+    (att: AcpAttachment) => openAcpAttachmentPreview(att),
+    [openAcpAttachmentPreview],
+  );
+
+  const openHostPathPreview = useCallback(
+    (ref: ParsedFileRef, badge?: string) => {
+      const hostId = activeHostOfSess?.id ?? activeWs?.host_id ?? "";
+      const cwd = activeWs?.cwd;
+      setPreviewTarget({
+        kind: "host-path",
+        key: `host-path:${hostId}:${cwd ?? ""}:${ref.path}:${ref.lineStart ?? ""}:${ref.lineEnd ?? ""}`,
+        path: ref.path,
+        cwd,
+        hostName: activeHostOfSess?.name,
+        lineStart: ref.lineStart,
+        lineEnd: ref.lineEnd,
+        badge,
+        loadHostFile: () => {
+          if (!hostId) {
+            return Promise.reject(new Error("当前对话未绑定机器节点"));
+          }
+          return readHostFileLocalFirst(hostId, ref.path, cwd);
+        },
+      });
+      setPreviewSeq((n) => n + 1);
+    },
+    [activeHostOfSess?.id, activeHostOfSess?.name, activeWs?.cwd, activeWs?.host_id],
+  );
+
+  const pendingPromptFileRefs = useMemo(() => {
+    if (!promptText) return [];
+    const seen = new Set<string>();
+    const out: ParsedFileRef[] = [];
+    for (const m of promptText.matchAll(/(?:^|\s)@([^\s@]+)/g)) {
+      const token = m[1];
+      if (!token || seen.has(token)) continue;
+      seen.add(token);
+      out.push(
+        parseFileReference(token, { fromMarkdownLink: true }) ?? {
+          raw: token,
+          path: token,
+          display: token,
+        },
+      );
+    }
+    return out;
+  }, [promptText]);
 
   const newSessionTargetWs =
     s.acpWorkspaces.find((w) => w.id === newSessWsId) ?? null;
@@ -920,6 +1025,8 @@ export default function AcpWorkspaceView() {
                         key={entry.id}
                         turns={entry.turns}
                         onDownloadAttachment={downloadAttachment}
+                        onPreviewAttachment={previewSentAttachment}
+                        onPreviewFilePath={openHostPathPreview}
                         onReplyPermission={replyPermission}
                       />
                     ) : (
@@ -927,6 +1034,8 @@ export default function AcpWorkspaceView() {
                         key={entry.turn.id}
                         turn={entry.turn}
                         onDownloadAttachment={downloadAttachment}
+                        onPreviewAttachment={previewSentAttachment}
+                        onPreviewFilePath={openHostPathPreview}
                         onReplyPermission={replyPermission}
                       />
                     ),
@@ -970,7 +1079,23 @@ export default function AcpWorkspaceView() {
                   <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
                     {activeSession.diffs.map((d, i) => (
                       <div key={i} className="mono-code" style={{ fontSize: 11.5 }}>
-                        <b>{d.file}</b> (
+                        <button
+                          type="button"
+                          className="acp-file-link-btn mono-code"
+                          title={`点击预览：${d.file}`}
+                          onClick={() =>
+                            openHostPathPreview(
+                              parseFileReference(d.file, { fromMarkdownLink: true }) ?? {
+                                raw: d.file,
+                                path: d.file,
+                                display: d.file,
+                              },
+                            )
+                          }
+                        >
+                          <b>{d.file}</b>
+                        </button>{" "}
+                        (
                         <span className="acp-diff-add-num">+{d.added}</span> /{" "}
                         <span className="acp-diff-del-num">-{d.removed}</span>) · {d.status}
                         {d.diff_lines && d.diff_lines.length > 0 && (
@@ -1018,17 +1143,51 @@ export default function AcpWorkspaceView() {
                 </div>
               )}
               <div className="acp-composer">
-                {pendingAtts.length > 0 && (
+                {(pendingAtts.length > 0 || pendingPromptFileRefs.length > 0) && (
                   <div className="acp-composer-pills">
+                    {pendingPromptFileRefs.map((ref) => (
+                      <button
+                        key={`ref-${ref.raw}`}
+                        type="button"
+                        className="acp-chip acp-chip-clickable mono-code"
+                        data-testid="acp-pending-file-ref"
+                        title={`点击预览待发送文件：${ref.path}`}
+                        onClick={() => openHostPathPreview(ref, "待发送")}
+                      >
+                        @{ref.raw}
+                      </button>
+                    ))}
                     {pendingAtts.map((a) => (
-                      <span key={a.id} className="acp-chip">
-                        <span>📎 {a.file_name}</span>
+                      <span
+                        key={a.id}
+                        className="acp-chip acp-chip-clickable"
+                        data-testid="acp-pending-att"
+                        onClick={() => openAcpAttachmentPreview(a, "待发送")}
+                      >
                         <button
                           type="button"
-                          style={{ border: "none", background: "none", cursor: "pointer", padding: 0 }}
-                          onClick={() =>
-                            setPendingAtts((cur) => cur.filter((x) => x.id !== a.id))
-                          }
+                          className="acp-chip-main-btn"
+                          title={`点击预览待发送附件：${a.file_name}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openAcpAttachmentPreview(a, "待发送");
+                          }}
+                        >
+                          📎 {a.file_name}
+                        </button>
+                        <button
+                          type="button"
+                          className="acp-chip-del-btn"
+                          aria-label={`移除附件 ${a.file_name}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPendingAtts((cur) => cur.filter((x) => x.id !== a.id));
+                            setPreviewTarget((cur) =>
+                              cur?.kind === "acp-attachment" && cur.att.id === a.id
+                                ? null
+                                : cur,
+                            );
+                          }}
                         >
                           <XIcon size={12} />
                         </button>
@@ -1178,6 +1337,19 @@ export default function AcpWorkspaceView() {
           </>
         )}
       </section>
+
+      {previewTarget && (
+        <FilePreview
+          variant="agent"
+          target={previewTarget}
+          openSeq={previewSeq}
+          onClose={() => {
+            setPreviewTarget(null);
+            setPreviewCollapsed(false);
+          }}
+          onMobileCollapsedChange={setPreviewCollapsed}
+        />
+      )}
 
       {showAddWs && (
         <AddWorkspaceModal

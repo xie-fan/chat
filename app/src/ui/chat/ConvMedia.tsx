@@ -28,8 +28,8 @@ export default function ConvMedia({
   onPreview,
 }: {
   conv: ConversationView;
-  /** 点图片缩略图：交给外层（ChatView）打开现有预览弹窗 */
-  onPreview?: (att: AttachmentView) => void;
+  /** 点图片缩略图或文件行：交给外层（ChatView）打开预览 */
+  onPreview?: (att: AttachmentView, m?: MessageView) => void;
 }) {
   const [tab, setTab] = useState<Tab>("image");
   const [items, setItems] = useState<MessageView[]>([]);
@@ -118,27 +118,57 @@ export default function ConvMedia({
                 })}
                 alt={m.attachment!.file_name}
                 title={m.attachment!.file_name}
-                onClick={() => onPreview?.(m.attachment!)}
+                onClick={() => onPreview?.(m.attachment!, m)}
               />
             ))}
           </div>
         )}
         {tab === "file" &&
           withAtt.map((m) => (
-            <div key={m.id} className="cm-file">
-              <span className="file-ic">📄</span>
-              <span className="file-meta">
-                <b title={m.attachment!.file_name}>{m.attachment!.file_name}</b>
-                <i>
-                  {fmtSize(m.attachment!.size)} · {m.sender_name} ·{" "}
-                  {new Date(m.created_at).toLocaleDateString()}
-                </i>
-              </span>
+            <div
+              key={m.id}
+              className="cm-file"
+              style={{ cursor: onPreview ? "pointer" : undefined }}
+              onClick={() => onPreview?.(m.attachment!, m)}
+            >
+              {onPreview ? (
+                <button
+                  type="button"
+                  className="cm-file-open"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPreview(m.attachment!, m);
+                  }}
+                >
+                  <span className="file-ic">📄</span>
+                  <span className="file-meta">
+                    <b title={m.attachment!.file_name}>{m.attachment!.file_name}</b>
+                    <i>
+                      {fmtSize(m.attachment!.size)} · {m.sender_name} ·{" "}
+                      {new Date(m.created_at).toLocaleDateString()}
+                    </i>
+                  </span>
+                </button>
+              ) : (
+                <>
+                  <span className="file-ic">📄</span>
+                  <span className="file-meta">
+                    <b title={m.attachment!.file_name}>{m.attachment!.file_name}</b>
+                    <i>
+                      {fmtSize(m.attachment!.size)} · {m.sender_name} ·{" "}
+                      {new Date(m.created_at).toLocaleDateString()}
+                    </i>
+                  </span>
+                </>
+              )}
               <button
                 type="button"
                 className="cm-dl"
                 title="下载"
-                onClick={() => void saveAttachment(m.attachment!)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void saveAttachment(m.attachment!);
+                }}
               >
                 ⤓
               </button>

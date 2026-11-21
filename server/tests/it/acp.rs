@@ -115,6 +115,64 @@ async fn acp_host_lifecycle_rpc_prompt_and_permissions() {
     let dirs_json: Value = dirs_res.json().await.unwrap();
     assert_eq!(dirs_json["entries"][0]["name"], "chat");
 
+    // 3b. 远程文件预览读取 RPC (GET /v1/acp/hosts/{id}/file) 及越权拦截
+    let forbidden_file = http()
+        .get(format!(
+            "{base}/v1/acp/hosts/{host_id}/file?path=src/main.rs&cwd=/home/dev/chat"
+        ))
+        .header("authorization", authz(&other.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden_file.status(), 404);
+
+    let file_req = tokio::spawn({
+        let base = base.clone();
+        let host_id = host_id.clone();
+        let access = u.access.clone();
+        async move {
+            http()
+                .get(format!(
+                    "{base}/v1/acp/hosts/{host_id}/file?path=src/main.rs&cwd=/home/dev/chat"
+                ))
+                .header("authorization", authz(&access))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+
+    let file_rpc = next_of(&mut host_ws, "rpc_call").await;
+    assert_eq!(file_rpc["method"], "read_file");
+    assert_eq!(file_rpc["params"]["path"], "src/main.rs");
+    assert_eq!(file_rpc["params"]["cwd"], "/home/dev/chat");
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "rpc_result",
+                "req_id": file_rpc["req_id"],
+                "ok": true,
+                "data": {
+                    "path": "/home/dev/chat/src/main.rs",
+                    "file_name": "main.rs",
+                    "mime": "text/x-rust",
+                    "size": 14,
+                    "encoding": "utf8",
+                    "content": "fn main() {}\n",
+                    "truncated": false
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let file_res = file_req.await.unwrap();
+    assert_eq!(file_res.status(), 200);
+    let file_json: Value = file_res.json().await.unwrap();
+    assert_eq!(file_json["file_name"], "main.rs");
+    assert_eq!(file_json["content"], "fn main() {}\n");
+
     // 4. 配置全局权限策略 + 在该宿主接入 Claude Agent + 修改默认模型/权限覆盖
     let s_res = http()
         .put(format!("{base}/v1/acp/settings"))

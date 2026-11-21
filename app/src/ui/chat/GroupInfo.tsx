@@ -15,6 +15,7 @@ import type {
   AttachmentView,
   ConversationDetail,
   ConversationView,
+  MessageView,
   PrefUpdate,
 } from "../../types";
 import { leaveGroup, refreshCatalogs } from "../../ws";
@@ -31,8 +32,8 @@ export default function GroupInfo({
 }: {
   conv: ConversationView;
   onClose: () => void;
-  /** V2 P3-1：文件与图片页签里点缩略图 → 外层预览弹窗 */
-  onPreview?: (att: AttachmentView) => void;
+  /** V2 P3-1：文件与图片页签里点缩略图或文件条目 → 外层预览弹窗 */
+  onPreview?: (att: AttachmentView, m?: MessageView) => void;
 }) {
   const s = useApp();
   const [detail, setDetail] = useState<ConversationDetail | null>(null);

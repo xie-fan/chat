@@ -42,6 +42,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/hosts/pair", post(exchange_pair_code))
         .route("/hosts/{id}", patch(rename_host).delete(delete_host))
         .route("/hosts/{id}/dirs", get(list_host_dirs))
+        .route("/hosts/{id}/file", get(read_host_file))
         .route("/agents", post(create_agent))
         .route("/agents/{id}", patch(update_agent).delete(delete_agent))
         .route("/agents/{id}/probe-models", post(probe_agent_models))
@@ -282,6 +283,40 @@ async fn list_host_dirs(
         host_id,
         "list_dir",
         json!({ "path": q.path.unwrap_or_default() }),
+    )
+    .await?;
+    Ok(Json(data))
+}
+
+#[derive(Deserialize)]
+struct HostFileQuery {
+    path: String,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+async fn read_host_file(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(host_id): Path<Uuid>,
+    Query(q): Query<HostFileQuery>,
+) -> AppResult<Json<Value>> {
+    let uid = uid_of(&headers, &st).await?;
+    let path = q.path.trim();
+    if path.is_empty() || path.len() > 2048 {
+        return Err(AppError::bad_request("invalid file path"));
+    }
+    let cwd = q
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && c.len() <= 1024);
+    let data = call_host_rpc(
+        &st,
+        uid,
+        host_id,
+        "read_file",
+        json!({ "path": path, "cwd": cwd }),
     )
     .await?;
     Ok(Json(data))

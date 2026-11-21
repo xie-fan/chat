@@ -2627,3 +2627,692 @@ button.st-nav-item.on,
   .acp-shell { flex-direction: column; }
   .acp-sidebar { width: 100%; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--border-color); }
 }
+
+/* ============================================================================
+   Unified File Preview System (Chat Modal / Agent Right Sidebar / Mobile Drawer)
+   ============================================================================ */
+
+/* ---------- Desktop Chat Centered Modal ---------- */
+.pv-modal {
+  width: min(860px, 92vw);
+  height: min(680px, 86vh);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .pv-modal {
+    animation: pvModalEnter 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}
+
+@keyframes pvModalEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* ---------- Shared Preview Header & Toolbar ---------- */
+.pv-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-panel);
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.pv-title-group {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pv-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pv-file-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.pv-title-line .pv-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pv-badge {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent-ring);
+}
+
+.pv-line-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+
+.pv-size {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.pv-subpath-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pv-subpath {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.pv-mini-btn {
+  flex-shrink: 0;
+  border: 1px solid var(--border-color);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.pv-mini-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-main);
+}
+
+.pv-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.pv-win-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  margin-left: 2px;
+}
+
+.pv-zoom-group {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-subtle);
+  overflow: hidden;
+}
+
+.pv-zoom-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-main);
+  font-size: 12px;
+  padding: 3px 7px;
+  cursor: pointer;
+  line-height: 1.25;
+}
+.pv-zoom-btn:hover {
+  background: var(--bg-hover);
+}
+
+.pv-zoom-reset {
+  font-variant-numeric: tabular-nums;
+  min-width: 42px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+}
+
+/* ---------- Shared Preview Body & Viewers ---------- */
+.pv-body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  background: var(--bg-canvas);
+  overscroll-behavior: contain;
+}
+
+.pv-status-box {
+  flex: 1;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 28px 18px;
+  text-align: center;
+}
+
+.pv-err-text {
+  color: var(--danger);
+  font-size: 13px;
+  max-width: 440px;
+  word-break: break-word;
+}
+
+.pv-trunc-banner {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  font-size: 12px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.pv-media-stage {
+  flex: 1;
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 16px;
+}
+
+.pv-media-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+  transition: transform 0.14s ease;
+}
+
+.pv-media-stage video {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 8px;
+}
+
+.pv-media-stage audio {
+  width: min(420px, 100%);
+}
+
+.pv-md-stage {
+  flex: 1;
+  padding: 18px 22px;
+  background: var(--bg-panel);
+  color: var(--text-main);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.pv-table-stage {
+  flex: 1;
+  overflow: auto;
+  background: var(--bg-panel);
+}
+
+.pv-csv-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  color: var(--text-main);
+}
+
+.pv-csv-table th,
+.pv-csv-table td {
+  border-bottom: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pv-csv-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-subtle);
+  font-weight: 600;
+}
+
+.pv-csv-table .pv-csv-idx {
+  width: 40px;
+  text-align: right;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.pv-code-stage {
+  flex: 1;
+  overflow: auto;
+  background: var(--bg-panel);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.pv-code-lines {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 0;
+  min-width: max-content;
+}
+
+.pv-code-row {
+  display: flex;
+  align-items: flex-start;
+  padding-right: 16px;
+  min-width: 100%;
+}
+
+.pv-code-row.is-hl {
+  background: color-mix(in srgb, var(--warn-bg) 75%, transparent);
+  box-shadow: inset 3px 0 0 var(--warn-fg);
+}
+
+.pv-code-num {
+  width: 48px;
+  padding: 0 10px 0 8px;
+  text-align: right;
+  color: var(--text-muted);
+  user-select: none;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.pv-code-text {
+  white-space: pre;
+  color: var(--text-main);
+  flex: 1;
+}
+
+.pv-raw-pre {
+  margin: 0;
+  padding: 12px 16px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-main);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.pv-pdf-stage {
+  flex: 1;
+  min-height: 320px;
+  display: flex;
+}
+
+.pv-pdf-stage iframe {
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  border: none;
+}
+
+/* ---------- Desktop Agent Right Sidebar ---------- */
+.pv-agent-sidebar {
+  position: relative;
+  flex-shrink: 0;
+  height: 100%;
+  min-width: 300px;
+  max-width: 56vw;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pv-agent-sidebar .pv-head {
+  flex-wrap: wrap;
+  row-gap: 6px;
+  padding: 10px 12px;
+}
+
+.pv-agent-sidebar .pv-toolbar {
+  order: 2;
+  flex: 1 0 100%;
+  justify-content: flex-start;
+}
+
+.pv-sidebar-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 5;
+  touch-action: none;
+  transition: background 0.15s ease;
+}
+
+.pv-sidebar-resizer:hover,
+.pv-sidebar-resizer:active {
+  background: var(--accent-ring);
+}
+
+/* ---------- Mobile & Mobile Web Right Slide-Over Drawer ---------- */
+.pv-mobile-layer {
+  position: fixed;
+  inset: 0;
+  overscroll-behavior: contain;
+}
+
+.pv-mobile-layer.is-collapsed {
+  pointer-events: none;
+}
+
+.pv-mobile-mask {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay);
+  transition: opacity 0.22s ease;
+}
+
+.pv-mobile-sheet {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  /* 覆盖大部分屏幕，始终保留最左侧条带可见与可轻触收起 */
+  width: min(560px, calc(100vw - 48px));
+  max-width: calc(100vw - 44px);
+  height: 100vh;
+  height: 100svh;
+  padding-bottom: env(safe-area-inset-bottom);
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border-color);
+  border-radius: 16px 0 0 16px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  touch-action: pan-y;
+  overscroll-behavior: contain;
+  will-change: transform;
+  transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.pv-mobile-sheet.is-dragging {
+  transition: none;
+}
+
+.pv-mobile-sheet .pv-head {
+  padding-left: 16px;
+}
+
+.pv-mobile-grabber {
+  position: absolute;
+  left: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 4px;
+  height: 42px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  opacity: 0.72;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.pv-edge-zone {
+  position: fixed;
+  right: 0;
+  top: 76px;
+  bottom: 88px;
+  width: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.pv-edge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 118px;
+  padding: 9px 6px 9px 8px;
+  border-radius: 12px 0 0 12px;
+  border: 1px solid var(--border-strong);
+  border-right: none;
+  background: var(--bg-panel);
+  color: var(--accent);
+  box-shadow: var(--shadow-md);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pv-edge-pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 82px;
+  color: var(--text-main);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pv-mobile-mask,
+  .pv-mobile-sheet,
+  .pv-media-stage img {
+    transition: none;
+  }
+}
+
+/* ---------- Interactive File Triggers & Chips ---------- */
+.acp-md-file-code-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  display: inline;
+}
+
+.acp-md-file-code {
+  color: var(--accent);
+  border-color: var(--accent-ring);
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--bg-subtle));
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.acp-md-file-code-btn:hover .acp-md-file-code {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.acp-md-file-link {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.acp-file-link-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  color: var(--accent);
+  font-size: inherit;
+  cursor: pointer;
+  text-align: left;
+  word-break: break-all;
+}
+
+.acp-file-link-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.acp-chip-clickable {
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.acp-chip-clickable:hover {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.acp-chip-main-btn,
+.acp-chip-del-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.acp-chip-del-btn {
+  color: var(--text-muted);
+  margin-left: 2px;
+}
+
+.acp-chip-del-btn:hover {
+  color: var(--danger);
+}
+
+.pf-chip.clickable,
+.reuse-chip.clickable {
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.pf-chip.clickable:hover,
+.reuse-chip.clickable:hover {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+}
+
+.pf-chip-main,
+.reuse-chip-main {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pf-chip-x {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0 2px;
+  margin: 0;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.pf-chip-x:hover {
+  color: var(--danger);
+}
+
+.cm-file-open {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+
+.pv-act:focus-visible,
+.pv-zoom-btn:focus-visible,
+.pv-mini-btn:focus-visible,
+.pv-edge-pill:focus-visible,
+.acp-md-file-code-btn:focus-visible,
+.acp-file-link-btn:focus-visible,
+.acp-chip-clickable:focus-visible,
+.acp-chip-main-btn:focus-visible,
+.acp-chip-del-btn:focus-visible,
+.pf-chip-main:focus-visible,
+.pf-chip-x:focus-visible,
+.reuse-chip-main:focus-visible,
+.cm-file-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}

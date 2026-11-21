@@ -17,6 +17,7 @@ import {
   TerminalIcon,
   WrenchIcon,
 } from "../icons";
+import { parseFileReference, type ParsedFileRef } from "../filePathRef";
 import { AcpMarkdown } from "./AcpMarkdown";
 
 export type AcpDisplayEntry =
@@ -123,12 +124,26 @@ function copyClipboard(text: string, onCopied: () => void) {
   onCopied();
 }
 
+function toFileRef(raw: string): ParsedFileRef {
+  return (
+    parseFileReference(raw, { fromMarkdownLink: true }) ?? {
+      raw,
+      path: raw,
+      display: raw,
+    }
+  );
+}
+
 function UserTurnCard({
   turn,
   onDownloadAttachment,
+  onPreviewAttachment,
+  onPreviewFilePath,
 }: {
   turn: AcpTurn;
   onDownloadAttachment: (id: string, fileName: string) => void;
+  onPreviewAttachment?: (att: AcpAttachment) => void;
+  onPreviewFilePath?: (ref: ParsedFileRef) => void;
 }) {
   const text = String(turn.payload.text ?? "");
   const files = Array.isArray(turn.payload.files)
@@ -143,23 +158,32 @@ function UserTurnCard({
       {(files.length > 0 || atts.length > 0) && (
         <div className="acp-composer-pills" style={{ marginTop: 8 }}>
           {files.map((f, i) => (
-            <span
+            <button
               key={`${f}-${i}`}
+              type="button"
+              onClick={() => onPreviewFilePath?.(toFileRef(f))}
+              title={onPreviewFilePath ? `预览文件：${f}` : f}
               className="acp-chip mono-code"
               style={{
                 background: "rgba(255,255,255,0.16)",
                 color: "#fff",
                 borderColor: "transparent",
+                cursor: onPreviewFilePath ? "pointer" : "default",
               }}
             >
               @{f}
-            </span>
+            </button>
           ))}
           {atts.map((a) => (
             <button
               key={a.id}
               type="button"
-              onClick={() => onDownloadAttachment(a.id, a.file_name)}
+              title={`预览文件：${a.file_name}`}
+              onClick={() =>
+                onPreviewAttachment
+                  ? onPreviewAttachment(a)
+                  : onDownloadAttachment(a.id, a.file_name)
+              }
               className="acp-chip"
               style={{
                 background: "rgba(255,255,255,0.16)",
@@ -245,7 +269,13 @@ function ThoughtTurnCard({ turn }: { turn: AcpTurn }) {
   );
 }
 
-function ToolDiffPreview({ diffs }: { diffs: AcpToolDiff[] }) {
+function ToolDiffPreview({
+  diffs,
+  onPreviewFilePath,
+}: {
+  diffs: AcpToolDiff[];
+  onPreviewFilePath?: (ref: ParsedFileRef) => void;
+}) {
   return (
     <div className="acp-tool-diffs">
       {diffs.map((d, idx) => {
@@ -257,7 +287,18 @@ function ToolDiffPreview({ diffs }: { diffs: AcpToolDiff[] }) {
           <div key={`${d.path}-${idx}`} className="acp-tool-diff-file">
             <div className="acp-tool-diff-path mono-code">
               <FileTextIcon size={12} />
-              <span>{d.path}</span>
+              {onPreviewFilePath ? (
+                <button
+                  type="button"
+                  className="acp-file-link-btn mono-code"
+                  title={`预览文件：${d.path}`}
+                  onClick={() => onPreviewFilePath(toFileRef(d.path))}
+                >
+                  {d.path}
+                </button>
+              ) : (
+                <span>{d.path}</span>
+              )}
               <span className="acp-diff-stat">
                 {oldLines.length > 0 && (
                   <span className="acp-diff-del-num">-{oldLines.length}</span>
@@ -289,7 +330,13 @@ function ToolDiffPreview({ diffs }: { diffs: AcpToolDiff[] }) {
   );
 }
 
-function ToolCallCard({ turn }: { turn: AcpTurn }) {
+function ToolCallCard({
+  turn,
+  onPreviewFilePath,
+}: {
+  turn: AcpTurn;
+  onPreviewFilePath?: (ref: ParsedFileRef) => void;
+}) {
   const payload = turn.payload as unknown as AcpToolCallPayload;
   const kind = String(payload.kind ?? "other");
   const title = String(payload.title || payload.name || "工具调用");
@@ -354,12 +401,25 @@ function ToolCallCard({ turn }: { turn: AcpTurn }) {
         <div className="acp-acc-body">
           {locations.length > 0 && (
             <div className="acp-tool-locs">
-              {locations.map((loc, i) => (
-                <span key={`${loc}-${i}`} className="acp-chip mono-code" title={loc}>
-                  <FileTextIcon size={11} />
-                  {loc}
-                </span>
-              ))}
+              {locations.map((loc, i) =>
+                onPreviewFilePath ? (
+                  <button
+                    key={`${loc}-${i}`}
+                    type="button"
+                    className="acp-chip acp-chip-clickable mono-code"
+                    title={`预览文件：${loc}`}
+                    onClick={() => onPreviewFilePath(toFileRef(loc))}
+                  >
+                    <FileTextIcon size={11} />
+                    {loc}
+                  </button>
+                ) : (
+                  <span key={`${loc}-${i}`} className="acp-chip mono-code" title={loc}>
+                    <FileTextIcon size={11} />
+                    {loc}
+                  </span>
+                ),
+              )}
             </div>
           )}
 
@@ -373,7 +433,7 @@ function ToolCallCard({ turn }: { turn: AcpTurn }) {
           {diffs.length > 0 && (
             <div className="acp-tool-sec">
               <div className="acp-tool-sec-label">文件变更预览</div>
-              <ToolDiffPreview diffs={diffs} />
+              <ToolDiffPreview diffs={diffs} onPreviewFilePath={onPreviewFilePath} />
             </div>
           )}
 
@@ -407,7 +467,13 @@ function ToolCallCard({ turn }: { turn: AcpTurn }) {
   );
 }
 
-function AgentTextTurn({ turn }: { turn: AcpTurn }) {
+function AgentTextTurn({
+  turn,
+  onPreviewFilePath,
+}: {
+  turn: AcpTurn;
+  onPreviewFilePath?: (ref: ParsedFileRef) => void;
+}) {
   const text = String(turn.payload.text ?? "");
   const isError = turn.status === "error";
   const isStreaming = turn.status === "streaming";
@@ -426,7 +492,11 @@ function AgentTextTurn({ turn }: { turn: AcpTurn }) {
 
   return (
     <div className="acp-turn-agent">
-      <AcpMarkdown text={text} streaming={isStreaming} />
+      <AcpMarkdown
+        text={text}
+        streaming={isStreaming}
+        onOpenFilePath={onPreviewFilePath}
+      />
       {text && !isStreaming ? (
         <div className="acp-agent-actions">
           <button
@@ -660,6 +730,8 @@ function TerminalOutTurnCard({ turn }: { turn: AcpTurn }) {
 export interface AcpTurnItemProps {
   turn: AcpTurn;
   onDownloadAttachment: (id: string, fileName: string) => void;
+  onPreviewAttachment?: (att: AcpAttachment) => void;
+  onPreviewFilePath?: (ref: ParsedFileRef) => void;
   onReplyPermission: (
     turnId: string,
     opt: "allow_once" | "allow_always" | "reject_once" | "reject_always",
@@ -669,17 +741,24 @@ export interface AcpTurnItemProps {
 export const AcpTurnItem = memo(function AcpTurnItem({
   turn,
   onDownloadAttachment,
+  onPreviewAttachment,
+  onPreviewFilePath,
   onReplyPermission,
 }: AcpTurnItemProps) {
   switch (turn.role) {
     case "user":
       return (
-        <UserTurnCard turn={turn} onDownloadAttachment={onDownloadAttachment} />
+        <UserTurnCard
+          turn={turn}
+          onDownloadAttachment={onDownloadAttachment}
+          onPreviewAttachment={onPreviewAttachment}
+          onPreviewFilePath={onPreviewFilePath}
+        />
       );
     case "agent_thought":
       return <ThoughtTurnCard turn={turn} />;
     case "tool_call":
-      return <ToolCallCard turn={turn} />;
+      return <ToolCallCard turn={turn} onPreviewFilePath={onPreviewFilePath} />;
     case "agent_plan":
       return <PlanTurnCard turn={turn} />;
     case "permission":
@@ -688,13 +767,15 @@ export const AcpTurnItem = memo(function AcpTurnItem({
       return <TerminalOutTurnCard turn={turn} />;
     case "agent_text":
     default:
-      return <AgentTextTurn turn={turn} />;
+      return <AgentTextTurn turn={turn} onPreviewFilePath={onPreviewFilePath} />;
   }
 });
 
 export interface ProcessGroupCardProps {
   turns: AcpTurn[];
   onDownloadAttachment: (id: string, fileName: string) => void;
+  onPreviewAttachment?: (att: AcpAttachment) => void;
+  onPreviewFilePath?: (ref: ParsedFileRef) => void;
   onReplyPermission: (
     turnId: string,
     opt: "allow_once" | "allow_always" | "reject_once" | "reject_always",
@@ -704,6 +785,8 @@ export interface ProcessGroupCardProps {
 export const ProcessGroupCard = memo(function ProcessGroupCard({
   turns,
   onDownloadAttachment,
+  onPreviewAttachment,
+  onPreviewFilePath,
   onReplyPermission,
 }: ProcessGroupCardProps) {
   let thoughtCount = 0;
@@ -838,6 +921,8 @@ export const ProcessGroupCard = memo(function ProcessGroupCard({
             key={t.id}
             turn={t}
             onDownloadAttachment={onDownloadAttachment}
+            onPreviewAttachment={onPreviewAttachment}
+            onPreviewFilePath={onPreviewFilePath}
             onReplyPermission={onReplyPermission}
           />
         ))}

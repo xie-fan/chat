@@ -82,6 +82,7 @@ pub fn run() {
             acp_host::acp_host_stop,
             acp_host::acp_host_info,
             acp_host::acp_host_list_dir,
+            acp_host::acp_host_read_file,
             acp_host::acp_host_probe_workspace,
             acp_host::acp_host_git_checkout,
             acp_host::acp_host_probe_agent,

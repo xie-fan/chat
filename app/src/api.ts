@@ -29,6 +29,7 @@ import type {
   AcpBootstrap,
   AcpDirListing,
   AcpHost,
+  AcpHostFileContent,
   AcpPermissionPolicy,
   AcpSession,
   AcpSettings,
@@ -1232,6 +1233,11 @@ export const acp = {
   deleteHost: (id: string) => del<void>(`/acp/hosts/${id}`),
   listDirs: (hostId: string, path = "") =>
     get<AcpDirListing>(`/acp/hosts/${hostId}/dirs?path=${encodeURIComponent(path)}`),
+  readHostFile: (hostId: string, path: string, cwd?: string) => {
+    const qs = new URLSearchParams({ path });
+    if (cwd) qs.set("cwd", cwd);
+    return get<AcpHostFileContent>(`/acp/hosts/${hostId}/file?${qs}`);
+  },
   createAgent: (body: {
     host_id: string;
     preset: string;
@@ -1313,10 +1319,10 @@ export const acp = {
     fd.append("file", file, file.name);
     return call<AcpAttachment>("/acp/files", { method: "POST", body: fd }, { timeoutMs: 0 });
   },
-  downloadFile: async (id: string, fileName: string): Promise<void> => {
+  fetchFileBlob: async (id: string, opts?: { dl?: boolean }): Promise<Blob> => {
     const gen = session();
     const srv = getServer();
-    const path = `/acp/files/${id}?dl=1`;
+    const path = `/acp/files/${id}${opts?.dl ? "?dl=1" : ""}`;
     let res = await raw(srv, path, undefined, 0);
     requireSession(gen);
     if (res.status === 401) {
@@ -1342,14 +1348,17 @@ export const acp = {
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      let msg = text || `下载失败 (${res.status})`;
+      let msg = text || `读取附件失败 (${res.status})`;
       try {
         const j = JSON.parse(text) as { error?: unknown };
         if (typeof j?.error === "string") msg = j.error;
       } catch {}
       throw new ApiError(res.status, msg);
     }
-    const blob = await res.blob();
+    return res.blob();
+  },
+  downloadFile: async (id: string, fileName: string): Promise<void> => {
+    const blob = await acp.fetchFileBlob(id, { dl: true });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

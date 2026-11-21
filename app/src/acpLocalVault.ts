@@ -486,6 +486,10 @@ export async function stageLocalAttachment(file: File): Promise<AcpAttachment> {
   };
 }
 
+export function getStagedLocalAttachment(id: string): LocalAttachmentPayload | undefined {
+  return attachmentMem.get(id);
+}
+
 export function takeStagedLocalAttachments(ids: string[]): LocalAttachmentPayload[] {
   const out: LocalAttachmentPayload[] = [];
   for (const id of ids) {

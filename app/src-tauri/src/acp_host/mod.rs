@@ -613,6 +613,13 @@ pub async fn acp_host_list_dir(path: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+pub async fn acp_host_read_file(path: String, cwd: Option<String>) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || dirs::read_file(&path, cwd.as_deref(), &[]))
+        .await
+        .map_err(|e| format!("读取文件任务异常：{e}"))?
+}
+
+#[tauri::command]
 pub async fn acp_host_probe_workspace(cwd: String) -> Result<Value, String> {
     command::probe_workspace(&cwd).await
 }
@@ -1035,6 +1042,20 @@ async fn handle_rpc_call(
 
     let res: Result<Value, String> = match method {
         "list_dir" => dirs::list_dir(params["path"].as_str().unwrap_or("")),
+        "read_file" => {
+            let raw_path = params["path"].as_str().unwrap_or("").to_string();
+            let raw_cwd = params["cwd"].as_str().map(str::to_string);
+            let allow_cwds = match &exec_gate {
+                ExecGate::Headless { allow_cwds, .. } => allow_cwds.clone(),
+                ExecGate::Desktop { .. } => Vec::new(),
+            };
+            tokio::task::spawn_blocking(move || {
+                dirs::read_file(&raw_path, raw_cwd.as_deref(), &allow_cwds)
+            })
+            .await
+            .map_err(|e| format!("read_file task failed: {e}"))
+            .and_then(|r| r)
+        }
         "probe_workspace" => command::probe_workspace(params["cwd"].as_str().unwrap_or("")).await,
         "git_checkout" => {
             command::git_checkout(

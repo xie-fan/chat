@@ -56,6 +56,7 @@ import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import ChatRecordView, { ChatRecordCard, type RecordViewState } from "./ChatRecordView";
 import { attImgSrc, imageBubbleSize } from "../mediaFormat";
+import FilePreview, { type FilePreviewTarget } from "../FilePreview";
 import EmptyState from "../EmptyState";
 import Skeleton from "../Skeleton";
 import Avatar from "../Avatar";
@@ -63,7 +64,6 @@ import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
 import { inBubbleGroup } from "./bubbleGroup";
 import { pushBackLayer, resetBackLayers } from "./backStack";
-import { Z } from "./layers";
 import { recordLabel } from "./chatRecord";
 import {
   enterMultiSelect,
@@ -138,16 +138,6 @@ function showText(m: MessageView): boolean {
     m.content !== "[图片]" &&
     m.content !== "[语音]" &&
     m.content !== `[文件] ${m.attachment.file_name}`
-  );
-}
-
-/** 可按文本预览的附件（mime 或扩展名判断） */
-function isTextLike(a: AttachmentView): boolean {
-  return (
-    a.mime.startsWith("text/") ||
-    /\.(txt|md|log|json|js|jsx|ts|tsx|py|rs|csv|ya?ml|xml|html?|css|sh|bat|ps1|c|h|cpp|java|go|toml|ini|cfg|sql)$/i.test(
-      a.file_name,
-    )
   );
 }
 
@@ -270,7 +260,13 @@ export default function ChatView() {
     /** MF2：从聊天记录查看页打开的附件（工具栏恰为 下载/转发/关闭） */
     rec?: { outerId: string; attachmentId: string };
   } | null>(null);
-  const [previewText, setPreviewText] = useState<string | null>(null);
+  const [stagedPreview, setStagedPreview] = useState<
+    | { kind: "pending"; file: File; id: string }
+    | { kind: "reuse"; reuse: DraftReuse }
+    | null
+  >(null);
+  const [previewSeq, setPreviewSeq] = useState(0);
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
   // 生命周期：emoji 选择器展开的消息 id、消息右键菜单、触屏动作面板、mutation 错误/忙碌
@@ -364,6 +360,8 @@ export default function ChatView() {
     setFwdRecord(null);
     setFwdMsg(null);
     setPreview(null);
+    setStagedPreview(null);
+    setPreviewCollapsed(false);
     batchSub.current = null;
     recSub.current = null;
     // 待发附件属于旧会话，不能带到新会话里发出去
@@ -432,6 +430,8 @@ export default function ChatView() {
       setFwdBatch(null);
       setFwdRecord(null);
       setPreview(null);
+      setStagedPreview(null);
+      setPreviewCollapsed(false);
       batchSub.current = null;
       recSub.current = null;
       resetBackLayers();
@@ -652,7 +652,18 @@ export default function ChatView() {
     return () => unreg?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recordView != null]);
-  useEffect(() => (preview ? pushBackLayer(() => setPreview(null)) : undefined), [preview != null]);
+  const anyPreviewOpen = Boolean(preview || stagedPreview);
+  const previewBlocksBack = anyPreviewOpen && !previewCollapsed;
+  const closeAllPreview = () => {
+    setPreview(null);
+    setStagedPreview(null);
+    setPreviewCollapsed(false);
+  };
+  useEffect(
+    () => (previewBlocksBack ? pushBackLayer(closeAllPreview) : undefined),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [previewBlocksBack],
+  );
   const fwdOpen = !!(fwdMsg || fwdBatch || fwdRecord);
   useEffect(
     () =>
@@ -679,8 +690,8 @@ export default function ChatView() {
             setFwdBatch(null);
             setFwdRecord(null);
           }
-        : preview
-          ? () => setPreview(null)
+        : previewBlocksBack
+          ? closeAllPreview
           : recordView
             ? () =>
                 setRecordView((cur) =>
@@ -1399,6 +1410,11 @@ export default function ChatView() {
         if (still()) {
           setText("");
           setAc(null);
+          setStagedPreview((cur) =>
+            cur?.kind === "reuse" && cur.reuse.attachment_id === chip.attachment_id
+              ? null
+              : cur,
+          );
           stickBottom.current = true;
         }
         if (getState().replyingTo === rt0) setState({ replyingTo: null });
@@ -1424,7 +1440,10 @@ export default function ChatView() {
       if (getState().replyingTo === rt0) setState({ replyingTo: null });
       if (still()) {
         setText((cur) => unsentText(cur, sentText));
-            setPendingFiles((p) => p.filter((f) => !sentFiles.includes(f)));
+        setPendingFiles((p) => p.filter((f) => !sentFiles.includes(f)));
+        setStagedPreview((cur) =>
+          cur?.kind === "pending" && sentFiles.includes(cur.file) ? null : cur,
+        );
         setAc(null);
         stickBottom.current = true;
       }
@@ -1526,16 +1545,68 @@ export default function ChatView() {
 
   const openPreview = (att: AttachmentView, m?: MessageView, rec?: { outerId: string; attachmentId: string }) => {
     previewAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
+    setStagedPreview(null);
     setPreview({ att, m: m ?? null, rec });
-    setPreviewText(null);
-    // 撤回件复用的乐观附件（att.recalled）：公共 URL 已 404，不拉取
-    if (isTextLike(att) && !att.recalled) {
-      fetch(files.url(att.id))
-        .then((r) => r.text())
-        .then((t) => setPreviewText(t.slice(0, 300_000)))
-        .catch(() => setPreviewText("（加载失败）"));
-    }
+    setPreviewSeq((n) => n + 1);
   };
+
+  const openPendingFilePreview = (file: File, index: number) => {
+    previewAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
+    setPreview(null);
+    setStagedPreview({
+      kind: "pending",
+      file,
+      id: `${file.name}:${file.size}:${file.lastModified}:${index}`,
+    });
+    setPreviewSeq((n) => n + 1);
+  };
+
+  const openReusePreview = (chip: DraftReuse) => {
+    if (chip.expired) return;
+    previewAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
+    setPreview(null);
+    setStagedPreview({ kind: "reuse", reuse: chip });
+    setPreviewSeq((n) => n + 1);
+  };
+
+  const activePreviewTarget: FilePreviewTarget | null = preview
+    ? {
+        kind: "chat-attachment",
+        key: `att:${preview.att.id}:${preview.rec?.outerId ?? ""}:${preview.att.recalled ? (reuseUrls[preview.att.id] ?? "pending") : "pub"}`,
+        fileName: preview.att.file_name,
+        mime: preview.att.mime,
+        size: preview.att.size,
+        url: attImgSrc(
+          preview.att,
+          preview.att.recalled ? reuseUrls[preview.att.id] : undefined,
+          files.url(preview.att.id),
+        ) ?? undefined,
+      }
+    : stagedPreview?.kind === "pending"
+      ? {
+          kind: "local-file",
+          key: `pending:${stagedPreview.id}`,
+          file: stagedPreview.file,
+          badge: "待发送",
+        }
+      : stagedPreview?.kind === "reuse"
+        ? {
+            kind: "chat-attachment",
+            key: `reuse:${stagedPreview.reuse.attachment_id}`,
+            fileName: stagedPreview.reuse.file_name,
+            mime: stagedPreview.reuse.mime,
+            size: stagedPreview.reuse.size,
+            badge: "待发送",
+            loadBlob: async () => {
+              const objUrl = await files.recalledUrl(stagedPreview.reuse.attachment_id);
+              try {
+                return await (await fetch(objUrl)).blob();
+              } finally {
+                URL.revokeObjectURL(objUrl);
+              }
+            },
+          }
+        : null;
 
   const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     // files 是活的 FileList：必须先拷成数组再清 value，否则清空后列表跟着归零
@@ -2237,27 +2308,55 @@ export default function ChatView() {
             {/* MM2：撤回重编辑挂上的「复用附件」chip；✕ 或成功发送才摘（清文字不摘） */}
             {reuse && (
               <div
-                className={`reuse-chip ${reuse.expired ? "expired" : ""}`}
+                className={`reuse-chip ${reuse.expired ? "expired" : "clickable"}`}
                 data-testid="reuse-chip"
+                onClick={reuse.expired ? undefined : () => openReusePreview(reuse)}
               >
-                {reuse.kind === "image" && reuseUrls[reuse.attachment_id] ? (
-                  <img
-                    className="rc-thumb"
-                    src={reuseUrls[reuse.attachment_id]}
-                    alt=""
-                  />
+                {reuse.expired ? (
+                  <>
+                    <span className="rc-ic">📎</span>
+                    <span className="rc-name" title={reuse.file_name}>
+                      {reuse.file_name}
+                    </span>
+                    <span className="rc-expired">附件已过期</span>
+                  </>
                 ) : (
-                  <span className="rc-ic">📎</span>
+                  <button
+                    type="button"
+                    className="reuse-chip-main"
+                    title={`点击预览：${reuse.file_name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openReusePreview(reuse);
+                    }}
+                  >
+                    {reuse.kind === "image" && reuseUrls[reuse.attachment_id] ? (
+                      <img
+                        className="rc-thumb"
+                        src={reuseUrls[reuse.attachment_id]}
+                        alt=""
+                      />
+                    ) : (
+                      <span className="rc-ic">📎</span>
+                    )}
+                    <span className="rc-name" title={reuse.file_name}>
+                      {reuse.file_name}
+                    </span>
+                  </button>
                 )}
-                <span className="rc-name" title={reuse.file_name}>
-                  {reuse.file_name}
-                </span>
-                {reuse.expired && <span className="rc-expired">附件已过期</span>}
                 <button
                   type="button"
                   className="rc-x"
                   aria-label="移除附件"
-                  onClick={() => setDraftReuse(conv.id, null)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setDraftReuse(conv.id, null);
+                    setStagedPreview((cur) =>
+                      cur?.kind === "reuse" && cur.reuse.attachment_id === reuse.attachment_id
+                        ? null
+                        : cur,
+                    );
+                  }}
                 >
                   ✕
                 </button>
@@ -2283,17 +2382,39 @@ export default function ChatView() {
             {pendingFiles.length > 0 && (
               <div className="pending-files">
                 {pendingFiles.map((f, i) => (
-                  <span key={i} className="pf-chip" title={f.name}>
-                    {f.type.startsWith("image/") ? "🖼" : "📄"}
-                    <span className="pf-name">{f.name}</span>
-                    <i>{fmtSize(f.size)}</i>
-                    <b
-                      onClick={() =>
-                        setPendingFiles((p) => p.filter((_, j) => j !== i))
-                      }
+                  <span
+                    key={i}
+                    className="pf-chip clickable"
+                    data-testid="pending-file-chip"
+                    onClick={() => openPendingFilePreview(f, i)}
+                  >
+                    <button
+                      type="button"
+                      className="pf-chip-main"
+                      title={`点击预览：${f.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openPendingFilePreview(f, i);
+                      }}
+                    >
+                      <span>{f.type.startsWith("image/") ? "🖼" : "📄"}</span>
+                      <span className="pf-name">{f.name}</span>
+                      <i>{fmtSize(f.size)}</i>
+                    </button>
+                    <button
+                      type="button"
+                      className="pf-chip-x"
+                      aria-label={`移除待发文件 ${f.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setPendingFiles((p) => p.filter((_, j) => j !== i));
+                        setStagedPreview((cur) =>
+                          cur?.kind === "pending" && cur.file === f ? null : cur,
+                        );
+                      }}
                     >
                       ✕
-                    </b>
+                    </button>
                   </span>
                 ))}
               </div>
@@ -2455,29 +2576,72 @@ export default function ChatView() {
         />
       )}
 
-      {/* 附件预览 / 大图查看器（MM2：带动作工具栏；工具栏项与消息菜单共用 items 函数）。
-          触屏打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（兼容 click 可能落到
-          刚渲染的工具栏按钮上）；鼠标/笔打开的预览永不忽略点击 */}
-      {preview && (
-        // Z.modal：记录查看页(Z.recordView)之上、转发弹窗(Z.forwardModal)之下
-        <div
-          className="modal-mask"
-          style={{ zIndex: Z.modal }}
-          onClick={() => {
-            if (!isGhostClick(previewAt.current)) setPreview(null);
-          }}
-        >
-          <div className="pv-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="pv-head">
-              <span className="pv-name" title={preview.att.file_name}>
-                {preview.att.file_name}
-              </span>
-              <span className="muted">{fmtSize(preview.att.size)}</span>
-              <span className="pv-toolbar">
-                {/* 回复/转发/撤回与消息菜单同一来源（viewer-<action>）；多选不进预览工具栏 */}
-                {preview.rec ? (
-                  /* MF2-C8 记录上下文：恰为 下载 → 转发（关闭在右侧 pv-head 固定位置） */
-                  <>
+      {/* 附件预览 / 大图查看器（桌面端居中弹窗，移动端右侧可收起/展开覆盖层；支持已发/已收与待发文件） */}
+      {activePreviewTarget && (
+        <FilePreview
+          variant="chat"
+          target={activePreviewTarget}
+          openSeq={previewSeq}
+          onClose={closeAllPreview}
+          shouldIgnoreClick={() => isGhostClick(previewAt.current)}
+          onMobileCollapsedChange={setPreviewCollapsed}
+          toolbarActions={
+            preview ? (
+              preview.rec ? (
+                /* MF2-C8 记录上下文：恰为 下载 → 转发（关闭在右侧 pv-head 固定位置） */
+                <>
+                  <button
+                    type="button"
+                    className="pv-act"
+                    data-testid="viewer-download"
+                    onClick={() => {
+                      if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
+                    }}
+                  >
+                    <DownloadIcon />
+                    <span>下载</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="pv-act"
+                    data-testid="viewer-forward"
+                    onClick={() => {
+                      if (isGhostClick(previewAt.current)) return;
+                      setFwdRecord({
+                        outerId: preview.rec!.outerId,
+                        attachmentId: preview.rec!.attachmentId,
+                        fileName: preview.att.file_name,
+                      });
+                    }}
+                  >
+                    <ForwardIcon />
+                    <span>转发</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  {preview.m &&
+                    itemsFor(preview.m)
+                      .filter((it) => ["reply", "forward", "recall"].includes(it.action))
+                      .map((it) => (
+                        <button
+                          key={it.action}
+                          type="button"
+                          className={`pv-act ${it.danger ? "danger" : ""}`}
+                          data-testid={`viewer-${it.action}`}
+                          title={it.label}
+                          onClick={() => {
+                            if (isGhostClick(previewAt.current)) return;
+                            const m = preview.m!;
+                            closeAllPreview();
+                            runMenuAction(m, it.action);
+                          }}
+                        >
+                          {menuIcon(it.action)}
+                          <span>{it.label}</span>
+                        </button>
+                      ))}
+                  {!preview.att.recalled && (
                     <button
                       type="button"
                       className="pv-act"
@@ -2489,108 +2653,12 @@ export default function ChatView() {
                       <DownloadIcon />
                       <span>下载</span>
                     </button>
-                    <button
-                      type="button"
-                      className="pv-act"
-                      data-testid="viewer-forward"
-                      onClick={() => {
-                        if (isGhostClick(previewAt.current)) return;
-                        setFwdRecord({
-                          outerId: preview.rec!.outerId,
-                          attachmentId: preview.rec!.attachmentId,
-                          fileName: preview.att.file_name,
-                        });
-                      }}
-                    >
-                      <ForwardIcon />
-                      <span>转发</span>
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    {preview.m &&
-                      itemsFor(preview.m)
-                        .filter((it) => ["reply", "forward", "recall"].includes(it.action))
-                        .map((it) => (
-                          <button
-                            key={it.action}
-                            type="button"
-                            className={`pv-act ${it.danger ? "danger" : ""}`}
-                            data-testid={`viewer-${it.action}`}
-                            title={it.label}
-                            onClick={() => {
-                              if (isGhostClick(previewAt.current)) return;
-                              const m = preview.m!;
-                              setPreview(null);
-                              runMenuAction(m, it.action);
-                            }}
-                          >
-                            {menuIcon(it.action)}
-                            <span>{it.label}</span>
-                          </button>
-                        ))}
-                    {!preview.att.recalled && (
-                      <button
-                        type="button"
-                        className="pv-act"
-                        data-testid="viewer-download"
-                        onClick={() => {
-                          if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
-                        }}
-                      >
-                        <DownloadIcon />
-                        <span>下载</span>
-                      </button>
-                    )}
-                  </>
-                )}
-              </span>
-              <button
-                className="icon-btn"
-                data-testid="viewer-close"
-                onClick={() => {
-                  if (!isGhostClick(previewAt.current)) setPreview(null);
-                }}
-              >
-                ✕
-              </button>
-            </div>
-            <div className="pv-body">
-              {preview.att.mime.startsWith("image/") &&
-                (() => {
-                  const src = attImgSrc(
-                    preview.att,
-                    preview.att.recalled ? reuseUrls[preview.att.id] : undefined,
-                    files.url(preview.att.id),
-                  );
-                  return src ? (
-                    <img src={src} alt={preview.att.file_name} />
-                  ) : (
-                    <div className="pv-unsupported">附件加载中…</div>
-                  );
-                })()}
-              {isTextLike(preview.att) && !preview.att.mime.startsWith("image/") && (
-                <pre>{previewText ?? "加载中…"}</pre>
-              )}
-              {preview.att.mime === "application/pdf" && (
-                <iframe src={files.url(preview.att.id)} title={preview.att.file_name} />
-              )}
-              {preview.att.mime.startsWith("audio/") && (
-                <audio controls src={files.url(preview.att.id)} />
-              )}
-              {preview.att.mime.startsWith("video/") && (
-                <video controls src={files.url(preview.att.id)} />
-              )}
-              {!preview.att.mime.startsWith("image/") &&
-                !preview.att.mime.startsWith("audio/") &&
-                !preview.att.mime.startsWith("video/") &&
-                preview.att.mime !== "application/pdf" &&
-                !isTextLike(preview.att) && (
-                  <div className="pv-unsupported">暂不支持预览此格式，请下载后查看</div>
-                )}
-            </div>
-          </div>
-        </div>
+                  )}
+                </>
+              )
+            ) : undefined
+          }
+        />
       )}
 
       {/* MM2：统一消息菜单（图标+文字）；附件不再有单独的右键菜单 */}

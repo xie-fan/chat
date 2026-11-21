@@ -22,6 +22,7 @@ import {
   renameLocalVaultHost,
   resolveLocalPermissionTurn,
   settleLocalSessionOnCancel,
+  getStagedLocalAttachment,
   stageLocalAttachment,
   takeStagedLocalAttachments,
   upsertLocalVaultWorkspace,
@@ -47,6 +48,7 @@ import type {
   AcpAttachment,
   AcpDirListing,
   AcpHost,
+  AcpHostFileContent,
   AcpPermissionPolicy,
   AcpSession,
   AcpThinkingLevel,
@@ -663,6 +665,26 @@ export async function listDirsLocalFirst(hostId: string, path = ""): Promise<Acp
   return acp.listDirs(hostId, path);
 }
 
+export async function readHostFileLocalFirst(
+  hostId: string,
+  path: string,
+  cwd?: string,
+): Promise<AcpHostFileContent> {
+  if (isLocalAcpHost(hostId)) {
+    try {
+      return await tauriInvoke<AcpHostFileContent>("acp_host_read_file", {
+        path,
+        cwd: cwd ?? null,
+      });
+    } catch (e) {
+      throw new Error(
+        typeof e === "string" ? e : e instanceof Error ? e.message : "读取本机文件失败",
+      );
+    }
+  }
+  return acp.readHostFile(hostId, path, cwd);
+}
+
 export async function createWorkspaceLocalFirst(body: {
   host_id: string;
   cwd: string;
@@ -1007,14 +1029,75 @@ export async function deleteSessionLocalFirst(sessId: string): Promise<void> {
   await acp.deleteSession(sessId);
 }
 
+const recentUploadedAcpBlobs = new Map<string, Blob>();
+
+function rememberAcpBlob(id: string, blob: Blob) {
+  recentUploadedAcpBlobs.set(id, blob);
+  if (recentUploadedAcpBlobs.size > 32) {
+    const oldest = recentUploadedAcpBlobs.keys().next().value;
+    if (oldest) recentUploadedAcpBlobs.delete(oldest);
+  }
+}
+
+function base64ToBlob(b64: string, mime: string): Blob {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mime || "application/octet-stream" });
+}
+
 export async function uploadAttachmentLocalFirst(
   file: File,
   sessionId: string,
 ): Promise<AcpAttachment> {
-  if (isLocalVaultSession(sessionId)) {
-    return stageLocalAttachment(file);
+  const att = isLocalVaultSession(sessionId)
+    ? await stageLocalAttachment(file)
+    : await acp.uploadFile(file, sessionId);
+  rememberAcpBlob(att.id, file);
+  return att;
+}
+
+export async function fetchAcpAttachmentBlobLocalFirst(
+  att: AcpAttachment,
+): Promise<Blob> {
+  const mem = recentUploadedAcpBlobs.get(att.id);
+  if (mem) return mem;
+  const staged = getStagedLocalAttachment(att.id);
+  if (staged) {
+    const blob = base64ToBlob(staged.data_base64, staged.mime);
+    rememberAcpBlob(att.id, blob);
+    return blob;
   }
-  return acp.uploadFile(file, sessionId);
+  const fetched = await acp.fetchFileBlob(att.id);
+  rememberAcpBlob(att.id, fetched);
+  return fetched;
+}
+
+export async function downloadAcpAttachmentLocalFirst(
+  id: string,
+  fileName: string,
+): Promise<void> {
+  const localBlob =
+    recentUploadedAcpBlobs.get(id) ??
+    (() => {
+      const staged = getStagedLocalAttachment(id);
+      return staged ? base64ToBlob(staged.data_base64, staged.mime) : null;
+    })();
+  if (localBlob && isLocalOnlyActive()) {
+    const url = URL.createObjectURL(localBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName || "attachment";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return;
+  }
+  await acp.downloadFile(id, fileName);
 }
 
 export async function sendPromptLocalFirst(
