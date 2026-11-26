@@ -42,8 +42,8 @@ pub struct ServerSettings {
     #[serde(skip_serializing)]
     pub push_ntfy_token: String,
     pub push_ntfy_token_set: bool,
-    /// 本服务对外地址：推送通知 Click 跳转 + 客户端更新下载地址前缀。
-    /// 默认公网实例 https://chat.287152.xyz；显式置空 = 更新下载按请求 Host 拼、推送不带 Click
+    /// 本服务对外地址，用于推送通知跳转和 Bot API 描述。
+    /// 默认公网实例 https://chat.287152.xyz；置空时推送不带跳转链接。
     pub public_url: String,
     /// 视频会议地址前缀；空字符串 = 关闭会议按钮
     pub meeting_base_url: String,

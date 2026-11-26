@@ -26,6 +26,8 @@ export type { SavedAccount, ServerEntry } from "./servers";
 import type {
   AcpAgent,
   AcpAttachment,
+  AcpHostSnapshot,
+  AcpSnapshotAttachment,
   AcpBootstrap,
   AcpDirListing,
   AcpHost,
@@ -730,7 +732,10 @@ async function call<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: nu
     // 登录失败统一口语文案（服务端报文是英文代号 invalid credentials）
     if (path === "/auth/login" && res.status === 401) msg = "用户名或密码错误";
     // 服务端没有这个接口（客户端更新了、服务端还没更新）
-    if (res.status === 404 && msg === "unknown_api") msg = "服务端版本较旧，不支持这个操作，请更新服务端";
+    if (res.status === 404 && msg === "unknown_api") {
+      code ??= "unknown_api";
+      msg = "服务端版本较旧，不支持这个操作，请更新服务端";
+    }
     throw new ApiError(res.status, msg, { code, hasErrorField });
   }
   return JSON.parse(text) as T;
@@ -1068,50 +1073,84 @@ export const searchApi = {
 };
 
 // ---------- files ----------
+export interface AttachmentAccess {
+  url: string;
+  expiresAt: number;
+}
+
 export const files = {
-  /** 附件地址（能力 URL）：dl=true 强制下载；thumb=true 取 JPEG 缩略图（有则返回），默认 inline */
-  url: (id: string, opts?: { dl?: boolean; thumb?: boolean }) => {
-    const p = new URLSearchParams();
-    if (opts?.dl) p.set("dl", "1");
-    else if (opts?.thumb) p.set("thumb", "1");
-    const q = p.toString();
-    return `${getServer()}/v1/files/${id}${q ? `?${q}` : ""}`;
+  /** 媒体标签与原生下载器使用附件专属的短时地址，账号凭据只经请求头发送。 */
+  access: async (id: string, opts?: { dl?: boolean; thumb?: boolean }): Promise<AttachmentAccess> => {
+    const gen = session();
+    const srv = getServer();
+    const path = `/files/${encodeURIComponent(id)}`;
+    const params = new URLSearchParams();
+    if (opts?.dl) params.set("dl", "1");
+    else if (opts?.thumb) params.set("thumb", "1");
+    const startedAt = Date.now();
+    let expiresAt = Infinity;
+    try {
+      const { ticket, expires_in } = await get<{ ticket: string; expires_in: number }>(`${path}/ticket`);
+      if (typeof ticket !== "string" || !ticket || !Number.isFinite(expires_in) || expires_in <= 0) {
+        throw new ApiError(502, "服务端未返回有效的附件地址");
+      }
+      params.set("ticket", ticket);
+      expiresAt = startedAt + (expires_in - 10) * 1000;
+    } catch (err) {
+      // 支持尚未升级的服务器。成员资格拒绝是 file not found，不能降级。
+      if (!(err instanceof ApiError && err.status === 404 && err.code === "unknown_api")) throw err;
+    }
+    requireSession(gen);
+    requireIdentity();
+    const query = params.toString();
+    return { url: `${srv}/v1${path}${query ? `?${query}` : ""}`, expiresAt };
   },
   upload: async (
     conversationId: string,
     file: File,
-    opts?: { durationMs?: number },
+    opts?: { durationMs?: number; clientUploadId?: string },
   ): Promise<AttachmentView> => {
     const fd = new FormData();
     fd.append("conversation_id", conversationId);
     fd.append("file", file, file.name);
     if (opts?.durationMs != null) fd.append("duration_ms", String(opts.durationMs));
+    if (opts?.clientUploadId) fd.append("client_upload_id", opts.clientUploadId);
     return call<AttachmentView>("/files", { method: "POST", body: fd }, { timeoutMs: 0 });
   },
+  removeUnsent: (id: string) => del<void>(`/files/${encodeURIComponent(id)}`),
   /**
    * MM2 撤回附件取回：GET /files/{id}/recalled → object URL。
-   * Bearer 头鉴权（token 永不出现在 URL），no-store；仅上传者 + TTL 内有效，其余一律 404。
+   * Bearer 头鉴权，no-store。上传者须仍在会话内，附件须处于保留期。
    */
   recalledUrl: async (id: string, opts?: { thumb?: boolean }): Promise<string> => {
+    const gen = session();
     const srv = getServer();
     const q = opts?.thumb ? "?thumb=1" : "";
     const url = `${srv}/v1/files/${id}/recalled${q}`;
-    const req = () =>
-      timedFetch(url, {
+    const req = () => {
+      requireSession(gen);
+      requireIdentity();
+      return timedFetch(url, {
         cache: "no-store",
         headers: {
           authorization: `Bearer ${readAuth(localStorage, encServer(srv))?.access ?? ""}`,
         },
       });
+    };
     let res = await req();
+    requireSession(gen);
     if (res.status === 401) {
-      const r = await tryRefresh(session(), srv);
+      const r = await tryRefresh(gen, srv);
+      requireSession(gen);
       if (r.r === "ok") res = await req();
       else if (r.r === "invalid") denySession(401, r.reason ?? LOGOUT_EXPIRED, srv);
       else throw new ApiError(503, "暂时连不上服务器，请稍后再试");
     }
     if (!res.ok) throw new ApiError(res.status, "file not found", { hasErrorField: true });
-    return URL.createObjectURL(await res.blob());
+    const blob = await res.blob();
+    requireSession(gen);
+    requireIdentity();
+    return URL.createObjectURL(blob);
   },
 };
 
@@ -1226,6 +1265,24 @@ export const admin = {
 // ---------- ACP Agent Workspace ----------
 export const acp = {
   bootstrap: () => get<AcpBootstrap>("/acp/bootstrap"),
+  exportHostSnapshot: (installId: string) =>
+    get<{ revision: string; import_id: string | null; snapshot: AcpHostSnapshot } | null>(
+      `/acp/local-hosts/${installId}/snapshot`,
+    ),
+  deleteHostSnapshot: (installId: string, revision: string) =>
+    del<void>(`/acp/local-hosts/${installId}/snapshot?${new URLSearchParams({ revision })}`),
+  importHostSnapshot: (installId: string, transferId: string, snapshot: AcpHostSnapshot) =>
+    post<{ host_id: string; transfer_id: string }>(`/acp/local-hosts/${installId}/snapshot`, {
+      transfer_id: transferId,
+      snapshot,
+    }),
+  uploadTransferFile: (attachment: AcpSnapshotAttachment, blob: Blob) => {
+    const body = new FormData();
+    body.append("file", new Blob([blob], { type: attachment.mime }), attachment.file_name);
+    return call<AcpAttachment>(`/acp/transfer-files/${attachment.id}`, { method: "PUT", body }, {
+      timeoutMs: 0,
+    });
+  },
   updateSettings: (default_permission: AcpPermissionPolicy) =>
     put<AcpSettings>("/acp/settings", { default_permission }),
   createPairCode: () => post<{ code: string; expires_in: number }>("/acp/hosts/pair-code"),
@@ -1307,8 +1364,11 @@ export const acp = {
       permission_policy?: AcpPermissionPolicy;
     },
   ) => post<AcpTurn>(`/acp/sessions/${sessionId}/prompts`, body),
-  cancelSession: (sessionId: string) =>
-    post<AcpSession>(`/acp/sessions/${sessionId}/cancel`, {}),
+  cancelSession: (sessionId: string, runId?: string | null) =>
+    post<AcpSession>(
+      `/acp/sessions/${sessionId}/cancel${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`,
+      {},
+    ),
   replyPermission: (
     turnId: string,
     option_id: "allow_once" | "allow_always" | "reject_once" | "reject_always",

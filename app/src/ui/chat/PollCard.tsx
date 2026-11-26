@@ -1,3 +1,4 @@
+import { newClientId } from "../../clientId";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, msgs, polls, session } from "../../api";
 import { applyRefreshed, applyUpdatedMessage, getState, setState, useApp } from "../../store";
@@ -83,7 +84,7 @@ export default function PollCard({
     setBusy(true);
     onErr(null);
     try {
-      const v = await polls.vote(m.id, ids, crypto.randomUUID());
+      const v = await polls.vote(m.id, ids, newClientId());
       if (current(token)) setState((st) => applyUpdatedMessage(st, v));
     } catch (e) {
       if (!current(token)) return;
@@ -115,7 +116,7 @@ export default function PollCard({
     setBusy(true);
     onErr(null);
     try {
-      const v = await polls.close(m.id, crypto.randomUUID());
+      const v = await polls.close(m.id, newClientId());
       if (current(token)) setState((st) => applyUpdatedMessage(st, v));
     } catch (e) {
       if (!current(token)) return;

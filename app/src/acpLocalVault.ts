@@ -1,3 +1,5 @@
+import { readLocalAcpBlob, removeLocalAcpBlob, storeLocalAcpBlob } from "./acpAttachmentStore";
+import { newClientId as makeUuid } from "./clientId";
 import type {
   AcpActivityPhase,
   AcpAgent,
@@ -8,6 +10,7 @@ import type {
   AcpPermissionPolicy,
   AcpRpcLogEntry,
   AcpSession,
+  AcpSnapshotAttachment,
   AcpThinkingLevel,
   AcpToolDiff,
   AcpTurn,
@@ -22,6 +25,10 @@ export interface LocalVaultData {
   agentSecrets: Record<string, Record<string, string>>;
   workspaces: AcpWorkspace[];
   sessions: AcpSession[];
+  attachments: Record<string, AcpSnapshotAttachment>;
+  owner: string | null;
+  cloudSource: { owner: string; hostId: string; revision: string } | null;
+  cloudImport: { owner: string; id: string } | null;
 }
 
 export interface LocalAttachmentPayload {
@@ -42,6 +49,10 @@ function emptyVault(): LocalVaultData {
     agentSecrets: {},
     workspaces: [],
     sessions: [],
+    attachments: {},
+    owner: null,
+    cloudSource: null,
+    cloudImport: null,
   };
 }
 
@@ -58,8 +69,12 @@ function loadVault(): LocalVaultData {
       agentSecrets: p.agentSecrets ?? {},
       workspaces: Array.isArray(p.workspaces) ? p.workspaces : [],
       sessions: Array.isArray(p.sessions)
-        ? p.sessions.map((s) => ({ ...s, running: false }))
+        ? p.sessions.map((s) => ({ ...s, running: false, run_id: null }))
         : [],
+      attachments: p.attachments ?? {},
+      owner: p.owner ?? null,
+      cloudSource: p.cloudSource ?? null,
+      cloudImport: p.cloudImport ?? null,
     };
   } catch {
     return emptyVault();
@@ -67,24 +82,29 @@ function loadVault(): LocalVaultData {
 }
 
 let vault: LocalVaultData = loadVault();
-const attachmentMem = new Map<string, LocalAttachmentPayload>();
 
-function persistVault() {
-  if (typeof localStorage === "undefined") return;
-  try {
-    if (!vault.active && !vault.host && vault.agents.length === 0 && vault.workspaces.length === 0) {
-      localStorage.removeItem(VAULT_STORAGE_KEY);
-    } else {
-      localStorage.setItem(VAULT_STORAGE_KEY, JSON.stringify(vault));
-    }
-  } catch {}
+function writeVault(data: LocalVaultData) {
+  if (!data.active && !data.host && data.agents.length === 0 && data.workspaces.length === 0) {
+    localStorage.removeItem(VAULT_STORAGE_KEY);
+  } else {
+    localStorage.setItem(VAULT_STORAGE_KEY, JSON.stringify(data));
+  }
 }
 
-function makeUuid(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+function commitVault(data: LocalVaultData): LocalVaultData {
+  // Transfers may destroy the source after this call. A failed write must
+  // leave the current in-memory and persisted snapshots intact.
+  writeVault(data);
+  vault = data;
+  return data;
+}
+
+function persistVault(keepImport = false) {
+  if (vault.cloudImport && !keepImport) vault = { ...vault, cloudImport: null };
+  if (typeof localStorage === "undefined") return;
+  try {
+    writeVault(vault);
+  } catch {}
 }
 
 export function getLocalVault(): LocalVaultData {
@@ -93,6 +113,11 @@ export function getLocalVault(): LocalVaultData {
 
 export function isLocalOnlyActive(): boolean {
   return vault.active && Boolean(vault.host);
+}
+
+/** 本地事件桥接也要按服务器和账号隔离，防止切号后迟到事件修改旧账号 Vault。 */
+export function localVaultOwnerMatches(owner: string): boolean {
+  return !vault.owner || vault.owner === owner;
 }
 
 export function isLocalVaultHost(hostId: string | null | undefined): boolean {
@@ -120,6 +145,10 @@ export function activateLocalVault(snapshot: {
   agents: AcpAgent[];
   workspaces: AcpWorkspace[];
   sessions: AcpSession[];
+  attachments?: AcpSnapshotAttachment[];
+  agentSecrets?: Record<string, Record<string, string>>;
+  owner?: string;
+  cloudSource?: LocalVaultData["cloudSource"];
 }): LocalVaultData {
   const localHostId = snapshot.host.id;
   const host: AcpHost = {
@@ -130,16 +159,18 @@ export function activateLocalVault(snapshot: {
     latency_ms: 0,
     last_seen: new Date().toISOString(),
   };
-  vault = {
+  return commitVault({
     active: true,
     host,
     agents: snapshot.agents.map((a) => ({ ...a, host_id: localHostId })),
-    agentSecrets: { ...vault.agentSecrets },
+    agentSecrets: snapshot.agentSecrets ?? vault.agentSecrets,
     workspaces: snapshot.workspaces.map((w) => ({ ...w, host_id: localHostId })),
     sessions: snapshot.sessions.map((s) => ({ ...s, turns: s.turns ?? [] })),
-  };
-  persistVault();
-  return vault;
+    attachments: Object.fromEntries((snapshot.attachments ?? []).map((a) => [a.id, a])),
+    owner: snapshot.owner ?? null,
+    cloudSource: snapshot.cloudSource ?? null,
+    cloudImport: null,
+  });
 }
 
 export function ensureLocalOnlyHost(info: {
@@ -147,7 +178,7 @@ export function ensureLocalOnlyHost(info: {
   name: string;
   os: string;
   roots: string[];
-}): LocalVaultData {
+}, owner?: string): LocalVaultData {
   const now = new Date().toISOString();
   const hostId = vault.host?.id || info.install_id || makeUuid();
   const host: AcpHost = {
@@ -164,27 +195,40 @@ export function ensureLocalOnlyHost(info: {
     ...vault,
     active: true,
     host,
+    owner: vault.owner ?? owner ?? null,
   };
-  persistVault();
+  persistVault(true);
   return vault;
 }
 
-export function deactivateAndTakeLocalVault(): LocalVaultData {
-  const taken = vault;
-  vault = emptyVault();
-  attachmentMem.clear();
-  persistVault();
-  return taken;
+export function confirmLocalVaultCloudRemoval() {
+  vault = { ...vault, cloudSource: null };
+  persistVault(true);
 }
 
-export function mergeLocalVaultWithBootstrap(bs: AcpBootstrap): AcpBootstrap {
-  if (!vault.active || !vault.host) return bs;
+export function beginLocalVaultImport(owner: string): string {
+  if (vault.cloudImport?.owner === owner) return vault.cloudImport.id;
+  if (vault.cloudImport) throw new Error("请切回原账号继续同步本地 ACP 数据");
+  const id = makeUuid();
+  commitVault({ ...vault, owner, cloudImport: { owner, id } });
+  return id;
+}
+
+export function completeLocalVaultImport() {
+  const attachmentIds = Object.keys(vault.attachments);
+  commitVault(emptyVault());
+  for (const id of attachmentIds) void removeLocalAcpBlob(id).catch(() => {});
+}
+
+export function mergeLocalVaultWithBootstrap(bs: AcpBootstrap, owner: string): AcpBootstrap {
+  if (!vault.active || !vault.host || (vault.owner && vault.owner !== owner)) return bs;
   const lid = vault.host.id;
+  const source = vault.cloudSource?.hostId;
   return {
     settings: bs.settings,
-    hosts: [vault.host, ...bs.hosts.filter((h) => h.id !== lid)],
-    agents: [...vault.agents, ...bs.agents.filter((a) => a.host_id !== lid)],
-    workspaces: [...vault.workspaces, ...bs.workspaces.filter((w) => w.host_id !== lid)],
+    hosts: [vault.host, ...bs.hosts.filter((h) => h.id !== lid && h.id !== source)],
+    agents: [...vault.agents, ...bs.agents.filter((a) => a.host_id !== lid && a.host_id !== source)],
+    workspaces: [...vault.workspaces, ...bs.workspaces.filter((w) => w.host_id !== lid && w.host_id !== source)],
     sessions: [
       ...vault.sessions,
       ...bs.sessions.filter(
@@ -460,43 +504,47 @@ export function removeLocalVaultSession(sessId: string) {
   persistVault();
 }
 
-export async function stageLocalAttachment(file: File): Promise<AcpAttachment> {
-  const buf = await file.arrayBuffer();
+export async function stageLocalAttachment(file: File, sessionId: string): Promise<AcpAttachment> {
+  if (!file.size) throw new Error("不能上传空附件");
+  const att = {
+    id: makeUuid(),
+    file_name: file.name,
+    mime: file.type || "application/octet-stream",
+    size: file.size,
+  };
+  await storeLocalAcpBlob(att.id, file);
+  if (!isLocalVaultSession(sessionId)) {
+    await removeLocalAcpBlob(att.id);
+    throw new Error("未找到本地会话");
+  }
+  try {
+    commitVault({
+      ...vault,
+      cloudImport: null,
+      attachments: { ...vault.attachments, [att.id]: { ...att, session_id: sessionId } },
+    });
+  } catch (error) {
+    await removeLocalAcpBlob(att.id).catch(() => {});
+    throw error;
+  }
+  return att;
+}
+
+async function promptAttachment(att: AcpAttachment): Promise<LocalAttachmentPayload> {
+  const blob = await readLocalAcpBlob(att.id);
+  if (!blob || blob.size !== att.size) throw new Error(`本地附件缺失或不完整：${att.file_name}`);
+  const buf = await blob.arrayBuffer();
   const bytes = new Uint8Array(buf);
   let binary = "";
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
-  const b64 = btoa(binary);
-  const id = makeUuid();
-  const entry: LocalAttachmentPayload = {
-    id,
-    file_name: file.name,
-    mime: file.type || "application/octet-stream",
-    size: file.size,
-    data_base64: b64,
-  };
-  attachmentMem.set(id, entry);
-  return {
-    id,
-    file_name: entry.file_name,
-    mime: entry.mime,
-    size: entry.size,
-  };
+  return { ...att, data_base64: btoa(binary) };
 }
 
-export function getStagedLocalAttachment(id: string): LocalAttachmentPayload | undefined {
-  return attachmentMem.get(id);
-}
-
-export function takeStagedLocalAttachments(ids: string[]): LocalAttachmentPayload[] {
-  const out: LocalAttachmentPayload[] = [];
-  for (const id of ids) {
-    const hit = attachmentMem.get(id);
-    if (hit) out.push(hit);
-  }
-  return out;
+export function getLocalPromptAttachments(attachments: AcpAttachment[]) {
+  return Promise.all(attachments.map(promptAttachment));
 }
 
 export function appendLocalUserTurnAndStart(
@@ -512,6 +560,8 @@ export function appendLocalUserTurnAndStart(
 ): { session: AcpSession; turn: AcpTurn } | null {
   const cur = vault.sessions.find((s) => s.id === sessId);
   if (!cur) return null;
+  if (cur.running) throw new Error("该会话已有运行中的任务");
+  const runId = makeUuid();
   const now = new Date().toISOString();
   const turns = cur.turns ?? [];
   const nextSeq = turns.reduce((m, t) => Math.max(m, t.seq), 0) + 1;
@@ -523,6 +573,7 @@ export function appendLocalUserTurnAndStart(
     status: "done",
     payload: {
       text: payload.text,
+      run_id: runId,
       files: payload.files,
       attachments: payload.attachments,
     },
@@ -532,6 +583,7 @@ export function appendLocalUserTurnAndStart(
   const updated: AcpSession = {
     ...cur,
     running: true,
+    run_id: runId,
     selected_model: payload.model,
     thinking_level: payload.thinking_level,
     permission_policy: payload.permission_policy,
@@ -555,6 +607,9 @@ export function resolveLocalPermissionTurn(
     const idx = (s.turns ?? []).findIndex((t) => t.id === turnId && t.role === "permission");
     if (idx < 0) continue;
     const prevTurn = s.turns![idx];
+    if (!s.running || prevTurn.status !== "pending" || prevTurn.payload.run_id !== s.run_id) {
+      return null;
+    }
     const reqId = String(prevTurn.payload.req_id ?? "");
     const nextTurn: AcpTurn = {
       ...prevTurn,
@@ -740,7 +795,9 @@ function upsertLocalStreamTurn(
       ? raw.duration_ms
       : undefined;
   const idx = turnKey
-    ? turns.findIndex((t) => t.role === role && t.payload.turn_key === turnKey)
+    ? turns.findIndex(
+        (t) => t.role === role && t.payload.turn_key === turnKey && t.payload.run_id === cur.run_id,
+      )
     : -1;
   const nextSeq = () => turns.reduce((m, t) => Math.max(m, t.seq), 0) + 1;
 
@@ -754,6 +811,7 @@ function upsertLocalStreamTurn(
       status,
       payload: {
         turn_key: turnKey,
+        run_id: cur.run_id,
         text: fullText !== null ? fullText : prevText + delta,
         ...(nextDuration !== undefined ? { duration_ms: nextDuration } : {}),
       },
@@ -768,6 +826,7 @@ function upsertLocalStreamTurn(
       status,
       payload: {
         turn_key: turnKey,
+        run_id: cur.run_id,
         text: fullText ?? delta,
         ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
       },
@@ -822,9 +881,14 @@ function settleSessionTurns(
   });
 }
 
-export function settleLocalSessionOnCancel(sessId: string): AcpSession | null {
+export function settleLocalSessionOnCancel(
+  sessId: string,
+  expectedRunId?: string | null,
+): AcpSession | null {
   const cur = vault.sessions.find((s) => s.id === sessId);
-  if (!cur) return null;
+  if (!cur?.running || (expectedRunId != null && cur.run_id !== expectedRunId)) {
+    return cur ?? null;
+  }
   const now = new Date().toISOString();
   const settledTurns = settleSessionTurns(
     cur.turns ?? [],
@@ -833,12 +897,21 @@ export function settleLocalSessionOnCancel(sessId: string): AcpSession | null {
   );
   return patchLocalVaultSession(sessId, {
     running: false,
+    run_id: null,
     turns: settledTurns,
   });
 }
 
 export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunnerDelta {
   const type = String(raw.type ?? "");
+  const sessId = typeof raw.session_id === "string" ? raw.session_id : "";
+  const curSession = sessId ? vault.sessions.find((s) => s.id === sessId) : undefined;
+  if (
+    (type === "session_update" || raw.run_id != null) &&
+    (!curSession?.running || !curSession.run_id || curSession.run_id !== raw.run_id)
+  ) {
+    return {};
+  }
   const now = new Date().toISOString();
 
   if (type === "agent_status") {
@@ -868,19 +941,19 @@ export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunner
     return ag ? { agent: ag } : {};
   }
 
-  if (type !== "session_update") return {};
-  const sessId = String(raw.session_id ?? "");
-  const cur = vault.sessions.find((s) => s.id === sessId);
-  if (!cur) return {};
+  if (type !== "session_update" || !curSession) return {};
+  const cur = curSession;
   const kind = String(raw.kind ?? "");
   const turns = [...(cur.turns ?? [])];
   const nextSeq = () => turns.reduce((m, t) => Math.max(m, t.seq), 0) + 1;
 
   if (kind === "plan") {
     const runKey = String(raw.run_key ?? "");
-    const payload = { run_key: runKey, steps: raw.steps ?? [] };
+    const payload = { run_key: runKey, run_id: cur.run_id, steps: raw.steps ?? [] };
     const idx = runKey
-      ? turns.findIndex((t) => t.role === "agent_plan" && t.payload.run_key === runKey)
+      ? turns.findIndex(
+          (t) => t.role === "agent_plan" && t.payload.run_key === runKey && t.payload.run_id === cur.run_id,
+        )
       : -1;
     if (idx >= 0) {
       turns[idx] = { ...turns[idx], payload, status: "done", updated_at: now };
@@ -918,12 +991,12 @@ export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunner
         ? raw.tool_call_id.trim().slice(0, 128)
         : makeUuid();
     const idx = turns.findIndex(
-      (t) => t.role === "tool_call" && t.payload.tool_call_id === toolCallId,
+      (t) => t.role === "tool_call" && t.payload.tool_call_id === toolCallId && t.payload.run_id === cur.run_id,
     );
     const prev = idx >= 0 ? turns[idx] : undefined;
     const status =
       normalizeLocalToolStatus(raw.status) ?? prev?.status ?? "in_progress";
-    const payload = mergeLocalToolCallPayload(prev?.payload, raw, toolCallId);
+    const payload = { ...mergeLocalToolCallPayload(prev?.payload, raw, toolCallId), run_id: cur.run_id };
     if (idx >= 0) {
       turns[idx] = { ...turns[idx], status, payload, updated_at: now };
     } else {
@@ -991,6 +1064,7 @@ export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunner
       status: "pending",
       payload: {
         req_id: String(raw.req_id ?? ""),
+        run_id: cur.run_id,
         tool_kind: String(raw.tool_kind ?? "tool"),
         command: String(raw.command ?? ""),
         cwd: String(raw.cwd ?? ""),
@@ -1028,7 +1102,11 @@ export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunner
         ? raw.acp_session_key
         : cur.acp_session_key;
     const errText = typeof raw.error === "string" ? raw.error.trim() : "";
-    const settledTurns = settleSessionTurns(turns, { hasError: Boolean(errText) }, now);
+    const settledTurns = settleSessionTurns(
+      turns,
+      { hasError: Boolean(errText), cancelPendingPermissions: true },
+      now,
+    );
     if (errText) {
       settledTurns.push({
         id: makeUuid(),
@@ -1043,6 +1121,7 @@ export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunner
     }
     const session = patchLocalVaultSession(sessId, {
       running: false,
+      run_id: null,
       acp_session_key: acpKey,
       turns: settledTurns,
     })!;
@@ -1069,6 +1148,5 @@ export function applyLocalRunnerEvent(raw: Record<string, unknown>): LocalRunner
 
 export function resetLocalVaultForTests() {
   vault = emptyVault();
-  attachmentMem.clear();
   persistVault();
 }

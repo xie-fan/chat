@@ -43,6 +43,13 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/hosts/{id}", patch(rename_host).delete(delete_host))
         .route("/hosts/{id}/dirs", get(list_host_dirs))
         .route("/hosts/{id}/file", get(read_host_file))
+        .route(
+            "/local-hosts/{install_id}/snapshot",
+            get(super::transfer::export_snapshot)
+                .post(super::transfer::import_snapshot)
+                .delete(super::transfer::delete_snapshot)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/agents", post(create_agent))
         .route("/agents/{id}", patch(update_agent).delete(delete_agent))
         .route("/agents/{id}/probe-models", post(probe_agent_models))
@@ -59,6 +66,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             post(upload_acp_file).layer(DefaultBodyLimit::max(body_cap)),
         )
         .route("/files/{id}", get(download_acp_file))
+        .route(
+            "/transfer-files/{id}",
+            put(upload_transfer_file).layer(DefaultBodyLimit::max(body_cap)),
+        )
 }
 
 async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
@@ -221,6 +232,7 @@ async fn delete_host(
     Path(host_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
+    let _lifecycle = st.lock_acp_host(host_id).await;
     let running_sessions: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT s.id, w.acp_host_id
            FROM acp_sessions s
@@ -1084,7 +1096,7 @@ async fn create_session(
              (user_id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level, permission_policy)
          VALUES ($1, $2, $3, $4, $5, '中', $6)
          RETURNING id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
-                   permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                   permission_policy, acp_session_key, running, run_id, diffs_json, rpc_logs_json,
                    created_at, updated_at",
     )
     .bind(uid)
@@ -1264,6 +1276,8 @@ async fn send_prompt(
 
     let sess = load_session_meta(&st.pool, uid, sess_id).await?;
     let ws = load_workspace(&st.pool, uid, sess.workspace_id).await?;
+    let _lifecycle = st.lock_acp_host(ws.host_id).await;
+    let sess = load_session_meta(&st.pool, uid, sess_id).await?;
     let ag = load_agent_raw(&st.pool, uid, sess.agent_id).await?;
 
     let text: String = req.text.trim().chars().take(16_384).collect();
@@ -1303,10 +1317,12 @@ async fn send_prompt(
     };
 
     // 在单个事务里原子抢占会话执行权（running: false -> true），关联附件并顺带分配 seq
+    let run_id = Uuid::new_v4();
     let mut tx = st.pool.begin().await?;
     let claimed = sqlx::query(
         "UPDATE acp_sessions
             SET running = true,
+                run_id = $6,
                 selected_model = $2,
                 thinking_level = $3,
                 permission_policy = $4,
@@ -1318,6 +1334,7 @@ async fn send_prompt(
     .bind(&thinking_level)
     .bind(&permission_policy)
     .bind(uid)
+    .bind(run_id)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -1386,6 +1403,7 @@ async fn send_prompt(
 
     let user_payload = json!({
         "text": text,
+        "run_id": run_id,
         "files": req.files,
         "attachments": attachments_meta,
     });
@@ -1411,6 +1429,7 @@ async fn send_prompt(
     let start_frame = json!({
         "type": "prompt_start",
         "session_id": sess_id,
+        "run_id": run_id,
         "acp_session_key": sess.acp_session_key,
         "cwd": ws.cwd,
         "agent": {
@@ -1430,10 +1449,14 @@ async fn send_prompt(
     .to_string();
 
     if host_tx.try_send(ConnMsg::Frame(start_frame)).is_err() {
-        let _ = sqlx::query("UPDATE acp_sessions SET running = false WHERE id = $1")
-            .bind(sess_id)
-            .execute(&st.pool)
-            .await;
+        let _ = sqlx::query(
+            "UPDATE acp_sessions SET running = false, run_id = NULL, updated_at = now()
+              WHERE id = $1 AND run_id = $2",
+        )
+        .bind(sess_id)
+        .bind(run_id)
+        .execute(&st.pool)
+        .await;
         if let Ok(updated_sess) = load_session_meta(&st.pool, uid, sess_id).await {
             broadcast_acp(
                 &st,
@@ -1452,64 +1475,88 @@ async fn send_prompt(
     Ok(Json(turn_view))
 }
 
+#[derive(Deserialize)]
+struct CancelPromptQuery {
+    run_id: Option<Uuid>,
+}
+
 async fn cancel_prompt(
     State(st): State<SharedState>,
     headers: HeaderMap,
     Path(sess_id): Path<Uuid>,
+    Query(query): Query<CancelPromptQuery>,
 ) -> AppResult<Json<super::AcpSessionView>> {
     let uid = uid_of(&headers, &st).await?;
     let sess = load_session_meta(&st.pool, uid, sess_id).await?;
     let ws = load_workspace(&st.pool, uid, sess.workspace_id).await?;
+    let _lifecycle = st.lock_acp_host(ws.host_id).await;
+    let sess = load_session_meta(&st.pool, uid, sess_id).await?;
+    if !sess.running || query.run_id.is_some_and(|id| Some(id) != sess.run_id) {
+        return Ok(Json(sess));
+    }
 
-    if let Some(conn) = st.acp_hosts.get(&ws.host_id) {
-        if conn.uid == uid {
-            let _ = conn.tx.try_send(ConnMsg::Frame(
-                json!({ "type": "prompt_cancel", "session_id": sess_id }).to_string(),
-            ));
+    if let Some(conn) = st.acp_hosts.get(&ws.host_id).filter(|conn| conn.uid == uid) {
+        conn.tx
+            .try_send(ConnMsg::Frame(
+                json!({
+                    "type": "prompt_cancel",
+                    "session_id": sess_id,
+                    "run_id": sess.run_id,
+                })
+                .to_string(),
+            ))
+            .map_err(|_| {
+                AppError::coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host_offline",
+                    "无法送达停止请求到机器节点",
+                )
+            })?;
+        if !conn.run_ids {
+            // An untagged completion is safe only while this remains the sole run.
+            // Legacy hosts release the session when they finish or disconnect.
+            broadcast_acp(
+                &st,
+                uid,
+                "session_activity",
+                json!({ "session_id": sess_id, "phase": "connecting", "detail": "等待宿主停止…" }),
+            );
+            return Ok(Json(sess));
         }
     }
 
-    sqlx::query("UPDATE acp_sessions SET running = false, updated_at = now() WHERE id = $1")
-        .bind(sess_id)
-        .execute(&st.pool)
-        .await?;
-
-    let settled_streams = sqlx::query(
-        "UPDATE acp_turns SET status = 'done', updated_at = now()
-          WHERE acp_session_id = $1
-            AND role IN ('agent_text', 'agent_thought')
-            AND status = 'streaming'
-          RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+    let mut tx = st.pool.begin().await?;
+    sqlx::query(
+        "UPDATE acp_sessions SET running = false, run_id = NULL, updated_at = now() WHERE id = $1",
     )
     .bind(sess_id)
-    .fetch_all(&st.pool)
-    .await
-    .unwrap_or_default();
-    for r in &settled_streams {
-        let tv = turn_from_row(r);
-        broadcast_acp(
-            &st,
-            uid,
-            "turn_upserted",
-            json!({ "session_id": sess_id, "turn": tv }),
-        );
-    }
-
-    let failed_tools = sqlx::query(
+    .execute(&mut *tx)
+    .await?;
+    let settled_turns = sqlx::query(
         "UPDATE acp_turns
-            SET status = 'failed',
-                payload = jsonb_set(payload, '{is_error}', 'true'::jsonb),
+            SET status = CASE role
+                    WHEN 'permission' THEN 'rejected'
+                    WHEN 'tool_call' THEN 'failed'
+                    ELSE 'done'
+                END,
+                payload = CASE role
+                    WHEN 'permission' THEN payload || jsonb_build_object('chosen_option', 'cancelled')
+                    WHEN 'tool_call' THEN payload || jsonb_build_object('is_error', true)
+                    ELSE payload
+                END,
                 updated_at = now()
-          WHERE acp_session_id = $1
-            AND role = 'tool_call'
-            AND status IN ('pending', 'in_progress')
+          WHERE acp_session_id = $1 AND (
+              (role IN ('agent_text', 'agent_thought') AND status = 'streaming')
+              OR (role = 'permission' AND status = 'pending')
+              OR (role = 'tool_call' AND status IN ('pending', 'in_progress'))
+          )
           RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
     )
     .bind(sess_id)
-    .fetch_all(&st.pool)
-    .await
-    .unwrap_or_default();
-    for r in &failed_tools {
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    for r in &settled_turns {
         let tv = turn_from_row(r);
         broadcast_acp(
             &st,
@@ -1550,8 +1597,20 @@ async fn reply_permission(
         return Err(AppError::bad_request("invalid option_id"));
     }
 
+    let host_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT w.acp_host_id FROM acp_turns t
+           JOIN acp_sessions s ON s.id = t.acp_session_id
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE t.id = $1 AND t.user_id = $2",
+    )
+    .bind(turn_id)
+    .bind(uid)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("permission request not found"))?;
+    let _lifecycle = st.lock_acp_host(host_id).await;
     let row = sqlx::query(
-        "SELECT t.id, t.acp_session_id, t.role, t.status, t.payload, w.acp_host_id
+        "SELECT t.id, t.acp_session_id, t.role, t.status, t.payload, s.running, s.run_id
            FROM acp_turns t
            JOIN acp_sessions s ON s.id = t.acp_session_id
            JOIN acp_workspaces w ON w.id = s.acp_workspace_id
@@ -1566,12 +1625,13 @@ async fn reply_permission(
     let role: String = row.get("role");
     let status: String = row.get("status");
     let sess_id: Uuid = row.get("acp_session_id");
-    let host_id: Uuid = row.get("acp_host_id");
+    let running: bool = row.get("running");
+    let run_id: Option<Uuid> = row.get("run_id");
     let mut payload: Value = row.get("payload");
     if role != "permission" {
         return Err(AppError::bad_request("turn is not a permission request"));
     }
-    if status != "pending" {
+    if !running || status != "pending" || payload["run_id"] != json!(run_id) {
         return Err(AppError::conflict("permission already resolved"));
     }
 
@@ -1609,6 +1669,7 @@ async fn reply_permission(
                 json!({
                     "type": "permission_reply",
                     "session_id": sess_id,
+                    "run_id": run_id,
                     "req_id": req_id,
                     "option_id": option_id,
                 })
@@ -1641,9 +1702,9 @@ async fn upload_acp_file(
             used_bytes, quota_mb,
         )));
     }
-    let Some(file) = rd.file.as_ref().filter(|_| rd.has_file()) else {
+    if !rd.has_file() {
         return Err(AppError::bad_request("missing file"));
-    };
+    }
 
     let sess_id = match rd.fields.get("session_id") {
         Some(raw) if !raw.trim().is_empty() => {
@@ -1664,8 +1725,87 @@ async fn upload_acp_file(
         _ => None,
     };
 
-    let id = Uuid::new_v4();
-    let stored = format!("acp-{id}");
+    store_acp_upload(&st, uid, sess_id, Uuid::new_v4(), &rd).await.map(Json)
+}
+
+async fn transfer_file(
+    st: &SharedState,
+    uid: Uuid,
+    id: Uuid,
+) -> AppResult<Option<AcpAttachmentView>> {
+    let row = sqlx::query(
+        "SELECT file_name, mime, size, storage_path FROM acp_attachments
+          WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(uid)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let size: i64 = row.get("size");
+    let stored: String = row.get("storage_path");
+    let disk_size = tokio::fs::metadata(stored_file_path(&st.cfg.files_dir, &stored))
+        .await
+        .map(|metadata| metadata.len())
+        .ok();
+    if disk_size != Some(size as u64) {
+        return Err(AppError::conflict("已有 ACP 附件在存储中缺失"));
+    }
+    Ok(Some(AcpAttachmentView {
+        id,
+        file_name: row.get("file_name"),
+        mime: row.get("mime"),
+        size,
+    }))
+}
+
+async fn upload_transfer_file(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    mut mp: Multipart,
+) -> AppResult<Json<AcpAttachmentView>> {
+    let uid = uid_of(&headers, &st).await?;
+    if let Some(existing) = transfer_file(&st, uid, id).await? {
+        return Ok(Json(existing));
+    }
+    let (quota_mb, quota_bytes, used_bytes) = upload_quota(&st, uid).await?;
+    let rd = read_upload(
+        &st.cfg.files_dir,
+        &mut mp,
+        st.cfg.upload_max_bytes,
+        quota_bytes,
+        used_bytes,
+        &[],
+    )
+    .await?;
+    if rd.over_quota {
+        return Err(AppError::payload_too_large(quota_message(used_bytes, quota_mb)));
+    }
+    match store_acp_upload(&st, uid, None, id, &rd).await {
+        Ok(attachment) => Ok(Json(attachment)),
+        Err(err) => match transfer_file(&st, uid, id).await? {
+            Some(existing) => Ok(Json(existing)),
+            None => Err(err),
+        },
+    }
+}
+
+async fn store_acp_upload(
+    st: &SharedState,
+    uid: Uuid,
+    sess_id: Option<Uuid>,
+    id: Uuid,
+    rd: &crate::api::UploadRead,
+) -> AppResult<AcpAttachmentView> {
+    let Some(file) = rd.file.as_ref().filter(|_| rd.has_file()) else {
+        return Err(AppError::bad_request("missing file"));
+    };
+    // A retry may supply the same attachment ID. Give its file a unique
+    // pathname so a rejected insert cannot overwrite the previous upload.
+    let stored = format!("acp-{}", Uuid::new_v4());
     let dest = stored_file_path(&st.cfg.files_dir, &stored);
     tokio::fs::rename(&file.path, &dest)
         .await
@@ -1690,12 +1830,12 @@ async fn upload_acp_file(
         return Err(e.into());
     }
 
-    Ok(Json(AcpAttachmentView {
+    Ok(AcpAttachmentView {
         id,
-        file_name: rd.file_name,
-        mime: rd.mime,
+        file_name: rd.file_name.clone(),
+        mime: rd.mime.clone(),
         size,
-    }))
+    })
 }
 
 #[derive(Deserialize)]

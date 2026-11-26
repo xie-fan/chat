@@ -33,8 +33,8 @@ pub(crate) fn avatar_file_path(files_dir: &str, stored: &str) -> std::path::Path
     std::path::Path::new(files_dir).join("avatars").join(stored)
 }
 
-/// 提交后异步删旧头像。只接受本目录文件名，避免误删 FILES_DIR 外的路径。
-pub(crate) fn spawn_avatar_cleanup(st: &SharedState, stored: Option<String>) {
+/// 在请求释放恢复屏障前删旧头像。只接受本目录文件名。
+async fn cleanup_old_avatar(st: &SharedState, stored: Option<String>) {
     let Some(stored) = stored.filter(|s| {
         !s.is_empty()
             && !s.contains('/')
@@ -46,11 +46,9 @@ pub(crate) fn spawn_avatar_cleanup(st: &SharedState, stored: Option<String>) {
         return;
     };
     let path = avatar_file_path(&st.cfg.files_dir, &stored);
-    tokio::spawn(async move {
-        if let Err(e) = tokio::fs::remove_file(&path).await {
-            tracing::warn!(path = %path.display(), error = %e, "old avatar cleanup failed");
-        }
-    });
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+        tracing::warn!(path = %path.display(), error = %e, "old avatar cleanup failed");
+    }
 }
 
 pub(super) async fn load_user_row(st: &SharedState, uid: Uuid) -> AppResult<UserRow> {
@@ -139,7 +137,7 @@ pub(super) async fn put_avatar(
         let _ = tokio::fs::remove_file(&path).await;
         return Err(AppError::conflict("avatar changed, retry"));
     }
-    spawn_avatar_cleanup(&st, me.avatar_path);
+    cleanup_old_avatar(&st, me.avatar_path).await;
     notify_avatar_changed(&st, uid).await;
     let row = load_user_row(&st, uid).await?;
     Ok(Json(self_public(&st, &row).await?))
@@ -159,7 +157,7 @@ pub(super) async fn delete_avatar(
         .bind(uid)
         .execute(&st.pool)
         .await?;
-        spawn_avatar_cleanup(&st, me.avatar_path);
+        cleanup_old_avatar(&st, me.avatar_path).await;
         notify_avatar_changed(&st, uid).await;
     }
     let row = load_user_row(&st, uid).await?;

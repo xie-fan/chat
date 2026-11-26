@@ -301,7 +301,7 @@ export interface RequestsView {
 
 // WS 出站帧
 export type WsOut =
-  | { type: "message"; message: MessageView }
+  | { type: "message"; message: MessageView; client_msg_id?: string }
   | { type: "message_ack"; client_msg_id: string | null; message: MessageView }
   | { type: "typing"; conversation_id: string; user: UserPublic }
   | { type: "presence"; user_id: string; online: boolean; last_seen_at: string | null }
@@ -684,6 +684,7 @@ export interface AcpSession {
   permission_policy: AcpPermissionPolicy;
   acp_session_key: string | null;
   running: boolean;
+  run_id?: string | null;
   diffs: AcpDiffItem[];
   rpc_logs: AcpRpcLogEntry[];
   created_at: string;
@@ -697,6 +698,18 @@ export interface AcpBootstrap {
   agents: AcpAgent[];
   workspaces: AcpWorkspace[];
   sessions: AcpSession[];
+}
+
+export interface AcpSnapshotAttachment extends AcpAttachment {
+  session_id: string;
+}
+
+export interface AcpHostSnapshot {
+  host: AcpHost;
+  agents: AcpAgent[];
+  workspaces: AcpWorkspace[];
+  sessions: AcpSession[];
+  attachments: AcpSnapshotAttachment[];
 }
 
 export interface AcpDirEntry {

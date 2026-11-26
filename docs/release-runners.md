@@ -156,7 +156,7 @@ git push origin v0.5.1
 | `GITHUB_TOKEN` | 可选。读 release 时带 `Authorization: Bearer`，只吃 API 配额用；只发给 API host，资产走 `browser_download_url` 302 到 CDN 时不带凭据 |
 | `CLIENT_UPDATE_PROXY` | 可选。更新请求走 HTTP 代理，如 `http://127.0.0.1:7890`；不设则不走系统代理 |
 | `GITHUB_API_BASE` | 可选。默认 `https://api.github.com`，测试 mock 用 |
-| 后台 → 服务器对外地址 | `public_url`：更新响应里下载地址的前缀（留空按请求 Host 拼），也是推送通知的 Click 跳转地址。代码默认 `https://chat.287152.xyz`：库里没有该行的旧部署升级后下载地址会从「按 Host 拼」变为指向它，存量旧值行也不会自动变——自建实例应到后台改一次（置空 = 回到按 Host 拼） |
+| 后台 → 服务器对外地址 | `public_url` 用于推送通知跳转和 Bot API 描述。桌面客户端检查和下载更新都走当前配置的服务器地址，保留反向代理路径前缀。更新接口在 `TRUST_PROXY=1` 时读取代理提供的 `X-Forwarded-Proto`、`X-Forwarded-Host` 与 `X-Forwarded-Prefix`。 |
 
 docker-compose 部署的话这几个变量写在 `docker-compose.yml` 的 environment 里（已留注释样例）。
 

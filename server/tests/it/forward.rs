@@ -319,6 +319,7 @@ async fn p24_forward_attachment_lifecycle() {
     // 目标附件可下载且内容一致
     let dl = c
         .get(format!("{base}/v1/files/{fwd_att}"))
+        .header("authorization", authz(&b.access))
         .send()
         .await
         .unwrap();
@@ -335,6 +336,7 @@ async fn p24_forward_attachment_lifecycle() {
     assert_eq!(r.status(), 200);
     let dl = c
         .get(format!("{base}/v1/files/{fwd_att}"))
+        .header("authorization", authz(&b.access))
         .send()
         .await
         .unwrap();
@@ -342,6 +344,7 @@ async fn p24_forward_attachment_lifecycle() {
     // 源附件公开下载已 404（recalled_at 隐藏），物理文件因副本引用仍在
     let dl = c
         .get(format!("{base}/v1/files/{att}"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();

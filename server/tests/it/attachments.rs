@@ -8,6 +8,245 @@ fn it_files_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("chat-it-files")
 }
 
+#[tokio::test]
+async fn attachments_follow_membership_even_for_issued_links() {
+    let base = spawn().await;
+    let owner = register(&base, &format!("fo_{}", uniq())).await;
+    let member = register(&base, &format!("fm_{}", uniq())).await;
+    befriend(&base, &owner, &member).await;
+    let group = mk_group(&base, &owner, std::slice::from_ref(&member.id)).await;
+    let (status, attachment) = upload_att(
+        &base,
+        &group,
+        &owner.access,
+        "photo.png",
+        "image/png",
+        png_fixture(900, 700),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let id = attachment["id"].as_str().unwrap();
+    let url = format!("{base}/v1/files/{id}");
+    let c = http();
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        c.get(&url)
+            .header("authorization", authz(&member.access))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "unsent uploads remain visible only to the uploader"
+    );
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
+        .await
+        .unwrap();
+    next_of(&mut ws, "presence_init").await;
+    ws_send(&mut ws, &group, json!({"content": "", "attachment_id": id})).await;
+
+    let ticket_response = c
+        .get(format!("{url}/ticket"))
+        .header("authorization", authz(&member.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ticket_response.status(), 200);
+    assert_eq!(ticket_response.headers()["cache-control"], "private, no-store");
+    let ticket: Value = ticket_response.json().await.unwrap();
+    let ticket = ticket["ticket"].as_str().unwrap();
+    let thumb = c
+        .get(format!("{url}?thumb=1&ticket={ticket}"))
+        .header("range", "bytes=0-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(thumb.status(), 206);
+    assert_eq!(thumb.headers()["cache-control"], "private, no-store");
+    assert_eq!(thumb.headers()["content-type"], "image/jpeg");
+    assert_eq!(thumb.bytes().await.unwrap().as_ref(), &[0xff, 0xd8]);
+
+    let other_url = format!("{base}/v1/files/{}?ticket={ticket}", uuid::Uuid::new_v4());
+    assert_eq!(c.get(other_url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        c.get(format!("{base}/v1/users/me"))
+            .header("authorization", authz(ticket))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "a scoped ticket is not an account access token"
+    );
+
+    let r = c
+        .delete(format!("{base}/v1/conversations/{group}/members/{}", member.id))
+        .header("authorization", authz(&owner.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    for suffix in ["", "/ticket", "?dl=1", "?thumb=1"] {
+        let r = c
+            .get(format!("{url}{suffix}"))
+            .header("authorization", authz(&member.access))
+            .header("range", "bytes=0-1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "membership removal applies to {suffix}");
+        assert_eq!(r.headers()["cache-control"], "private, no-store");
+    }
+    let old_link = c
+        .get(format!("{url}?dl=1&ticket={ticket}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_link.status(), 404, "a ticket cannot keep membership alive");
+    assert_eq!(old_link.headers()["cache-control"], "private, no-store");
+    assert_eq!(
+        c.get(url)
+            .header("authorization", authz(&owner.access))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "remaining members keep attachment access"
+    );
+}
+
+#[tokio::test]
+async fn repeated_upload_key_replays_the_same_attachment() {
+    let (_guard, base, state) = spawn_named_state(&format!("chat_t_upload_retry_{}", uniq())).await;
+    let user = register(&base, &format!("ur_{}", uniq())).await;
+    let conv = self_conv(&base, &user).await["id"].as_str().unwrap().to_string();
+    let key = uuid::Uuid::new_v4().to_string();
+    let upload = |body: &'static [u8]| {
+        let base = base.clone();
+        let access = user.access.clone();
+        let conv = conv.clone();
+        let key = key.clone();
+        async move {
+            http()
+                .post(format!("{base}/v1/files"))
+                .header("authorization", authz(&access))
+                .multipart(
+                    reqwest::multipart::Form::new()
+                        .text("conversation_id", conv)
+                        .text("client_upload_id", key)
+                        .part(
+                            "file",
+                            reqwest::multipart::Part::bytes(body.to_vec())
+                                .file_name("retry.txt")
+                                .mime_str("text/plain")
+                                .unwrap(),
+                        ),
+                )
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let first: Value = upload(b"first").await.json().await.unwrap();
+    let second: Value = upload(b"second").await.json().await.unwrap();
+    assert_eq!(first["id"], second["id"]);
+    assert_eq!(first["size"], 5);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attachments WHERE client_upload_id = $1")
+            .bind(uuid::Uuid::parse_str(&key).unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unsent_attachment_delete_and_gc_release_storage_but_sent_files_survive() {
+    let (_guard, base, state) =
+        spawn_named_state(&format!("chat_t_upload_gc_{}", uniq())).await;
+    let user = register(&base, &format!("ugc_{}", uniq())).await;
+    let conv = self_conv(&base, &user).await["id"].as_str().unwrap().to_string();
+    let files_dir = std::path::PathBuf::from(&state.cfg.files_dir);
+    let c = http();
+
+    let (_, manual) = upload_att(&base, &conv, &user.access, "manual.txt", "text/plain", b"manual".to_vec()).await;
+    let manual_id = manual["id"].as_str().unwrap().to_string();
+    let manual_path = files_dir.join(&manual_id);
+    assert!(manual_path.exists());
+    assert_eq!(
+        c.delete(format!("{base}/v1/files/{manual_id}"))
+            .header("authorization", authz(&user.access))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(!manual_path.exists());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attachments WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&manual_id).unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let (_, old) = upload_att(&base, &conv, &user.access, "old.txt", "text/plain", b"old".to_vec()).await;
+    let old_id = old["id"].as_str().unwrap().to_string();
+    let old_path = files_dir.join(&old_id);
+    sqlx::query("UPDATE attachments SET created_at = now() - interval '2 days' WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&old_id).unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        chat_server::domain::sweep_unattached_attachments(
+            &state.pool,
+            &state.cfg.files_dir,
+            std::time::Duration::from_secs(86400),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(!old_path.exists());
+
+    let (_, sent) = upload_att(&base, &conv, &user.access, "sent.txt", "text/plain", b"sent".to_vec()).await;
+    let sent_id = sent["id"].as_str().unwrap().to_string();
+    let sent_path = files_dir.join(&sent_id);
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &user).await)
+        .await
+        .unwrap();
+    next_of(&mut ws, "presence_init").await;
+    ws_send(&mut ws, &conv, json!({"client_msg_id": "gc-sent", "content": "", "attachment_id": sent_id})).await;
+    assert_eq!(
+        c.delete(format!("{base}/v1/files/{sent_id}"))
+            .header("authorization", authz(&user.access))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(sent_path.exists());
+    assert_eq!(
+        chat_server::domain::sweep_unattached_attachments(
+            &state.pool,
+            &state.cfg.files_dir,
+            std::time::Duration::from_secs(0),
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert!(sent_path.exists());
+}
+
 /// 复制一行 attachments（新 id，共享 storage_path/thumb_path），模拟 P2-4 转发副本
 async fn copy_attachment(pool: &sqlx::PgPool, src_id: &str) -> String {
     let copy_id = uuid::Uuid::new_v4();
@@ -72,7 +311,7 @@ async fn download_supports_range_and_keeps_headers() {
     assert_eq!(st, 200, "{att}");
     let url = format!("{base}/v1/files/{}", att["id"].as_str().unwrap());
 
-    let full = http().get(&url).send().await.unwrap();
+    let full = http().get(&url).header("authorization", authz(&a.access)).send().await.unwrap();
     assert_eq!(full.status(), 200);
     assert_eq!(full.headers()["content-type"], "video/mp4");
     assert!(full.headers()["content-disposition"]
@@ -84,6 +323,7 @@ async fn download_supports_range_and_keeps_headers() {
 
     let part = http()
         .get(&url)
+        .header("authorization", authz(&a.access))
         .header("range", "bytes=100-199")
         .send()
         .await
@@ -96,7 +336,7 @@ async fn download_supports_range_and_keeps_headers() {
         body[100..200].to_vec()
     );
 
-    let dl = http().get(format!("{url}?dl=1")).send().await.unwrap();
+    let dl = http().get(format!("{url}?dl=1")).header("authorization", authz(&a.access)).send().await.unwrap();
     assert!(dl.headers()["content-disposition"]
         .to_str()
         .unwrap()
@@ -104,6 +344,7 @@ async fn download_supports_range_and_keeps_headers() {
     assert_eq!(
         http()
             .get(format!("{base}/v1/files/{}", uuid::Uuid::new_v4()))
+            .header("authorization", authz(&a.access))
             .send()
             .await
             .unwrap()
@@ -140,6 +381,7 @@ async fn p2_1_image_dims_thumb() {
     // ?thumb=1 → JPEG，最长边 480
     let dl = c
         .get(format!("{base}/v1/files/{att_id}?thumb=1"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();
@@ -151,6 +393,7 @@ async fn p2_1_image_dims_thumb() {
     // dl=1 忽略 thumb：返回原图
     let dl = c
         .get(format!("{base}/v1/files/{att_id}?thumb=1&dl=1"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();
@@ -194,6 +437,7 @@ async fn p2_1_small_and_broken_image() {
             "{base}/v1/files/{}?thumb=1",
             att["id"].as_str().unwrap()
         ))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();
@@ -256,6 +500,7 @@ async fn p2_1_delete_cleans_thumb() {
     // 撤回不再删文件：公开下载立即 404，物理文件与缩略图保留（待过期清扫）
     let dl = c
         .get(format!("{base}/v1/files/{id}"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();

@@ -61,6 +61,49 @@ pub struct LocalPolicyView {
 
 type ExecConfirmWait = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
+struct RunningPrompt {
+    run_id: Uuid,
+    cancel: watch::Sender<bool>,
+}
+
+type RunningPrompts = Arc<Mutex<HashMap<String, RunningPrompt>>>;
+
+fn track_prompt(
+    prompts: &RunningPrompts,
+    session_id: &str,
+    run_id: Uuid,
+) -> watch::Receiver<bool> {
+    let (cancel, receiver) = watch::channel(false);
+    let next = RunningPrompt { run_id, cancel };
+    if let Some(old) = prompts.lock().unwrap().insert(session_id.to_owned(), next) {
+        let _ = old.cancel.send(true);
+    }
+    receiver
+}
+
+fn cancel_prompt(prompts: &RunningPrompts, session_id: &str, run_id: Option<Uuid>) {
+    if let Some(prompt) = prompts.lock().unwrap().get(session_id) {
+        if run_id.is_none_or(|id| id == prompt.run_id) {
+            let _ = prompt.cancel.send(true);
+        }
+    }
+}
+
+fn untrack_prompt(prompts: &RunningPrompts, session_id: &str, run_id: Uuid) {
+    let mut prompts = prompts.lock().unwrap();
+    if prompts.get(session_id).is_some_and(|p| p.run_id == run_id) {
+        prompts.remove(session_id);
+    }
+}
+
+fn tag_prompt_event(mut event: Value, session_id: &str, run_id: Uuid) -> Value {
+    if matches!(event["type"].as_str(), Some("session_update" | "agent_status" | "agent_models")) {
+        event["session_id"] = json!(session_id);
+        event["run_id"] = json!(run_id);
+    }
+    event
+}
+
 #[derive(Clone)]
 enum ExecGate {
     Desktop {
@@ -79,7 +122,7 @@ pub struct AcpHostState {
     probing_cmds: Arc<Mutex<HashSet<String>>>,
     local_pending_perms: PendingPerms,
     local_perm_cache: Arc<Mutex<PermissionCache>>,
-    local_running_cancels: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    local_running_cancels: RunningPrompts,
     ticket_wait: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>,
     exec_confirm_wait: ExecConfirmWait,
     trust: Arc<Mutex<TrustStore>>,
@@ -533,21 +576,17 @@ pub async fn acp_host_local_prompt_start(
     }
 
     let sid = msg.session_id.clone();
-    let (ctx, crx) = watch::channel(false);
-    if let Some(old) = state
-        .local_running_cancels
-        .lock()
-        .unwrap()
-        .insert(sid.clone(), ctx)
-    {
-        let _ = old.send(true);
-    }
-
+    let run_id = *msg.run_id.get_or_insert_with(Uuid::new_v4);
+    let crx = track_prompt(&state.local_running_cancels, &sid, run_id);
     let (tx, mut rx) = mpsc::channel::<Value>(128);
     let app_for_events = app.clone();
+    let event_sid = sid.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            let _ = app_for_events.emit("acp-host:local-event", ev);
+            let _ = app_for_events.emit(
+                "acp-host:local-event",
+                tag_prompt_event(ev, &event_sid, run_id),
+            );
         }
     });
 
@@ -556,7 +595,7 @@ pub async fn acp_host_local_prompt_start(
     let cancels = state.local_running_cancels.clone();
     tauri::async_runtime::spawn(async move {
         acp_client::run_prompt_task(msg, tx, perms, cache, crx).await;
-        cancels.lock().unwrap().remove(&sid);
+        untrack_prompt(&cancels, &sid, run_id);
     });
     Ok(())
 }
@@ -565,10 +604,9 @@ pub async fn acp_host_local_prompt_start(
 pub async fn acp_host_local_prompt_cancel(
     state: State<'_, AcpHostState>,
     session_id: String,
+    run_id: Option<Uuid>,
 ) -> Result<(), String> {
-    if let Some(ctx) = state.local_running_cancels.lock().unwrap().get(&session_id) {
-        let _ = ctx.send(true);
-    }
+    cancel_prompt(&state.local_running_cancels, &session_id, run_id);
     Ok(())
 }
 
@@ -767,6 +805,7 @@ async fn run_one_connection(
         "os": host_os_label(),
         "ip": "Client-Daemon",
         "roots": dirs::roots(),
+        "run_ids": true,
     })
     .to_string();
     if sink.send(WsMsg::Text(hello.into())).await.is_err() {
@@ -776,8 +815,7 @@ async fn run_one_connection(
     let (out_tx, mut out_rx) = mpsc::channel::<Value>(128);
     let pending_perms: PendingPerms = Arc::new(Mutex::new(HashMap::new()));
     let perm_cache = Arc::new(Mutex::new(PermissionCache::default()));
-    let running_cancels: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let running_cancels: RunningPrompts = Arc::new(Mutex::new(HashMap::new()));
     let probing_agents: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let mut permanent_stop = false;
@@ -950,13 +988,22 @@ async fn run_one_connection(
                             Some("prompt_start") => {
                                 if let Ok(mut msg) = serde_json::from_value::<PromptStartMsg>(v) {
                                     let sid = msg.session_id.clone();
-                                    let (ctx, mut crx) = watch::channel(false);
-                                    if let Some(old) =
-                                        running_cancels.lock().unwrap().insert(sid.clone(), ctx)
-                                    {
-                                        let _ = old.send(true);
-                                    }
-                                    let tx = out_tx.clone();
+                                    let run_id = *msg.run_id.get_or_insert_with(Uuid::new_v4);
+                                    let mut crx = track_prompt(&running_cancels, &sid, run_id);
+                                    let (tx, mut run_events) = mpsc::channel::<Value>(128);
+                                    let transport = out_tx.clone();
+                                    let event_sid = sid.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(ev) = run_events.recv().await {
+                                            if transport
+                                                .send(tag_prompt_event(ev, &event_sid, run_id))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    });
                                     let perms = pending_perms.clone();
                                     let cache = perm_cache.clone();
                                     let cancels = running_cancels.clone();
@@ -988,14 +1035,16 @@ async fn run_one_connection(
                                                     .await;
                                             }
                                         }
-                                        cancels.lock().unwrap().remove(&sid);
+                                        untrack_prompt(&cancels, &sid, run_id);
                                     });
                                 }
                             }
                             Some("prompt_cancel") => {
                                 if let Some(sid) = v["session_id"].as_str() {
-                                    if let Some(ctx) = running_cancels.lock().unwrap().get(sid) {
-                                        let _ = ctx.send(true);
+                                    let run = &v["run_id"];
+                                    let run_id = run.as_str().and_then(|id| Uuid::parse_str(id).ok());
+                                    if run.is_null() || run_id.is_some() {
+                                        cancel_prompt(&running_cancels, sid, run_id);
                                     }
                                 }
                             }
@@ -1024,8 +1073,8 @@ async fn run_one_connection(
     }
 
     // 取消仍在执行的子任务
-    for (_, tx) in running_cancels.lock().unwrap().drain() {
-        let _ = tx.send(true);
+    for (_, prompt) in running_cancels.lock().unwrap().drain() {
+        let _ = prompt.cancel.send(true);
     }
     permanent_stop
 }
@@ -1531,6 +1580,23 @@ pub fn maybe_run_cli() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_run_cleanup_and_cancel_leave_replacement_running() {
+        let prompts: RunningPrompts = Arc::new(Mutex::new(HashMap::new()));
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let first_cancel = track_prompt(&prompts, "session", first);
+
+        cancel_prompt(&prompts, "session", Some(first));
+        assert!(*first_cancel.borrow());
+        let second_cancel = track_prompt(&prompts, "session", second);
+        untrack_prompt(&prompts, "session", first);
+        cancel_prompt(&prompts, "session", Some(first));
+        assert!(!*second_cancel.borrow());
+        cancel_prompt(&prompts, "session", Some(second));
+        assert!(*second_cancel.borrow());
+    }
 
     #[test]
     fn ws_base_url_enforces_wss_on_non_loopback_and_encodes_ticket() {

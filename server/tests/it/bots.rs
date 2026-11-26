@@ -647,6 +647,43 @@ async fn bot_api_pulls_updates_and_reads_history() {
 }
 
 #[tokio::test]
+async fn bot_update_materialization_failure_keeps_delivery_cursor() {
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_bot_cursor_{}", uniq())).await;
+    let owner = register(&base, &format!("bcur_o{}", uniq())).await;
+    let bot = create_bot(&base, &owner, &format!("bcur{}", uniq()), "").await;
+    let bot_id = bot["id"].as_str().unwrap().to_string();
+    let (_, token) = add_token(&base, &owner, &bot_id, "cursor").await;
+    let dm = dm_with(&conv_list(&base, &owner).await, &bot_id);
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
+        .await
+        .unwrap();
+    ws_send(&mut ws, &dm, json!({"client_msg_id": "cursor-1", "content": "kept"})).await;
+
+    sqlx::query("ALTER VIEW message_views RENAME TO message_views_temporarily_broken")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let (status, _) = bot_api(
+        &base,
+        &token,
+        reqwest::Method::GET,
+        "/bot/updates",
+        None,
+    )
+    .await;
+    sqlx::query("ALTER VIEW message_views_temporarily_broken RENAME TO message_views")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, 500);
+
+    let events = updates(&base, &token, "").await;
+    assert_eq!(events.len(), 1, "failed materialization must be retryable");
+    assert_eq!(events[0]["message"]["content"], "kept");
+    assert!(updates(&base, &token, "").await.is_empty());
+}
+
+#[tokio::test]
 async fn bot_api_sends_files_edits_and_recalls() {
     use reqwest::Method;
     let base = spawn().await;
@@ -679,6 +716,16 @@ async fn bot_api_sends_files_edits_and_recalls() {
     assert_eq!(m["kind"], "image");
     assert_eq!(m["attachment"]["id"], att["id"]);
     assert_eq!(m["sender_id"], bot_id.as_str());
+
+    let file = http()
+        .get(format!("{base}/v1/bot/files/{}", att["id"].as_str().unwrap()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(file.status(), 200);
+    assert_eq!(file.headers()["cache-control"], "private, no-store");
+    assert_eq!(file.bytes().await.unwrap().as_ref(), png_fixture(4, 4));
 
     // 先发「处理中」再改成结果；版本对不上 409
     let (_, m) = bot_api(
@@ -786,9 +833,7 @@ async fn bot_openapi_lists_guarded_routes() {
     let mut checked = 0;
     for (path, ops) in spec["paths"].as_object().unwrap() {
         for (method, op) in ops.as_object().unwrap() {
-            if op["security"] == json!([]) {
-                continue; // 公开的附件下载
-            }
+            assert_ne!(op["security"], json!([]), "{method} {path} 必须鉴权");
             let url = format!(
                 "{base}/v1{}",
                 path.replace("{id}", &uuid::Uuid::new_v4().to_string())
@@ -805,7 +850,7 @@ async fn bot_openapi_lists_guarded_routes() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 10);
+    assert_eq!(checked, 11);
 }
 
 /// bot 上传的算进主人的配额（主人和他的 bot 共用一份）；

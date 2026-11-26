@@ -1,9 +1,9 @@
 import type { AttachmentView, MessageView, RecordItem } from "../../types";
-import { files } from "../../api";
 import RichText from "../../richText";
 import Avatar from "../Avatar";
+import AttachmentImage from "./AttachmentImage";
 import AudioBubble from "./AudioBubble";
-import { attImgSrc, imageBubbleSize } from "../mediaFormat";
+import { imageBubbleSize } from "../mediaFormat";
 import {
   recordCardLines,
   recordItemTime,
@@ -123,18 +123,15 @@ function RecordRow({
     clickable = true;
     onOpen = () => onNested(it.record!);
   } else if (att && it.kind === "image") {
-    const src = attImgSrc(att, undefined, files.url(att.id, { thumb: !!att.has_thumb }));
     const dim =
       att.width != null && att.height != null ? imageBubbleSize(att.width, att.height) : null;
-    body = src ? (
-      <img
+    body = (
+      <AttachmentImage
         className="rv-img"
-        src={src}
-        alt={att.file_name}
+        attachment={att}
         style={dim && dim.width ? { width: dim.width, height: dim.height } : undefined}
+        fallback={<span className="rv-att-ph">🖼 {att.file_name}</span>}
       />
-    ) : (
-      <span className="rv-att-ph">🖼 {att.file_name}</span>
     );
     clickable = true;
     onOpen = () => onPreview(att);

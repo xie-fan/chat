@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { files } from "../../api";
 import type { AttachmentView } from "../../types";
+import { useAttachmentAccess } from "./attachmentAccess";
 import { audioBubbleWidth, formatVoiceDuration } from "./voice";
 
 /** 同一时间只播放一条语音。 */
@@ -11,10 +12,13 @@ function pauseOthers(mine: HTMLAudioElement) {
   current = mine;
 }
 
-export default function AudioBubble({ att }: { att: AttachmentView }) {
+export default function AudioBubble({ att, recalledUrl }: { att: AttachmentView; recalledUrl?: string }) {
   const audioRef = useRef<HTMLAudioElement>(null);
+  const acquiring = useRef(false);
+  const access = useAttachmentAccess(att.recalled ? undefined : att.id);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [error, setError] = useState(false);
   const duration = att.duration_ms ?? 0;
 
   useEffect(() => {
@@ -42,14 +46,36 @@ export default function AudioBubble({ att }: { att: AttachmentView }) {
     };
   }, [duration, att.id]);
 
-  const toggle = () => {
+  const toggle = async () => {
     const el = audioRef.current;
-    if (!el) return;
-    if (el.paused) {
-      pauseOthers(el);
-      void el.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
-    } else {
+    if (!el || acquiring.current) return;
+    if (!el.paused) {
       el.pause();
+      return;
+    }
+    const cached = access && access.expiresAt > Date.now() ? access.url : undefined;
+    acquiring.current = true;
+    setError(false);
+    try {
+      // 通常已有预取的票据，可在点击事件内直接调用 play。停留过久则临时续签。
+      let url = att.recalled ? recalledUrl : cached;
+      if (!att.recalled && !url) url = (await files.access(att.id)).url;
+      if (!url || audioRef.current !== el) return;
+      if (el.src !== url) {
+        const time = el.currentTime;
+        el.src = url;
+        if (time > 0) el.currentTime = time;
+      }
+      pauseOthers(el);
+      await el.play();
+      if (audioRef.current === el) setPlaying(true);
+    } catch {
+      if (audioRef.current === el) {
+        setPlaying(false);
+        setError(true);
+      }
+    } finally {
+      acquiring.current = false;
     }
   };
 
@@ -59,7 +85,8 @@ export default function AudioBubble({ att }: { att: AttachmentView }) {
         type="button"
         className="voice-play"
         aria-label={playing ? "暂停语音" : "播放语音"}
-        onClick={toggle}
+        title={error ? "语音暂时无法播放，请重试" : undefined}
+        onClick={() => void toggle()}
       >
         {playing ? "暂停" : "播放"}
       </button>
@@ -67,7 +94,7 @@ export default function AudioBubble({ att }: { att: AttachmentView }) {
         <i style={{ width: `${Math.min(100, progress * 100)}%` }} />
       </span>
       <span className="voice-dur">{formatVoiceDuration(duration, "bubble")}</span>
-      <audio ref={audioRef} src={files.url(att.id)} preload="none" />
+      <audio key={att.id} ref={audioRef} preload="none" />
     </div>
   );
 }

@@ -5,16 +5,15 @@ export const BUBBLE_EDGE = 240;
 
 /**
  * 附件图片的 <img> src（MM2 fix3）：
- * - att.recalled（撤回件复用的乐观附件）：公共 /v1/files/{id} 已随撤回 404，
- *   只能用已取回的 object URL；还没取回返回 null（调用方画中性占位，不请求公共 URL）。
- * - 普通附件 → 公共能力 URL。
+ * 撤回件复用期间使用上传者已取回的 object URL。普通附件使用鉴权后的媒体地址。
+ * 两种地址仍在请求时返回 null，由调用方显示占位。
  */
 export function attImgSrc(
   att: { recalled?: boolean },
   objectUrl: string | null | undefined,
-  publicUrl: string,
+  mediaUrl: string | null | undefined,
 ): string | null {
-  return att.recalled ? (objectUrl ?? null) : publicUrl;
+  return (att.recalled ? objectUrl : mediaUrl) ?? null;
 }
 
 /**

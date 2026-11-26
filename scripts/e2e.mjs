@@ -332,7 +332,7 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
     const rec3 = await api(A.access_token, 'POST', `/messages/${asent.message.id}/recall`);
     ok('recall response carries recalled_attachment_id for uploader', rec3.status === 200
       && rec3.json?.recalled_attachment_id === att, `got ${rec3.status} ${JSON.stringify(rec3.json)?.slice(0, 180)}`);
-    const gone = await fetch(`${BASE}/files/${att}`);
+    const gone = await fetch(`${BASE}/files/${att}`, { headers: { authorization: `Bearer ${A.access_token}` } });
     ok('recalled attachment hidden (404)', gone.status === 404);
     const back = await fetch(`${BASE}/files/${att}/recalled`, { headers: { authorization: `Bearer ${A.access_token}` } });
     ok('uploader fetches recalled blob', back.status === 200 && (await back.text()) === 'rc-bytes'
@@ -341,7 +341,7 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
     const resent = await wsa.waitType('message_ack', (m) => m.client_msg_id === 'rc4');
     const newAtt = resent.message?.attachment?.id;
     ok('reuse_attachment_id resends clone', !!newAtt && newAtt !== att, JSON.stringify(resent.message?.attachment));
-    const dl = await fetch(`${BASE}/files/${newAtt}`);
+    const dl = await fetch(`${BASE}/files/${newAtt}`, { headers: { authorization: `Bearer ${A.access_token}` } });
     ok('reused attachment downloads', dl.status === 200 && (await dl.text()) === 'rc-bytes');
   }
 
@@ -394,7 +394,7 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
     const fm = await wsa.waitType('message', (x) => x.message.attachment?.id === f1.json.id);
     ok('file msg broadcast w/ attachment', fm.message.kind === 'file' && fm.message.attachment.file_name === 'note.txt', JSON.stringify(fm.message.kind));
     ok('placeholder content', fm.message.content === '[文件] note.txt', fm.message.content);
-    const dl = await fetch(`${BASE}/files/${f1.json.id}`);
+    const dl = await fetch(`${BASE}/files/${f1.json.id}`, { headers: { authorization: `Bearer ${B.access_token}` } });
     ok('download file', dl.status === 200 && (await dl.text()) === 'hello file');
     // 图片 → kind=image
     const png = Uint8Array.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0]);
@@ -512,7 +512,7 @@ async function phase2() {
     for (const attachment of s.attachments) {
       const message = msgs.json.messages.find((m) => m.id === attachment.message_id);
       ok('attachment metadata persisted', message?.attachment?.id === attachment.attachment_id);
-      const download = await fetch(`${BASE}/files/${attachment.attachment_id}`);
+      const download = await fetch(`${BASE}/files/${attachment.attachment_id}`, { headers: { authorization: `Bearer ${t}` } });
       const bytes = Buffer.from(await download.arrayBuffer());
       ok('attachment bytes persisted', download.status === 200 && bytes.length === attachment.size &&
         createHash('sha256').update(bytes).digest('hex') === attachment.sha256);
@@ -749,7 +749,7 @@ async function runV2(A, C) {
     });
     ok('large png has_thumb', up.status === 200 && up.json?.has_thumb === true,
       `got ${up.status} ${JSON.stringify(up.json)?.slice(0, 160)}`);
-    const thumb = await fetch(`${BASE}/files/${up.json?.id}?thumb=1`);
+    const thumb = await fetch(`${BASE}/files/${up.json?.id}?thumb=1`, { headers: { authorization: `Bearer ${A.access_token}` } });
     const ctype = thumb.headers.get('content-type') || '';
     ok('thumb is image/jpeg', thumb.status === 200 && ctype.startsWith('image/jpeg'),
       `got ${thumb.status} ${ctype}`);

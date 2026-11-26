@@ -1,3 +1,4 @@
+import { newClientId } from "../../clientId";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, convs, files, msgs as msgsApi, serverInfo, serverScope, serverSupportsRecall, session } from "../../api";
 import {
@@ -44,6 +45,7 @@ import { discardSend, retrySend, sendChat,
 import { confirmDialog } from "../Modal";
 import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
+import AttachmentImage from "./AttachmentImage";
 import AudioBubble from "./AudioBubble";
 import CtxMenu from "./CtxMenu";
 import ForwardModal from "./ForwardModal";
@@ -55,7 +57,7 @@ import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import ChatRecordView, { ChatRecordCard, type RecordViewState } from "./ChatRecordView";
-import { attImgSrc, imageBubbleSize } from "../mediaFormat";
+import { imageBubbleSize } from "../mediaFormat";
 import FilePreview, { type FilePreviewTarget } from "../FilePreview";
 import EmptyState from "../EmptyState";
 import Skeleton from "../Skeleton";
@@ -102,6 +104,28 @@ import {
   type MenuItem,
   type OverlayOpen,
 } from "./msgMenu";
+
+/**
+ * Upload attachments in order while retaining successful results in the map.
+ * If a later upload fails, a retry can reuse the earlier attachment IDs.
+ */
+export async function uploadPendingAttachments(
+  filesToUpload: File[],
+  uploaded: Map<File, AttachmentView>,
+  uploadKeys: Map<File, string>,
+  upload: (file: File, clientUploadId: string) => Promise<AttachmentView>,
+): Promise<AttachmentView[]> {
+  const result: AttachmentView[] = [];
+  for (const file of filesToUpload) {
+    const existing = uploaded.get(file);
+    const key = uploadKeys.get(file) ?? newClientId();
+    uploadKeys.set(file, key);
+    const attachment = existing ?? (await upload(file, key));
+    if (!existing) uploaded.set(file, attachment);
+    result.push(attachment);
+  }
+  return result;
+}
 import {
   CopyIcon,
   DownloadIcon,
@@ -149,7 +173,7 @@ export function prepareEditSubmission(previous: EditSubmission | null, id: strin
   const content = text.trim();
   if (!content || Array.from(content).length > 4000) throw new Error("消息需 1–4000 字");
   if (previous?.id === id && previous.content === content) return previous;
-  return { id, content, expectedVersion, clientOpId: crypto.randomUUID() };
+  return { id, content, expectedVersion, clientOpId: newClientId() };
 }
 
 /** 编辑结果归属：仅当组件 owner、编辑代次、目标消息、会话与账号代次全部未变时才收尾编辑态 */
@@ -268,6 +292,8 @@ export default function ChatView() {
   const [previewSeq, setPreviewSeq] = useState(0);
   const [previewCollapsed, setPreviewCollapsed] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const pendingUploaded = useRef(new Map<File, AttachmentView>());
+  const pendingUploadKeys = useRef(new Map<File, string>());
   const [sending, setSending] = useState(false);
   // 生命周期：emoji 选择器展开的消息 id、消息右键菜单、触屏动作面板、mutation 错误/忙碌
   const [emojiPick, setEmojiPick] = useState<string | null>(null);
@@ -364,7 +390,12 @@ export default function ChatView() {
     setPreviewCollapsed(false);
     batchSub.current = null;
     recSub.current = null;
-    // 待发附件属于旧会话，不能带到新会话里发出去
+    // 待发附件属于旧会话，不能带到新会话里发出去。清掉未关联上传，避免旧会话切换后占配额。
+    void Promise.allSettled(
+      [...pendingUploaded.current.values()].map((attachment) => files.removeUnsent(attachment.id)),
+    );
+    pendingUploaded.current.clear();
+    pendingUploadKeys.current.clear();
     setPendingFiles([]);
     setSendErr(null);
     // 切换会话：在途 mutation 回调失权（owner token 已换），忙碌态与编辑代次一并复位
@@ -422,6 +453,12 @@ export default function ChatView() {
     reload();
     const tick = setInterval(reload, 30_000);
     const onLogout = () => {
+      void Promise.allSettled(
+        [...pendingUploaded.current.values()].map((attachment) => files.removeUnsent(attachment.id)),
+      );
+      pendingUploaded.current.clear();
+      pendingUploadKeys.current.clear();
+      setPendingFiles([]);
       setReedits([]);
       // MF2：登出/服务端切换丢弃多选与查看页；返回键层栈兜底清空
       setMs(null);
@@ -864,7 +901,7 @@ export default function ChatView() {
     setMutBusy(true);
     setMutErr(null);
     try {
-      const tomb = await msgsApi.recall(m.id, crypto.randomUUID());
+      const tomb = await msgsApi.recall(m.id, newClientId());
       setState((st) => applyUpdatedMessage(st, tomb));
       if (canReedit && meId) {
         patchReedit(localStorage, serverScope(), meId, m.id, {
@@ -1104,7 +1141,7 @@ export default function ChatView() {
     for (const id of p.message_ids.slice(0, FALLBACK_SEPARATE_CAP)) {
       try {
         // 单转幂等键 fwd:{op}:{target} 不含源消息 id——每条必须新 op
-        const r = await msgsApi.forward(id, p.targets, crypto.randomUUID());
+        const r = await msgsApi.forward(id, p.targets, newClientId());
         const oks = r.results.filter((x) => x.ok && x.message);
         for (const x of oks) setState((st) => applyLiveMessage(st, x.message!));
         if (r.results.some((x) => x.ok)) sent++;
@@ -1127,7 +1164,7 @@ export default function ChatView() {
       prev.attachmentId === attachmentId &&
       prev.targets.join("\n") === sorted.join("\n")
         ? prev
-        : { outerId, attachmentId, targets: sorted, op: crypto.randomUUID() };
+        : { outerId, attachmentId, targets: sorted, op: newClientId() };
     recSub.current = p;
     await runRecordForward(p);
   };
@@ -1337,7 +1374,7 @@ export default function ChatView() {
     setMutBusy(true);
     setMutErr(null);
     try {
-      const resp = await msgsApi.forward(m.id, [self.id], crypto.randomUUID());
+      const resp = await msgsApi.forward(m.id, [self.id], newClientId());
       const r = resp.results[0];
       if (r?.ok && r.message) {
         setState((st) => ({ ...st, ...applyLiveMessage(st, r.message!) }));
@@ -1362,7 +1399,7 @@ export default function ChatView() {
     setMutErr(null);
     try {
       const mine = (m.reactions ?? []).some((r) => r.emoji === emoji && r.reacted_by_me);
-      const res = await msgsApi.react(m.id, emoji, !mine, crypto.randomUUID());
+      const res = await msgsApi.react(m.id, emoji, !mine, newClientId());
       setState((st) => applyUpdatedMessage(st, res));
     } catch (e) {
       setMutErr(e instanceof Error ? e.message : "表情操作失败");
@@ -1392,7 +1429,7 @@ export default function ChatView() {
     const sentText = text;
     const sentFiles = pendingFiles;
     const rt0 = s.replyingTo;
-    const still = () => getState().activeConv === conv.id;
+  const still = () => gen === session() && getState().activeConv === conv.id;
     try {
       if (chip) {
         // 复用发送：附件来自撤回保留原件，本地没有 File 可直接上传
@@ -1421,9 +1458,17 @@ export default function ChatView() {
         return;
       }
       // 先上传待发附件，文字随最后一个附件消息一起发
-      const atts: AttachmentView[] = [];
-      for (const f of sentFiles) {
-        atts.push(await files.upload(conv.id, f));
+      const atts = await uploadPendingAttachments(
+        sentFiles,
+        pendingUploaded.current,
+        pendingUploadKeys.current,
+        (file, clientUploadId) => files.upload(conv.id, file, { clientUploadId }),
+      );
+      if (!still()) {
+        if (gen === session()) {
+          await Promise.allSettled(atts.map((att) => files.removeUnsent(att.id)));
+        }
+        throw new Error("会话已切换，附件未发送");
       }
       const rt = rt0 ?? undefined;
       atts.forEach((att, i) =>
@@ -1434,6 +1479,13 @@ export default function ChatView() {
           i === atts.length - 1 ? rt : undefined,
         ),
       );
+      // These files now belong to the message outbox. Keep only the key for uploads
+      // that did not finish, so later retries can reuse those rows without retaining
+      // already queued attachments in this component.
+      for (const file of sentFiles) {
+        pendingUploaded.current.delete(file);
+        pendingUploadKeys.current.delete(file);
+      }
       if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt);
       const draft = getState().drafts[conv.id]?.text ?? "";
       if (unsentText(draft, sentText) !== draft) setDraft(conv.id, unsentText(draft, sentText)); // 发送即清该会话草稿
@@ -1576,11 +1628,9 @@ export default function ChatView() {
         fileName: preview.att.file_name,
         mime: preview.att.mime,
         size: preview.att.size,
-        url: attImgSrc(
-          preview.att,
-          preview.att.recalled ? reuseUrls[preview.att.id] : undefined,
-          files.url(preview.att.id),
-        ) ?? undefined,
+        ...(preview.att.recalled
+          ? { url: reuseUrls[preview.att.id] }
+          : { loadUrl: async () => (await files.access(preview.att.id)).url }),
       }
     : stagedPreview?.kind === "pending"
       ? {
@@ -2027,40 +2077,27 @@ export default function ChatView() {
                           (() => {
                             const att = m.attachment;
                             if (!att) return null;
-                            // 复用发送的乐观附件（att.recalled）：公共 URL 已 404，
-                            // 只渲染 chip 取回的 objectURL；没取回画中性占位，不闪破图
-                            const src = attImgSrc(
-                              att,
-                              att.recalled ? reuseUrls[att.id] : undefined,
-                              files.url(att.id, { thumb: !!att.has_thumb }),
-                            );
-                            return src ? (
-                              <img
+                            const style = imgDim(att);
+                            return (
+                              <AttachmentImage
                                 className="msg-img"
-                                src={src}
-                                alt={att.file_name}
-                                style={imgDim(att)}
+                                attachment={att}
+                                recalledUrl={reuseUrls[att.id]}
+                                style={style}
                                 data-own-action
                                 onClick={() => openPreview(att, m)}
+                                fallback={<div className="msg-img-ph" style={style} aria-label={att.file_name}>🖼</div>}
                               />
-                            ) : (
-                              <div
-                                className="msg-img-ph"
-                                style={imgDim(att)}
-                                aria-label={att.file_name}
-                              >
-                                🖼
-                              </div>
                             );
                           })()}
                         {m.attachment && m.kind === "audio" && (
-                          <AudioBubble att={m.attachment} />
+                          <AudioBubble att={m.attachment} recalledUrl={reuseUrls[m.attachment.id]} />
                         )}
                         {m.attachment && m.kind === "file" && (
                           <div
                             className="msg-file"
                             data-own-action
-                            // 复用在途的撤回件：公共 URL 已 404，预览没有意义
+                            // 复用在途的撤回件继续通过原草稿的预览入口查看
                             onClick={
                               m.attachment.recalled
                                 ? undefined
@@ -2407,6 +2444,10 @@ export default function ChatView() {
                       aria-label={`移除待发文件 ${f.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
+                        const attachment = pendingUploaded.current.get(f);
+                        pendingUploaded.current.delete(f);
+                        pendingUploadKeys.current.delete(f);
+                        if (attachment) void files.removeUnsent(attachment.id).catch(() => {});
                         setPendingFiles((p) => p.filter((_, j) => j !== i));
                         setStagedPreview((cur) =>
                           cur?.kind === "pending" && cur.file === f ? null : cur,

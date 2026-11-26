@@ -14,10 +14,22 @@ pub(crate) async fn spawn_backup_env(
     chat_server::state::SharedState,
     std::path::PathBuf,
 ) {
+    spawn_backup_env_with_migrations(tag, sqlx::migrate!("./migrations")).await
+}
+
+async fn spawn_backup_env_with_migrations(
+    tag: &str,
+    migrations: sqlx::migrate::Migrator,
+) -> (
+    testdb::TempDb,
+    String,
+    chat_server::state::SharedState,
+    std::path::PathBuf,
+) {
     let db = testdb::TempDb::create(&format!("chat_t_p41{tag}_{}", uniq())).await;
     let url = db.url();
     let pool = PgPoolOptions::new().connect(&url).await.unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    migrations.run(&pool).await.unwrap();
 
     let files_dir = std::env::temp_dir().join(format!("chat-it-p41-{tag}-{}", uniq()));
     let cfg = Config {
@@ -573,6 +585,7 @@ async fn p41_restore_rolls_back_data_and_credentials() {
     // 附件：字节一致；PG sha256 复核「恢复文件 == 原始字节」
     let dl = c
         .get(format!("{base}/v1/files/{att_id}"))
+        .header("authorization", authz(&admin2.access))
         .send()
         .await
         .unwrap();
@@ -1263,6 +1276,7 @@ async fn mf1_backup_chat_record_roundtrip() {
     let admin2 = login_again(&base, &admin.username).await;
     let dl = http()
         .get(format!("{base}/v1/files/{clone_id}"))
+        .header("authorization", authz(&admin2.access))
         .send()
         .await
         .unwrap();
@@ -1288,6 +1302,56 @@ async fn mf1_backup_chat_record_roundtrip() {
 
 /// version-39 老备份（CSVs 缺 record / record_message_id 两列）照常恢复，
 /// 新列一律 NULL。
+#[tokio::test]
+async fn restore_accepts_backup_exported_before_fcm_table_existed() {
+    let mut migrations = sqlx::migrate!("./migrations");
+    migrations.migrations.to_mut().retain(|migration| migration.version <= 43);
+    let (_db, base, state, files_dir) = spawn_backup_env_with_migrations("prefcm", migrations).await;
+    let admin = register(&base, &format!("prefcm_{}", uniq())).await;
+    std::fs::write(files_dir.join("before.txt"), b"from backup").unwrap();
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+    let entries = read_backup(&bytes);
+    let manifest: Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+    assert_eq!(manifest["migration_version"], 43);
+    assert!(!entries.contains_key("db/android_fcm_devices.csv"));
+
+    // Upgrade the actual database and register a device that must disappear on restore.
+    sqlx::migrate!("./migrations").run(&state.pool).await.unwrap();
+    sqlx::query("UPDATE users SET display_name = 'after upgrade' WHERE username = $1")
+        .bind(&admin.username)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query(
+            "INSERT INTO android_fcm_devices (session_id, token, binding, key_hash, generation)
+             SELECT sessions.id, 'after-upgrade', $1, 'test_hash', 1
+             FROM sessions JOIN users ON users.id = sessions.user_id
+             WHERE users.username = $2",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&admin.username)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+    std::fs::write(files_dir.join("before.txt"), b"changed").unwrap();
+
+    let restored = restore_upload(&base, &admin.access, bytes, Some("RESTORE")).await;
+    assert_eq!(restored.status(), 200, "{}", restored.text().await.unwrap());
+    let admin2 = login_again(&base, &admin.username).await;
+    assert_eq!(me(&base, &admin2).await["display_name"], admin.username);
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM android_fcm_devices")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(devices, 0);
+    assert_eq!(std::fs::read(files_dir.join("before.txt")).unwrap(), b"from backup");
+}
+
 #[tokio::test]
 async fn mf1_restore_accepts_v39_backup() {
     let (_guard, base, st, _files_dir) = spawn_backup_env("v39").await;

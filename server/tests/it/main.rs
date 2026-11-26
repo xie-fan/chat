@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 mod acp;
+mod acp_transfer;
 mod admin;
 mod announcements;
 mod attachments;

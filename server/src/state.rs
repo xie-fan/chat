@@ -54,6 +54,7 @@ pub struct AcpHostConn {
     pub conn_id: Uuid,
     pub sid: Option<Uuid>,
     pub tx: mpsc::Sender<ConnMsg>,
+    pub run_ids: bool,
 }
 
 pub struct AppState {
@@ -64,6 +65,7 @@ pub struct AppState {
     pub conns: ConnMap,
     /// ACP 宿主节点在线连接：host_id -> AcpHostConn
     pub acp_hosts: DashMap<Uuid, AcpHostConn>,
+    acp_host_locks: [tokio::sync::Mutex<()>; 64],
     /// 待宿主响应的 ACP RPC 请求：req_id -> (host_id, oneshot sender)
     pub acp_rpc_wait:
         DashMap<Uuid, (Uuid, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>)>,
@@ -87,6 +89,11 @@ pub struct AppState {
     pub ws_ping_interval_ms: AtomicU64,
     /// V2 P4-1：维护模式。为 true 时除正在执行的恢复请求外所有 /v1 请求 503（含 WS 升级）。
     pub maintenance: AtomicBool,
+    pub(crate) maintenance_started: tokio::sync::Notify,
+    /// 维护开始前发出的后台任务不能影响恢复后的数据库。
+    pub(crate) restore_epoch: AtomicU64,
+    /// 恢复前等待已经开始的数据库和附件操作结束。
+    pub(crate) storage_barrier: tokio::sync::RwLock<()>,
     /// V2 P4-1：备份/恢复互斥锁（同一时间只允许一个备份生成或一次恢复进行）。
     pub backup_busy: AtomicBool,
     /// bot id → 在 GET /bot/updates 上长轮询的请求；有发给它的新消息时 notify_waiters 叫醒。
@@ -111,6 +118,7 @@ impl AppState {
             fcm,
             conns: DashMap::new(),
             acp_hosts: DashMap::new(),
+            acp_host_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
             acp_rpc_wait: DashMap::new(),
             acp_pair_codes: DashMap::new(),
             tickets: DashMap::new(),
@@ -121,9 +129,19 @@ impl AppState {
             ws_idle_timeout_ms: AtomicU64::new(75_000),
             ws_ping_interval_ms: AtomicU64::new(30_000),
             maintenance: AtomicBool::new(false),
+            maintenance_started: Default::default(),
+            restore_epoch: AtomicU64::new(0),
+            storage_barrier: Default::default(),
             backup_busy: AtomicBool::new(false),
             bot_wake: DashMap::new(),
         })
+    }
+
+    /// Serializes ACP run transitions with their host's connection lifecycle.
+    pub(crate) async fn lock_acp_host(&self, host_id: Uuid) -> tokio::sync::MutexGuard<'_, ()> {
+        self.acp_host_locks[usize::from(host_id.as_bytes()[0]) % self.acp_host_locks.len()]
+            .lock()
+            .await
     }
 
     /// 登记 ACP 宿主 WS 连接；同一 host_id 重连时先向旧连接下发 host_superseded 并关闭。
@@ -135,6 +153,7 @@ impl AppState {
         conn_id: Uuid,
         sid: Option<Uuid>,
         tx: mpsc::Sender<ConnMsg>,
+        run_ids: bool,
     ) -> bool {
         if let Some(prev) = self.acp_hosts.insert(
             host_id,
@@ -143,6 +162,7 @@ impl AppState {
                 conn_id,
                 sid,
                 tx,
+                run_ids,
             },
         ) {
             let frame = serde_json::json!({ "type": "host_superseded" }).to_string();
@@ -456,8 +476,8 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel(4);
         let (tx2, _rx2) = mpsc::channel(4);
 
-        assert!(!st.register_acp_host(host_id, uid, conn1, None, tx1));
-        assert!(st.register_acp_host(host_id, uid, conn2, None, tx2));
+        assert!(!st.register_acp_host(host_id, uid, conn1, None, tx1, false));
+        assert!(st.register_acp_host(host_id, uid, conn2, None, tx2, true));
 
         match rx1.recv().await {
             Some(ConnMsg::Shutdown(frame)) => assert!(frame.contains("host_superseded")),

@@ -1,3 +1,4 @@
+import { newClientId } from "./clientId";
 import {
   acp,
   ApiError,
@@ -114,7 +115,7 @@ type Outgoing = {
 };
 
 /** ack 看门狗：发出 ACK_TIMEOUT_MS 未确认即重连重放，
- * 期间每 ACK_WATCHDOG_MS 扫一次——ack 丢了但消息本体已回显的，直接按 ack 收敛。 */
+ * 看门狗检查未确认的发送，超时后按原幂等键重放。 */
 const ACK_TIMEOUT_MS = 10_000;
 const ACK_WATCHDOG_MS = 3_000;
 let ackWatchdog: number | null = null;
@@ -470,7 +471,15 @@ function dispatch(f: WsOut) {
       break;
     case "message":
       onMessage(f.message);
-      trackIncomingSeq(f.message.conversation_id, f.message.seq);
+      if (
+        f.client_msg_id &&
+        f.message.sender_id === s.me?.id &&
+        outbox.some((item) => item.clientMsgId === f.client_msg_id && item.convId === f.message.conversation_id)
+      ) {
+        resolveSend(f.client_msg_id, f.message);
+      } else {
+        trackIncomingSeq(f.message.conversation_id, f.message.seq);
+      }
       break;
     case "message_ack": {
       resolveSend(f.client_msg_id, f.message);
@@ -546,7 +555,16 @@ function dispatch(f: WsOut) {
       );
       break;
     case "acp_event":
-      setState((cur) => applyAcpEvent(cur, f.event, f.data));
+      if (f.event === "bootstrap_changed") {
+        const gen = wsGen;
+        void acp.bootstrap().then((snapshot) => {
+          if (!stopped && gen === wsGen && gen === session()) {
+            setState((cur) => applyAcpBootstrap(cur, snapshot));
+          }
+        }).catch(() => {});
+      } else {
+        setState((cur) => applyAcpEvent(cur, f.event, f.data));
+      }
       break;
     case "force_logout": {
       // 被踢下线（禁用/重置密码/改密/移出设备）：记本服务器的原因 → 停连接 → 回登录页
@@ -632,7 +650,7 @@ async function refreshByWhat(what: string) {
   }
 }
 
-/** 服务端真身到手（message_ack，或 ack 丢失后经广播/sync 回显匹配）：
+/** 服务端以幂等键确认（message_ack 或给发送者的消息广播）：
  * 移出待发队列、按 ack 语义用真身替换乐观气泡。ack 对应条目已不在队列里
  * （如另一标签页清过）也照常并入真身，不丢消息。 */
 function resolveSend(clientMsgId: string | null, real: MessageView) {
@@ -657,50 +675,16 @@ function scheduleAckWatchdog() {
   }, ACK_WATCHDOG_MS);
 }
 
-/**
- * P0-3：「发送中」兜底。flushOutbox 跳过 sentOn===当前连接 的条目——消息已发出
- * 而 message_ack 单帧丢失（服务端回包通道满、半开连接等）时，没有重连触发就
- * 永远卡在「发送中」。看门狗两路兜底：
- * 1. 真身已从广播/sync 回显（同会话、本人、同正文/附件）→ 按 ack 语义收敛；
- * 2. 在当前存活连接上发出且超时未确认 → 重连，按原幂等键重放。
- * 死连接上的待发项交给重连 flushOutbox 重放，不在此判失败；
- * 从没上过 socket 的离线待发项同理（无 sentAt，直接跳过）。
- */
+/** 超时后按原幂等键重放。仅凭正文或文件名无法判断是哪次发送。 */
 function checkOutboxAcks() {
-  const consumed = new Set<string>(); // 本轮已认领的真身：一条真身只收敛一条待发
-  for (const item of [...outbox]) {
-    if (item.sentAt == null) continue;
-    const echoed = findEchoedMessage(item, consumed);
-    if (echoed) {
-      consumed.add(echoed.id);
-      resolveSend(item.clientMsgId, echoed);
-    } else if (
-      !item.error &&
-      ws != null &&
-      item.sentOn === ws &&
-      ws.readyState === WebSocket.OPEN &&
-      Date.now() - item.sentAt >= ACK_TIMEOUT_MS
-    ) {
-      reconnectNow();
-    }
+  const sock = ws;
+  if (!sock || sock.readyState !== WebSocket.OPEN) return;
+  const now = Date.now();
+  if (outbox.some((item) =>
+    !item.error && item.sentOn === sock && item.sentAt != null && now - item.sentAt >= ACK_TIMEOUT_MS
+  )) {
+    reconnectNow();
   }
-}
-
-/** 在会话缓存里找「这条已发消息」的服务端真身：ack 丢了但广播/sync 已送达。
- * 匹配同会话、本人所发、落库正文（服务端 trim + 附件占位符与乐观文案同规则）、
- * 附件同名；本轮已被认领的真身不再复用。 */
-function findEchoedMessage(item: Outgoing, consumed: Set<string>): MessageView | undefined {
-  const me = getState().me;
-  if (!me) return undefined;
-  const content = item.optimistic.content.trim();
-  return (getState().messages[item.convId] ?? []).find(
-    (m) =>
-      !m.id.startsWith("client:") &&
-      !consumed.has(m.id) &&
-      m.sender_id === me.id &&
-      m.content === content &&
-      (m.attachment?.file_name ?? null) === (item.attachment?.file_name ?? null),
-  );
 }
 
 function takeOutbox(clientMsgId: string | null): Outgoing | undefined {
@@ -783,7 +767,7 @@ export function sendChat(
   replyTo?: MessageView,
   reuse?: boolean,
 ): string | undefined {
-  const clientMsgId = crypto.randomUUID();
+  const clientMsgId = newClientId();
   const me = getState().me;
   if (!me) return undefined;
   // MM2 fix3：复用发送的乐观附件打上 recalled 标——id 是撤回保留原件，
@@ -845,7 +829,7 @@ export function sendChat(
 
 /** 发送 Meeting Card（kind=meeting）；content 为可加入的绝对 URL。遗留纯文本会议链接仍走 sendChat。 */
 export function sendMeeting(convId: string, url: string): string | undefined {
-  const clientMsgId = crypto.randomUUID();
+  const clientMsgId = newClientId();
   const me = getState().me;
   if (!me) return undefined;
   const optimistic: MessageView = {

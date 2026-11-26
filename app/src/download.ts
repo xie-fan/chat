@@ -26,6 +26,7 @@ function browserAnchor(url: string, name: string) {
   const el = document.createElement("a");
   el.href = url;
   el.download = name;
+  el.referrerPolicy = "no-referrer";
   document.body.appendChild(el);
   el.click();
   el.remove();
@@ -39,9 +40,13 @@ export async function saveAttachment(
   a: AttachmentView,
   deps: SaveAttachmentDeps = {},
 ): Promise<void> {
-  const url = files.url(a.id, { dl: true });
   if (!(deps.tauri ?? inTauri())) {
-    (deps.anchor ?? browserAnchor)(url, a.file_name);
+    try {
+      const { url } = await files.access(a.id, { dl: true });
+      (deps.anchor ?? browserAnchor)(url, a.file_name);
+    } catch (e) {
+      pushToast({ title: "下载失败", text: e instanceof Error ? e.message : String(e) });
+    }
     return;
   }
   // 在途提示常驻直到被结果接替（大文件可能超过 5s）
@@ -50,6 +55,7 @@ export async function saveAttachment(
     { timeoutMs: 0 },
   );
   try {
+    const { url } = await files.access(a.id, { dl: true });
     const invoke: Invoke =
       deps.invoke ??
       (await import("@tauri-apps/api/core")).invoke as Invoke;

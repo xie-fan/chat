@@ -5,7 +5,50 @@ import {
   editRejected,
   ownsEditResult,
   prepareEditSubmission,
+  uploadPendingAttachments,
 } from "./ChatView";
+import type { AttachmentView } from "../../types";
+
+it("reuses successful uploads when a later attachment is retried", async () => {
+  const first = new File(["a"], "a.txt");
+  const second = new File(["b"], "b.txt");
+  const uploaded = new Map<File, AttachmentView>();
+  const keys = new Map<File, string>();
+  const calls: string[] = [];
+  let secondAttempt = false;
+  await expect(uploadPendingAttachments(
+    [first, second], uploaded, keys,
+    async (file, key) => {
+      calls.push(`${file.name}:${key}`);
+      if (file === second && !secondAttempt) throw new Error("temporary upload failure");
+      return {
+        id: file === first ? "a" : "b.txt", file_name: file.name, mime: "text/plain", size: 1,
+        width: null, height: null, has_thumb: false, duration_ms: null,
+      };
+    },
+  )).rejects.toThrow("temporary upload failure");
+  expect(uploaded.get(first)?.id).toBe("a");
+  expect(calls).toHaveLength(2);
+  const firstKey = keys.get(first);
+  const secondKey = keys.get(second);
+  expect(firstKey).toBeTruthy();
+  expect(secondKey).toBeTruthy();
+  secondAttempt = true;
+  const retry = await uploadPendingAttachments(
+    [first, second], uploaded, keys,
+    async (file, key) => { calls.push(`${file.name}:${key}`); return {
+      id: file.name, file_name: file.name, mime: "text/plain", size: 1,
+      width: null, height: null, has_thumb: false, duration_ms: null,
+    }; },
+  );
+  expect(retry.map((item) => item.id)).toEqual(["a", "b.txt"]);
+  expect(calls).toHaveLength(3);
+  expect(uploaded.get(first)?.id).toBe("a");
+  expect(uploaded.get(second)?.id).toBe("b.txt");
+  expect(keys.get(first)).toBe(firstKey);
+  expect(keys.get(second)).toBe(secondKey);
+  expect(calls[2]).toBe(`b.txt:${secondKey}`);
+});
 
 describe("edit submission callback ownership", () => {
   const token = {};

@@ -1,5 +1,6 @@
 // ===== MF2 批量转发：请求构造 / 结果文案 / 旧服务端判定（纯函数，便于单测） =====
 
+import { newClientId } from "../../clientId";
 import { ApiError } from "../../api";
 import type { ForwardBatchResp, ForwardResp } from "../../types";
 
@@ -35,7 +36,7 @@ export function prepareBatchSubmission(
   ) {
     return prev;
   }
-  return { conversation_id, message_ids: [...message_ids], targets: t, mode, client_op_id: crypto.randomUUID() };
+  return { conversation_id, message_ids: [...message_ids], targets: t, mode, client_op_id: newClientId() };
 }
 
 /**

@@ -16,11 +16,34 @@ async fn client_heartbeat_and_replayed_message_are_idempotent() {
         .await
         .unwrap();
     next_of(&mut socket, "pong").await;
+    let (mut peer, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await)
+        .await
+        .unwrap();
+    next_of(&mut peer, "presence_init").await;
+
     let frame = json!({"client_msg_id":"heartbeat-replay", "content":"retry"});
-    let first = ws_send(&mut socket, &conv, frame.clone()).await;
+    let mut request = frame.clone();
+    request["type"] = json!("send_message");
+    request["conversation_id"] = json!(conv);
+    socket
+        .send(WsMsg::Text(request.to_string().into()))
+        .await
+        .unwrap();
+    let echo = next_of(&mut socket, "message").await;
+    assert_eq!(echo["client_msg_id"], "heartbeat-replay");
+    let delivered = next_of(&mut peer, "message").await;
+    assert!(delivered.get("client_msg_id").is_none());
+    let first = next_of(&mut socket, "message_ack").await["message"].clone();
     let replay = ws_send(&mut socket, &conv, frame).await;
     assert_eq!(first["id"], replay["id"]);
     assert_eq!(first["seq"], replay["seq"]);
+    let separate = ws_send(
+        &mut socket,
+        &conv,
+        json!({"client_msg_id":"heartbeat-separate", "content":"retry"}),
+    )
+    .await;
+    assert_ne!(first["id"], separate["id"]);
 }
 
 // ---------- review 回归 ----------
@@ -74,7 +97,7 @@ async fn attachment_download_hardened() {
         b"<script>x</script>",
     )
     .await;
-    let dl = c.get(format!("{base}/v1/files/{id}")).send().await.unwrap();
+    let dl = c.get(format!("{base}/v1/files/{id}")).header("authorization", authz(&a.access)).send().await.unwrap();
     assert_eq!(dl.status(), 200);
     assert_eq!(dl.headers()["x-content-type-options"], "nosniff");
     assert!(dl.headers()["content-disposition"]
@@ -92,7 +115,7 @@ async fn attachment_download_hardened() {
         b"<svg><script>x</script></svg>",
     )
     .await;
-    let dl = c.get(format!("{base}/v1/files/{id}")).send().await.unwrap();
+    let dl = c.get(format!("{base}/v1/files/{id}")).header("authorization", authz(&a.access)).send().await.unwrap();
     assert!(dl.headers()["content-disposition"]
         .to_str()
         .unwrap()
@@ -101,7 +124,7 @@ async fn attachment_download_hardened() {
     // png → inline 预览保留，nosniff 同样带上
     let png: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     let id = upload(&base, &conv, &a.access, "p.png", "image/png", png).await;
-    let dl = c.get(format!("{base}/v1/files/{id}")).send().await.unwrap();
+    let dl = c.get(format!("{base}/v1/files/{id}")).header("authorization", authz(&a.access)).send().await.unwrap();
     assert!(dl.headers()["content-disposition"]
         .to_str()
         .unwrap()
@@ -111,6 +134,7 @@ async fn attachment_download_hardened() {
     // dl=1 时即便安全 MIME 也强制 attachment
     let dl = c
         .get(format!("{base}/v1/files/{id}?dl=1"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();

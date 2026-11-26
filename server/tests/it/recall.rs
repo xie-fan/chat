@@ -341,7 +341,7 @@ async fn recall_attachment_hidden_and_uploader_fetch() {
         format!("{base}/v1/files/{att_id}?dl=1"),
         format!("{base}/v1/files/{att_id}?thumb=1"),
     ] {
-        let dl = c.get(&url).send().await.unwrap();
+        let dl = c.get(&url).header("authorization", authz(&a.access)).send().await.unwrap();
         assert_eq!(dl.status(), 404, "{url} 应 404");
     }
 
@@ -460,6 +460,7 @@ async fn reuse_recalled_attachment() {
     assert_eq!(re["attachment"]["height"], 48);
     let dl = c
         .get(format!("{base}/v1/files/{new_att}"))
+        .header("authorization", authz(&b.access))
         .send()
         .await
         .unwrap();

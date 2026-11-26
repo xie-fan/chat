@@ -5,6 +5,7 @@ import {
   clearSession,
   convs,
   deviceLabel,
+  files,
   getServer,
   loadSession,
   removeServer,
@@ -98,6 +99,38 @@ describe("session-owned HTTP requests", () => {
     expect(await next).toEqual(login("new").user);
     expect(await parallel).toEqual(login("new").user);
     expect(refreshTokens).toEqual(["old-refresh", "new-refresh"]);
+  });
+});
+
+describe("authenticated attachment access", () => {
+  it("sends the account credential only in the ticket request header", async () => {
+    const fetcher = vi.fn(async () => Response.json({ ticket: "file.ticket.signature", expires_in: 600 }));
+    vi.stubGlobal("fetch", fetcher);
+    const { url } = await files.access("image", { thumb: true });
+    expect(fetcher).toHaveBeenCalledWith(`${TEST_SRV}/v1/files/image/ticket`, expect.objectContaining({
+      headers: { authorization: "Bearer old-access" },
+    }));
+    expect(url).toBe(`${TEST_SRV}/v1/files/image?thumb=1&ticket=file.ticket.signature`);
+  });
+
+  it("uses legacy URLs only when the ticket route is unsupported", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ error: "unknown_api" }, { status: 404 }))
+      .mockResolvedValueOnce(Response.json({ error: "file not found" }, { status: 404 }));
+    vi.stubGlobal("fetch", fetcher);
+    expect((await files.access("legacy")).url).toBe(`${TEST_SRV}/v1/files/legacy`);
+    await expect(files.access("removed")).rejects.toMatchObject({ status: 404, message: "file not found" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("discards an in-flight attachment ticket from a previous sign-in", async () => {
+    const ticket = deferred<Response>();
+    vi.stubGlobal("fetch", vi.fn(() => ticket.promise));
+    const result = files.access("private");
+    const rejected = expect(result).rejects.toThrow("session changed");
+    saveSession(login("other-user"));
+    ticket.resolve(Response.json({ ticket: "old.file.signature", expires_in: 600 }));
+    await rejected;
   });
 });
 

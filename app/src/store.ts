@@ -1,3 +1,4 @@
+import { newClientId } from "./clientId";
 import { useSyncExternalStore } from "react";
 import { mergeLocalVaultWithBootstrap } from "./acpLocalVault";
 import {
@@ -9,7 +10,7 @@ import {
   clearPendingSessionPatch,
   clearPendingWorkspacePatch,
 } from "./acpOverlay";
-import { loadSession, serverScope } from "./api";
+import { getServer, loadSession, serverScope } from "./api";
 import { writeDrafts, type DraftEntry, type DraftReuse } from "./drafts";
 import { cacheKey, getRecent, touchRecent, writeLocalCache } from "./localCache";
 import { recordLabel } from "./ui/chat/chatRecord";
@@ -412,7 +413,7 @@ export function shouldNotify(s: AppState, m: MessageView): boolean {
 
 /** timeoutMs 传 0 = 常驻不自动消失（MM4「下载中…」在途提示，由结果 toast 接替） */
 export function pushToast(t: Omit<Toast, "id" | "ts">, opts?: { timeoutMs?: number }): string {
-  const id = crypto.randomUUID();
+  const id = newClientId();
   setState((s) => ({
     toasts: [...s.toasts.slice(-3), { ...t, id, ts: Date.now() }],
   }));
@@ -793,7 +794,7 @@ function settleInactiveActivity(
 }
 
 export function applyAcpBootstrap(s: AppState, bsRaw: AcpBootstrap): Partial<AppState> {
-  const bs = mergeLocalVaultWithBootstrap(bsRaw);
+  const bs = mergeLocalVaultWithBootstrap(bsRaw, JSON.stringify([getServer(), s.me?.id]));
   const acpSessions = bs.sessions.map(applySessionOverlay);
   const pruned = pruneAcpActivity(s.acpActivity, acpSessions);
   let acpActivity = pruned;

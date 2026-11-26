@@ -142,7 +142,7 @@ pub struct MemberView {
     pub joined_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct AttachmentView {
     pub id: Uuid,
     pub file_name: String,
@@ -416,6 +416,8 @@ pub enum WsOut {
     Pong,
     Message {
         message: MessageView,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
     },
     MessageAck {
         client_msg_id: Option<String>,

@@ -15,8 +15,8 @@ use crate::settings;
 use crate::state::SharedState;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{OriginalUri, Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -304,6 +304,44 @@ pub(crate) fn origin(public_url: &str, headers: &HeaderMap) -> String {
     format!("{proto}://{host}")
 }
 
+fn update_download_url(
+    uri: &Uri,
+    headers: &HeaderMap,
+    trust_proxy: bool,
+    name: &str,
+) -> AppResult<reqwest::Url> {
+    let forwarded = |key: &str| {
+        trust_proxy
+            .then(|| headers.get(key)?.to_str().ok()?.rsplit(',').next().map(str::trim))
+            .flatten()
+    };
+    let scheme = forwarded("x-forwarded-proto")
+        .filter(|scheme| matches!(*scheme, "http" | "https"))
+        .or_else(|| uri.scheme_str())
+        .unwrap_or("http");
+    let host = forwarded("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST)?.to_str().ok())
+        .or_else(|| uri.authority().map(|authority| authority.as_str()))
+        .ok_or_else(|| AppError::bad_request("更新请求缺少服务器地址"))?;
+    let invalid_address = || AppError::bad_request("更新请求的服务器地址无效");
+    let authority: axum::http::uri::Authority = host.parse().map_err(|_| invalid_address())?;
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{authority}"))
+        .map_err(|_| invalid_address())?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid_address());
+    }
+    let prefix = forwarded("x-forwarded-prefix")
+        .filter(|prefix| prefix.starts_with('/'))
+        .or_else(|| uri.path().rsplit_once("/v1/client/update/").map(|(prefix, _)| prefix))
+        .unwrap_or("");
+    url.set_path(prefix.trim_end_matches('/'));
+    url.path_segments_mut()
+        .map_err(|_| invalid_address())?
+        .pop_if_empty()
+        .extend(["v1", "client", "download", name]);
+    Ok(url)
+}
+
 #[derive(Deserialize)]
 pub struct UpdateQuery {
     /// 插件的 {{bundle_type}}：nsis / deb / appimage
@@ -326,6 +364,7 @@ fn package_suffix(target: &str, arch: &str, bundle: &str) -> Option<&'static str
 /// 版本比较交给客户端插件（不比当前新就不装）。
 pub async fn tauri_update(
     State(st): State<SharedState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path((target, arch, _current)): Path<(String, String, String)>,
     Query(q): Query<UpdateQuery>,
@@ -352,13 +391,12 @@ pub async fn tauri_update(
         .text()
         .await
         .map_err(|e| AppError::bad_gateway(format!("取签名失败：{e}")))?;
-    let s = settings::load(&st.pool).await?;
-    let base = origin(&s.public_url, &headers);
+    let url = update_download_url(&uri, &headers, st.cfg.trust_proxy, &exe.name)?;
     Ok(Json(serde_json::json!({
         "version": version_of(&r.tag_name),
         "notes": r.body,
         "pub_date": r.published_at,
-        "url": format!("{base}/v1/client/download/{}", exe.name),
+        "url": url.as_str(),
         "signature": signature.trim(),
     }))
     .into_response())
@@ -405,6 +443,18 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn trusted_proxy_download_preserves_prefix_and_encodes_asset_name() {
+        let uri = "/v1/client/update/linux/x86_64/1".parse().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "internal:28080".parse().unwrap());
+        headers.insert("x-forwarded-host", "lan.example:8443".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-prefix", "/services/chat/".parse().unwrap());
+        let url = super::update_download_url(&uri, &headers, true, "Chat #2.deb").unwrap();
+        assert_eq!(url.as_str(), "https://lan.example:8443/services/chat/v1/client/download/Chat%20%232.deb");
+    }
 
     #[tokio::test]
     async fn latest_metadata_uses_fresh_cache_and_falls_back_to_recent_release() {

@@ -46,6 +46,8 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptStartMsg {
     pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<Uuid>,
     pub acp_session_key: Option<String>,
     pub cwd: String,
     pub agent: AgentConfig,
@@ -186,7 +188,7 @@ pub async fn run_prompt_task(
     }
 
     let child_pid = child.id();
-    let upload_dir = session_upload_dir(&msg.session_id);
+    let upload_dir = session_upload_dir(&msg);
     let res = {
         let drive_fut = async {
             if is_pi {
@@ -1150,9 +1152,10 @@ fn acp_thinking_candidates(raw: &str) -> &'static [&'static str] {
     }
 }
 
-pub(super) fn session_upload_dir(session_id: &str) -> Option<PathBuf> {
-    let parsed = Uuid::parse_str(session_id.trim()).ok()?;
-    Some(super::host_data_dir().join("uploads").join(parsed.to_string()))
+pub(super) fn session_upload_dir(msg: &PromptStartMsg) -> Option<PathBuf> {
+    let session_id = Uuid::parse_str(msg.session_id.trim()).ok()?;
+    let directory_id = msg.run_id.unwrap_or(session_id);
+    Some(super::host_data_dir().join("uploads").join(directory_id.to_string()))
 }
 
 pub(super) fn restrict_dir_owner(path: &Path) {
@@ -1177,7 +1180,7 @@ pub(super) fn restrict_file_owner(path: &Path) {
 
 fn build_prompt_blocks(msg: &PromptStartMsg, dir: &Path, image_ok: bool) -> Vec<Value> {
     let mut blocks = Vec::new();
-    let upload_dir = session_upload_dir(&msg.session_id);
+    let upload_dir = session_upload_dir(msg);
     for att in &msg.attachments {
         if let Some(b64) = &att.data_base64 {
             if image_ok && att.mime.starts_with("image/") {
@@ -2353,6 +2356,7 @@ mod tests {
         });
 
         let msg = PromptStartMsg {
+            run_id: None,
             session_id: "s-1".into(),
             acp_session_key: None,
             cwd: dir.to_string_lossy().into(),
@@ -2602,6 +2606,7 @@ mod tests {
         });
 
         let msg = PromptStartMsg {
+            run_id: None,
             session_id: "s-cfg".into(),
             acp_session_key: None,
             cwd: dir.to_string_lossy().into(),
@@ -2742,6 +2747,7 @@ mod tests {
         });
 
         let msg = PromptStartMsg {
+            run_id: None,
             session_id: "s-act".into(),
             acp_session_key: None,
             cwd: dir.to_string_lossy().into(),
@@ -2888,6 +2894,7 @@ mod tests {
         });
 
         let msg = PromptStartMsg {
+            run_id: None,
             session_id: "s-sp".into(),
             acp_session_key: None,
             cwd: dir.to_string_lossy().into(),
@@ -3051,6 +3058,7 @@ mod tests {
         });
 
         let msg = PromptStartMsg {
+            run_id: None,
             session_id: "s-tw".into(),
             acp_session_key: None,
             cwd: dir.to_string_lossy().into(),

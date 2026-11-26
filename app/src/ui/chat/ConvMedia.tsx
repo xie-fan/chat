@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { files, searchApi } from "../../api";
+import { searchApi } from "../../api";
 import { saveAttachment } from "../../download";
 import type { AttachmentView, ConversationView, MessageView } from "../../types";
+import AttachmentImage from "./AttachmentImage";
 import AudioBubble from "./AudioBubble";
 
 // ===== V2 P3-1 =====
@@ -110,15 +111,13 @@ export default function ConvMedia({
         {tab === "image" && (
           <div className="cm-grid">
             {withAtt.map((m) => (
-              <img
+              <AttachmentImage
                 key={m.id}
                 className="cm-thumb"
-                src={files.url(m.attachment!.id, {
-                  thumb: !!m.attachment!.has_thumb,
-                })}
-                alt={m.attachment!.file_name}
+                attachment={m.attachment!}
                 title={m.attachment!.file_name}
                 onClick={() => onPreview?.(m.attachment!, m)}
+                fallback={<div className="cm-thumb" aria-label={m.attachment!.file_name} />}
               />
             ))}
           </div>

@@ -210,6 +210,25 @@
         }
       }
     },
+    "/bot/files/{id}": {
+      "get": {
+        "operationId": "downloadFile",
+        "summary": "下载 bot 所在会话的附件",
+        "description": "附件 id 来自消息或聊天记录。需要 bot 令牌。退群、撤回和未发送的他人上传均不可读取。支持 Range。",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "thumb", "in": "query", "schema": { "type": "integer", "enum": [1] }, "description": "有缩略图时返回缩略图" },
+          { "name": "dl", "in": "query", "schema": { "type": "integer", "enum": [1] }, "description": "下载原文件" }
+        ],
+        "responses": {
+          "200": { "description": "附件内容", "content": { "*/*": { "schema": { "type": "string", "format": "binary" } } } },
+          "206": { "description": "请求的附件片段", "content": { "*/*": { "schema": { "type": "string", "format": "binary" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
     "/bot/messages/{id}": {
       "patch": {
         "operationId": "editMessage",
@@ -254,30 +273,6 @@
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
-          "404": { "$ref": "#/components/responses/NotFound" }
-        }
-      }
-    },
-    "/files/{id}": {
-      "get": {
-        "operationId": "downloadFile",
-        "summary": "下载附件",
-        "description": "消息里 attachment.id 对应的文件，不需要令牌。",
-        "security": [],
-        "parameters": [
-          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
-          {
-            "name": "thumb",
-            "in": "query",
-            "description": "1 = 图片缩略图（attachment.has_thumb 为 true 时才有，没有就返回原图）",
-            "schema": { "type": "integer", "enum": [1] }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "文件内容，Content-Type 是上传时的类型",
-            "content": { "*/*": { "schema": { "type": "string", "format": "binary" } } }
-          },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }

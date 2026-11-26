@@ -4,7 +4,9 @@ import {
   addLocalVaultSession,
   appendLocalUserTurnAndStart,
   applyLocalRunnerEvent,
-  deactivateAndTakeLocalVault,
+  beginLocalVaultImport,
+  completeLocalVaultImport,
+  confirmLocalVaultCloudRemoval,
   ensureLocalOnlyHost,
   getLocalVault,
   getLocalVaultRawEnv,
@@ -13,6 +15,7 @@ import {
   isLocalVaultHost,
   isLocalVaultSession,
   isLocalVaultWorkspace,
+  localVaultOwnerMatches,
   patchLocalVaultAgent,
   patchLocalVaultSession,
   patchLocalVaultWorkspace,
@@ -22,11 +25,11 @@ import {
   renameLocalVaultHost,
   resolveLocalPermissionTurn,
   settleLocalSessionOnCancel,
-  getStagedLocalAttachment,
+  getLocalPromptAttachments,
   stageLocalAttachment,
-  takeStagedLocalAttachments,
   upsertLocalVaultWorkspace,
 } from "./acpLocalVault";
+import { readLocalAcpBlob, storeLocalAcpBlob } from "./acpAttachmentStore";
 import {
   clearPendingAgentPatch,
   clearPendingSessionPatch,
@@ -41,7 +44,7 @@ import {
   type PendingAgentPatch,
   type PendingSessionPatch,
 } from "./acpOverlay";
-import { acp, convs, getServer, isDesktopShell, serverScope } from "./api";
+import { acp, convs, getServer, isDesktopShell, serverScope, session } from "./api";
 import { applyAcpBootstrap, applyAcpEvent, type AppState, getState, setState } from "./store";
 import type {
   AcpAgent,
@@ -49,6 +52,7 @@ import type {
   AcpDirListing,
   AcpHost,
   AcpHostFileContent,
+  AcpHostSnapshot,
   AcpPermissionPolicy,
   AcpSession,
   AcpThinkingLevel,
@@ -62,6 +66,7 @@ let unlistenConfirm: (() => void) | null = null;
 let unlistenStatus: (() => void) | null = null;
 let unlistenLocalEvent: (() => void) | null = null;
 let startedServer: string | null = null;
+let cloudTransferRunning = false;
 
 let memLocalHostId: string | null = null;
 let memLocalMeta: { install_id: string; name: string; os: string; roots: string[] } | null = null;
@@ -202,6 +207,10 @@ async function ensureLocalEventBridge(): Promise<void> {
       "acp-host:local-event",
       (ev) => {
         if (!ev.payload) return;
+        const current = getState().me?.id
+          ? JSON.stringify([getServer(), getState().me!.id])
+          : null;
+        if (!current || !localVaultOwnerMatches(current)) return;
         const delta = applyLocalRunnerEvent(ev.payload);
         if (delta.agent || delta.workspace || delta.session || delta.activity) {
           setState((cur) => {
@@ -252,191 +261,258 @@ async function ensureLocalEventBridge(): Promise<void> {
   } catch {}
 }
 
-/**
- * 切换「本机允许被云端控制」开关：
- * - 关闭时：立即断开本机宿主 WS，将本机当前配置转入纯本地存储（保持本机正常使用），并调用 deleteHost 从云端彻底删除本机全部数据且停止一切同步；
- * - 开启时：恢复本机宿主 WS 连接，并将纯本地存储中的 Agent、工作区与会话同步上云。
- */
+function assertCompleteSnapshot(snapshot: AcpHostSnapshot) {
+  if (snapshot.sessions.some((item) => item.running)) {
+    throw new Error("请先结束本机正在运行的 ACP 任务，再切换云端控制");
+  }
+  const fileIds = new Set(snapshot.attachments.map((att) => att.id));
+  for (const item of snapshot.sessions) {
+    for (const turn of item.turns ?? []) {
+      if (!Array.isArray(turn.payload.attachments)) continue;
+      for (const att of turn.payload.attachments) {
+        if (!att || typeof att.id !== "string" || !fileIds.has(att.id)) {
+          throw new Error("ACP 历史记录引用了缺失的附件，已保留原始数据");
+        }
+      }
+    }
+  }
+}
+
+function showLocalVault(vault: ReturnType<typeof getLocalVault>, cloudHostId: string | null) {
+  const host = vault.host!;
+  const workspaceIds = new Set(vault.workspaces.map((item) => item.id));
+  setState((cur) => {
+    const excluded = new Set(
+      cur.acpWorkspaces.filter((item) =>
+        item.host_id === cloudHostId || item.host_id === host.id,
+      ).map((item) => item.id),
+    );
+    return {
+      acpHosts: [host, ...cur.acpHosts.filter((item) => item.id !== cloudHostId && item.id !== host.id)],
+      acpAgents: [...vault.agents, ...cur.acpAgents.filter((item) =>
+        item.host_id !== cloudHostId && item.host_id !== host.id)],
+      acpWorkspaces: [...vault.workspaces, ...cur.acpWorkspaces.filter((item) =>
+        item.host_id !== cloudHostId && item.host_id !== host.id)],
+      acpSessions: [...vault.sessions, ...cur.acpSessions.filter((item) =>
+        !workspaceIds.has(item.workspace_id) && !excluded.has(item.workspace_id))],
+      activeAcpHostId: cur.activeAcpHostId === cloudHostId ? host.id : (cur.activeAcpHostId ?? host.id),
+    };
+  });
+}
+
+function waitForCloudHost(): { ready: Promise<void>; stop: () => void } {
+  let stop = () => {};
+  const ready = new Promise<void>((resolve) => {
+    const onReady = () => {
+      stop();
+      resolve();
+    };
+    const timeout = setTimeout(onReady, 6000);
+    stop = () => {
+      clearTimeout(timeout);
+      hostReadyWaiters.delete(onReady);
+    };
+    hostReadyWaiters.add(onReady);
+  });
+  return { ready, stop };
+}
+
 export async function setCloudControlEnabled(enabled: boolean): Promise<LocalPolicyView> {
   if (!isDesktopShell()) {
     return { allow_all_local: false, cloud_control_enabled: true, approved_count: 0 };
   }
+  if (cloudTransferRunning) throw new Error("已有 ACP 数据切换正在进行");
+  cloudTransferRunning = true;
+  try {
+    return await transferCloudControl(enabled);
+  } finally {
+    cloudTransferRunning = false;
+  }
+}
+
+async function transferCloudControl(enabled: boolean): Promise<LocalPolicyView> {
+  const generation = session();
+  const serverUrl = getServer();
+  const owner = JSON.stringify([serverUrl, getState().me?.id]);
+  if (getLocalVault().owner && getLocalVault().owner !== owner) {
+    throw new Error("请切回原账号继续同步本地 ACP 数据");
+  }
+  const ensureCurrentAccount = () => {
+    if (generation !== session() || serverUrl !== getServer()) {
+      throw new Error("登录账号已变更，已中止 ACP 数据切换");
+    }
+  };
   await ensureLocalEventBridge();
   const meta = await fetchLocalHostMeta();
+  ensureCurrentAccount();
+  if (meta.install_id === "local-host") throw new Error("无法确认本机 ACP 宿主身份");
+
+  async function deleteSavedCloudSource() {
+    const source = getLocalVault().cloudSource;
+    if (!source) return;
+    if (source.owner !== owner) throw new Error("请切回原账号继续同步本地 ACP 数据");
+    ensureCurrentAccount();
+    await acp.deleteHostSnapshot(meta.install_id, source.revision);
+    ensureCurrentAccount();
+    confirmLocalVaultCloudRemoval();
+  }
 
   if (!enabled) {
-    const cur = getState();
-    const cloudHost =
-      cur.acpHosts.find((h) => h.id === (memLocalHostId ?? readStoredLocalHostId())) ??
-      cur.acpHosts.find(
-        (h) => h.ip === "Client-Daemon" && (!meta.os || h.os === meta.os),
-      ) ??
-      null;
-    const cloudHostId = cloudHost?.id ?? memLocalHostId ?? readStoredLocalHostId();
-
-    const policy = await tauriInvoke<LocalPolicyView>("acp_host_set_cloud_control", {
-      enabled: false,
-    });
+    let cloudHostId = getLocalVault().cloudSource?.hostId ?? meta.host_id;
+    if (!isLocalOnlyActive()) {
+      const exported = await acp.exportHostSnapshot(meta.install_id);
+      ensureCurrentAccount();
+      const snapshot = exported?.snapshot;
+      if (snapshot) {
+        cloudHostId = snapshot.host.id;
+        assertCompleteSnapshot(snapshot);
+        for (const item of snapshot.attachments) {
+          const blob = await acp.fetchFileBlob(item.id);
+          ensureCurrentAccount();
+          if (blob.size !== item.size) throw new Error(`云端附件不完整：${item.file_name}`);
+          await storeLocalAcpBlob(item.id, blob);
+        }
+      }
+      ensureCurrentAccount();
+      const host: AcpHost = snapshot
+        ? { ...snapshot.host, id: meta.install_id }
+        : {
+            id: meta.install_id,
+            name: meta.name,
+            os: meta.os,
+            ip: "Local-Only",
+            roots: meta.roots,
+            online: true,
+            latency_ms: 0,
+            last_seen: new Date().toISOString(),
+          };
+      const sourceAgents = snapshot?.agents ?? [];
+      activateLocalVault({
+        host,
+        agents: sourceAgents.map((agent) => ({
+          ...agent,
+          env: Object.fromEntries(Object.entries(agent.env).map(([key, value]) => [key, value ? "••••••••" : ""])),
+        })),
+        agentSecrets: Object.fromEntries(sourceAgents.map((agent) => [agent.id, agent.env])),
+        workspaces: snapshot?.workspaces ?? [],
+        sessions: snapshot?.sessions ?? [],
+        attachments: snapshot?.attachments ?? [],
+        owner,
+        cloudSource: exported ? { owner, hostId: exported.snapshot.host.id, revision: exported.revision } : null,
+      });
+    }
+    const policy = await tauriInvoke<LocalPolicyView>("acp_host_set_cloud_control", { enabled: false });
+    ensureCurrentAccount();
     startedServer = null;
     setLocalAcpHostId(null);
-
-    const localHostId = meta.install_id;
-    const baseHost: AcpHost = cloudHost
-      ? { ...cloudHost, id: localHostId }
-      : {
-          id: localHostId,
-          name: meta.name,
-          os: meta.os,
-          ip: "Local-Only",
-          roots: meta.roots,
-          online: true,
-          latency_ms: 0,
-          last_seen: new Date().toISOString(),
-        };
-
-    const hostAgents = cloudHostId
-      ? cur.acpAgents.filter((a) => a.host_id === cloudHostId)
-      : [];
-    const hostWorkspaces = cloudHostId
-      ? cur.acpWorkspaces.filter((w) => w.host_id === cloudHostId)
-      : [];
-    const wsIds = new Set(hostWorkspaces.map((w) => w.id));
-    const hostSessions = cur.acpSessions.filter((s) => wsIds.has(s.workspace_id));
-
-    for (const a of hostAgents) clearPendingAgentPatch(a.id);
-    for (const w of hostWorkspaces) clearPendingWorkspacePatch(w.id);
-    for (const s of hostSessions) clearPendingSessionPatch(s.id);
-
-    const v = activateLocalVault({
-      host: baseHost,
-      agents: hostAgents,
-      workspaces: hostWorkspaces,
-      sessions: hostSessions,
-    });
-
-    setState((st) => {
-      const otherHosts = st.acpHosts.filter(
-        (h) => h.id !== cloudHostId && h.id !== v.host!.id,
-      );
-      const otherAgents = st.acpAgents.filter(
-        (a) => a.host_id !== cloudHostId && a.host_id !== v.host!.id,
-      );
-      const otherWorkspaces = st.acpWorkspaces.filter(
-        (w) => w.host_id !== cloudHostId && w.host_id !== v.host!.id,
-      );
-      const otherSessions = st.acpSessions.filter((s) => !wsIds.has(s.workspace_id));
-      return {
-        acpHosts: [v.host!, ...otherHosts],
-        acpAgents: [...v.agents, ...otherAgents],
-        acpWorkspaces: [...v.workspaces, ...otherWorkspaces],
-        acpSessions: [...v.sessions, ...otherSessions],
-        activeAcpHostId:
-          st.activeAcpHostId === cloudHostId ? v.host!.id : (st.activeAcpHostId ?? v.host!.id),
-      };
-    });
-
-    if (cloudHostId && cloudHost?.ip !== "Local-Only") {
-      await acp.deleteHost(cloudHostId);
+    showLocalVault(getLocalVault(), cloudHostId);
+    try {
+      await deleteSavedCloudSource();
+    } catch (error) {
+      throw new Error(`本地快照已保存，云端副本仍待清理：${error instanceof Error ? error.message : String(error)}`);
     }
     return policy;
   }
 
-  // 重新开启云端控制：恢复 WS 连接并将纯本地数据上云
-  const policy = await tauriInvoke<LocalPolicyView>("acp_host_set_cloud_control", {
-    enabled: true,
-  });
-  const localSnap = deactivateAndTakeLocalVault();
-  const srv = getServer() || (typeof window !== "undefined" ? window.location.origin : "");
-
-  const waitHostId = new Promise<string | null>((resolve) => {
-    const timer = setTimeout(() => {
-      hostReadyWaiters.delete(onReady);
-      resolve(getLocalAcpHostId());
-    }, 6000);
-    const onReady = (hid: string) => {
-      clearTimeout(timer);
-      hostReadyWaiters.delete(onReady);
-      resolve(hid);
-    };
-    hostReadyWaiters.add(onReady);
-  });
-
-  await startAcpHost(srv);
-  const newCloudHostId = (await waitHostId) ?? getLocalAcpHostId();
-
-  if (newCloudHostId && localSnap.host) {
-    if (localSnap.host.name && localSnap.host.name !== meta.name) {
-      await acp.renameHost(newCloudHostId, localSnap.host.name).catch(() => {});
-    }
-    const agentIdMap = new Map<string, string>();
-    for (const ag of localSnap.agents) {
-      try {
-        const rawEnv = localSnap.agentSecrets[ag.id];
-        const created = await acp.createAgent({
-          host_id: newCloudHostId,
-          preset: ag.preset,
-          name: ag.name,
-          adapter: ag.adapter,
-          cmd: ag.cmd,
-          env: rawEnv && Object.keys(rawEnv).length ? rawEnv : undefined,
-          local_probed: true,
-          status: ag.status,
-          default_model: ag.default_model,
-          model_options: ag.model_options,
-        });
-        agentIdMap.set(ag.id, created.id);
-        if (ag.permission_override !== "inherit") {
-          await acp
-            .updateAgent(created.id, { permission_override: ag.permission_override })
-            .catch(() => {});
-        }
-      } catch {}
-    }
-
-    const wsIdMap = new Map<string, string>();
-    for (const ws of localSnap.workspaces) {
-      try {
-        const createdWs = await acp.createWorkspace({
-          host_id: newCloudHostId,
-          cwd: ws.cwd,
-          name: ws.name,
-          local_probed: true,
-          branch: ws.branch,
-          branches: ws.branches,
-        });
-        wsIdMap.set(ws.id, createdWs.id);
-      } catch {}
-    }
-
-    for (const sess of localSnap.sessions) {
-      const mappedWs = wsIdMap.get(sess.workspace_id);
-      const mappedAg = agentIdMap.get(sess.agent_id);
-      if (!mappedWs || !mappedAg) continue;
-      try {
-        const createdSess = await acp.createSession({
-          workspace_id: mappedWs,
-          agent_id: mappedAg,
-          title: sess.title,
-          skip_model_probe: true,
-        });
-        await acp
-          .updateSession(createdSess.id, {
-            selected_model: sess.selected_model,
-            thinking_level: sess.thinking_level,
-            permission_policy: sess.permission_policy,
-          })
-          .catch(() => {});
-      } catch {}
-    }
+  const currentVault = getLocalVault();
+  if (!currentVault.active || !currentVault.host) {
+    const policy = await tauriInvoke<LocalPolicyView>("acp_host_set_cloud_control", { enabled: true });
+    ensureCurrentAccount();
+    await startAcpHost(serverUrl);
+    return policy;
   }
-
+  await deleteSavedCloudSource();
+  const active = getLocalVault();
+  const snapshot: AcpHostSnapshot = {
+    host: active.host!,
+    agents: active.agents.map((agent) => ({ ...agent, env: active.agentSecrets[agent.id] ?? {} })),
+    workspaces: active.workspaces,
+    sessions: active.sessions,
+    attachments: Object.values(active.attachments).filter((att) =>
+      active.sessions.some((item) => item.id === att.session_id),
+    ),
+  };
+  assertCompleteSnapshot(snapshot);
+  const transferId = beginLocalVaultImport(owner);
+  const watch = waitForCloudHost();
   try {
-    const bs = await acp.bootstrap();
-    setState((cur) => applyAcpBootstrap(cur, bs));
-  } catch {}
+    const policy = await tauriInvoke<LocalPolicyView>("acp_host_set_cloud_control", { enabled: true });
+    ensureCurrentAccount();
+    await startAcpHost(serverUrl);
+    ensureCurrentAccount();
+    let target = await acp.exportHostSnapshot(meta.install_id);
+    if (!target?.snapshot.host.online) {
+      await watch.ready;
+      ensureCurrentAccount();
+      target = await acp.exportHostSnapshot(meta.install_id);
+    }
+    if (!target?.snapshot.host.online) throw new Error("本机还未连上云端，已保留本地快照");
+    ensureCurrentAccount();
 
-  return policy;
+    if (target.import_id !== transferId) {
+      if (target.snapshot.agents.length || target.snapshot.workspaces.length) {
+        throw new Error("云端宿主已有数据，已保留本地快照");
+      }
+      for (const item of snapshot.attachments) {
+        const blob = await readLocalAcpBlob(item.id);
+        ensureCurrentAccount();
+        if (!blob || blob.size !== item.size) throw new Error(`本地附件缺失或不完整：${item.file_name}`);
+        const copied = await acp.uploadTransferFile(item, blob);
+        if (copied.id !== item.id || copied.size !== item.size ||
+            copied.file_name !== item.file_name || copied.mime !== item.mime) {
+          throw new Error(`云端附件校验失败：${item.file_name}`);
+        }
+      }
+      ensureCurrentAccount();
+      if (getLocalVault().cloudImport?.id !== transferId) {
+        throw new Error("本地数据在同步期间发生变化，已保留本地快照");
+      }
+      const receipt = await acp.importHostSnapshot(meta.install_id, transferId, snapshot);
+      if (receipt.host_id !== target.snapshot.host.id || receipt.transfer_id !== transferId) {
+        throw new Error("未收到正确的 ACP 导入确认，已保留本地快照");
+      }
+    } else {
+      const copiedFiles = new Set(target.snapshot.attachments.map((att) => att.id));
+      if (snapshot.attachments.some((att) => !copiedFiles.has(att.id))) {
+        throw new Error("云端附件记录已发生变化，已保留本地快照");
+      }
+    }
+    ensureCurrentAccount();
+    const bootstrap = await acp.bootstrap();
+    ensureCurrentAccount();
+    const hostId = target.snapshot.host.id;
+    const agentIds = new Set(bootstrap.agents.filter((item) => item.host_id === hostId).map((item) => item.id));
+    const wsIds = new Set(bootstrap.workspaces.filter((item) => item.host_id === hostId).map((item) => item.id));
+    const cloudSessions = new Map(bootstrap.sessions.filter((item) => wsIds.has(item.workspace_id)).map((item) => [item.id, item]));
+    if (!bootstrap.hosts.some((item) => item.id === hostId)
+      || snapshot.agents.some((item) => !agentIds.has(item.id))
+      || snapshot.workspaces.some((item) => !wsIds.has(item.id))
+      || snapshot.sessions.some((item) => {
+        const remote = cloudSessions.get(item.id);
+        const remoteTurnIds = new Set(remote?.turns?.map((turn) => turn.id));
+        return !remote || item.turns?.some((turn) => !remoteTurnIds.has(turn.id));
+      })) {
+      throw new Error("云端快照校验失败，已保留本地快照");
+    }
+    if (getLocalVault().cloudImport?.id !== transferId) {
+      throw new Error("本地数据在同步期间发生变化，已保留本地快照");
+    }
+    completeLocalVaultImport();
+    setLocalAcpHostId(hostId);
+    setState((cur) => applyAcpBootstrap(cur, bootstrap));
+    return policy;
+  } catch (error) {
+    if (generation === session() && serverUrl === getServer()) {
+      await tauriInvoke("acp_host_set_cloud_control", { enabled: false }).catch(() => {});
+      startedServer = null;
+      setLocalAcpHostId(null);
+    }
+    throw error;
+  } finally {
+    watch.stop();
+  }
 }
+
 
 // ---------- 本地优先修改 + 后台合并异步同步到服务器（纯本地模式完全不同步） ----------
 
@@ -1039,21 +1115,12 @@ function rememberAcpBlob(id: string, blob: Blob) {
   }
 }
 
-function base64ToBlob(b64: string, mime: string): Blob {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) {
-    bytes[i] = bin.charCodeAt(i);
-  }
-  return new Blob([bytes], { type: mime || "application/octet-stream" });
-}
-
 export async function uploadAttachmentLocalFirst(
   file: File,
   sessionId: string,
 ): Promise<AcpAttachment> {
   const att = isLocalVaultSession(sessionId)
-    ? await stageLocalAttachment(file)
+    ? await stageLocalAttachment(file, sessionId)
     : await acp.uploadFile(file, sessionId);
   rememberAcpBlob(att.id, file);
   return att;
@@ -1062,14 +1129,13 @@ export async function uploadAttachmentLocalFirst(
 export async function fetchAcpAttachmentBlobLocalFirst(
   att: AcpAttachment,
 ): Promise<Blob> {
-  const mem = recentUploadedAcpBlobs.get(att.id);
-  if (mem) return mem;
-  const staged = getStagedLocalAttachment(att.id);
-  if (staged) {
-    const blob = base64ToBlob(staged.data_base64, staged.mime);
-    rememberAcpBlob(att.id, blob);
+  if (getLocalVault().attachments[att.id]) {
+    const blob = await readLocalAcpBlob(att.id);
+    if (!blob || blob.size !== att.size) throw new Error(`本地附件缺失或不完整：${att.file_name}`);
     return blob;
   }
+  const mem = recentUploadedAcpBlobs.get(att.id);
+  if (mem) return mem;
   const fetched = await acp.fetchFileBlob(att.id);
   rememberAcpBlob(att.id, fetched);
   return fetched;
@@ -1079,13 +1145,9 @@ export async function downloadAcpAttachmentLocalFirst(
   id: string,
   fileName: string,
 ): Promise<void> {
-  const localBlob =
-    recentUploadedAcpBlobs.get(id) ??
-    (() => {
-      const staged = getStagedLocalAttachment(id);
-      return staged ? base64ToBlob(staged.data_base64, staged.mime) : null;
-    })();
-  if (localBlob && isLocalOnlyActive()) {
+  const local = getLocalVault().attachments[id];
+  if (local) {
+    const localBlob = await fetchAcpAttachmentBlobLocalFirst(local);
     const url = URL.createObjectURL(localBlob);
     const a = document.createElement("a");
     a.href = url;
@@ -1116,7 +1178,7 @@ export async function sendPromptLocalFirst(
   if (isLocalVaultSession(sess.id)) {
     if (!ws || !ag) throw new Error("工作区或 Agent 不存在");
     await ensureLocalEventBridge();
-    const staged = takeStagedLocalAttachments(body.attachments.map((a) => a.id));
+    const staged = await getLocalPromptAttachments(body.attachments);
     const claimed = appendLocalUserTurnAndStart(sess.id, body);
     if (!claimed) throw new Error("未找到本地会话");
 
@@ -1141,7 +1203,8 @@ export async function sendPromptLocalFirst(
       await tauriInvoke("acp_host_local_prompt_start", {
         msg: {
           session_id: sess.id,
-          acp_session_key: sess.acp_session_key,
+          run_id: claimed.session.run_id,
+          acp_session_key: claimed.session.acp_session_key,
           cwd: ws.cwd,
           agent: {
             id: ag.id,
@@ -1162,11 +1225,10 @@ export async function sendPromptLocalFirst(
         },
       });
     } catch (e) {
-      const rolled = patchLocalVaultSession(sess.id, { running: false });
+      const rolled = settleLocalSessionOnCancel(sess.id, claimed.session.run_id);
+      if (!rolled || rolled.running) throw e;
       setState((cur) => {
-        const nextSess = cur.acpSessions.map((x) =>
-          x.id === sess.id ? (rolled ?? { ...x, running: false }) : x,
-        );
+        const nextSess = cur.acpSessions.map((x) => (x.id === sess.id ? rolled : x));
         return {
           acpSessions: nextSess,
           ...applyAcpEvent({ ...cur, acpSessions: nextSess }, "session_activity", {
@@ -1189,23 +1251,31 @@ export async function sendPromptLocalFirst(
     thinking_level: body.thinking_level,
     permission_policy: body.permission_policy,
   });
-  setState((cur) =>
-    applyAcpEvent(cur, "session_activity", {
-      session_id: sess.id,
-      phase: "connecting",
-      detail: "等待 Agent 响应…",
-    }),
-  );
+  if (turn.payload.run_id === undefined) {
+    // Older servers still need the optimistic activity until their running state arrives.
+    setState((cur) =>
+      applyAcpEvent(cur, "session_activity", {
+        session_id: sess.id,
+        phase: "connecting",
+        detail: "等待 Agent 响应…",
+      }),
+    );
+  }
   return { localHandled: false, turn };
 }
 
 export async function cancelSessionLocalFirst(sess: AcpSession): Promise<AcpSession> {
   if (isLocalVaultSession(sess.id)) {
-    await tauriInvoke("acp_host_local_prompt_cancel", { sessionId: sess.id });
-    const updated = settleLocalSessionOnCancel(sess.id) ?? {
+    await tauriInvoke("acp_host_local_prompt_cancel", {
+      sessionId: sess.id,
+      runId: sess.run_id ?? null,
+    });
+    const updated = settleLocalSessionOnCancel(sess.id, sess.run_id) ?? {
       ...sess,
       running: false,
+      run_id: null,
     };
+    if (updated.running) return updated;
     setState((cur) => {
       const nextSess = cur.acpSessions.map((x) => (x.id === sess.id ? updated : x));
       return {
@@ -1223,7 +1293,13 @@ export async function cancelSessionLocalFirst(sess: AcpSession): Promise<AcpSess
     });
     return updated;
   }
-  return acp.cancelSession(sess.id);
+  const updated = await acp.cancelSession(sess.id, sess.run_id);
+  const current = getState().acpSessions.find((s) => s.id === sess.id);
+  // Another device can already have started a new run by the time this HTTP reply arrives.
+  if (current?.run_id && current.run_id !== sess.run_id && current.run_id !== updated.run_id) {
+    return current;
+  }
+  return updated;
 }
 
 export async function replyPermissionLocalFirst(
@@ -1253,7 +1329,9 @@ export async function startAcpHost(serverUrl: string): Promise<void> {
 
   const [policy, meta] = await Promise.all([getLocalPolicy(), fetchLocalHostMeta()]);
   if (!policy.cloud_control_enabled) {
-    const v = ensureLocalOnlyHost(meta);
+    const owner = getLocalVault().owner;
+    if (owner && owner !== JSON.stringify([serverUrl, getState().me?.id])) return;
+    const v = ensureLocalOnlyHost(meta, JSON.stringify([serverUrl, getState().me?.id]));
     setState((cur) => ({
       acpHosts: [v.host!, ...cur.acpHosts.filter((h) => h.id !== v.host!.id)],
       acpAgents: [

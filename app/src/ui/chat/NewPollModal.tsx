@@ -1,3 +1,4 @@
+import { newClientId } from "../../clientId";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, polls, session } from "../../api";
 import { applyLiveMessage, getState, setState } from "../../store";
@@ -10,7 +11,7 @@ export function preparePollSubmission(draft: CreatePollReq, previous: CreatePoll
   if (payload.options.length < 2 || payload.options.length > 10) throw new Error("需 2–10 个不同选项");
   if (payload.options.some((o) => Array.from(o).length > 100)) throw new Error("选项每项 1–100 字");
   if (payload.expires_at && (!Number.isFinite(Date.parse(payload.expires_at)) || Date.parse(payload.expires_at) <= Date.now())) throw new Error("截止时间必须在未来");
-  return { ...payload, client_msg_id: crypto.randomUUID() };
+  return { ...payload, client_msg_id: newClientId() };
 }
 
 /**

@@ -164,6 +164,9 @@ pub async fn handle_session(
                         }
                         match msg {
                             Message::Text(text) => {
+                                let Some(_storage) = crate::backup::storage_operation(&st) else {
+                                    continue;
+                                };
                                 if !on_text(&st, uid, conn_id, grant.session_version, grant.sid, &tx, &text).await {
                                     send_timed(&mut sink, Message::Close(None), t).await;
                                     break;
@@ -194,6 +197,9 @@ where
 
 /// 最后一个连接断开或被踢下线后广播离线。epoch 已经变了就放弃，避免盖住刚连上的设备。
 pub async fn publish_offline(st: &SharedState, uid: Uuid, epoch: u64) {
+    let Some(_storage) = crate::backup::storage_operation(st) else {
+        return;
+    };
     if !st.epoch_is(uid, epoch) || st.is_online(uid) {
         return;
     }
@@ -277,8 +283,9 @@ pub async fn post_and_broadcast(
     msg: domain::PostMessage<'_>,
 ) -> Result<domain::Posted, domain::PostError> {
     let conv = msg.conversation_id;
+    let client_msg_id = msg.client_msg_id;
     let posted = domain::post_message(&st.pool, msg).await?;
-    broadcast_posted(st, conv, &posted).await;
+    broadcast_posted_inner(st, conv, &posted, true, client_msg_id).await;
     Ok(posted)
 }
 
@@ -297,11 +304,31 @@ pub async fn broadcast_posted_push(
     posted: &domain::Posted,
     with_push: bool,
 ) {
+    broadcast_posted_inner(st, conv, posted, with_push, None).await;
+}
+
+async fn broadcast_posted_inner(
+    st: &SharedState,
+    conv: Uuid,
+    posted: &domain::Posted,
+    with_push: bool,
+    client_msg_id: Option<&str>,
+) {
     if posted.inserted {
-        let p = frame(&WsOut::Message {
+        let message_frame = |key: Option<&str>| frame(&WsOut::Message {
             message: posted.message.clone(),
+            client_msg_id: key.map(str::to_owned),
         });
-        st.send_to_users(&posted.member_ids, &p);
+        let public = message_frame(None);
+        if let Some(key) = client_msg_id {
+            let sender = message_frame(Some(key));
+            for uid in &posted.member_ids {
+                let payload = if *uid == posted.message.sender_id { &sender } else { &public };
+                st.send_to_user(*uid, payload);
+            }
+        } else {
+            st.send_to_users(&posted.member_ids, &public);
+        }
         // 发送者已读位置在事务内推进到这条：同步给他的其他设备清角标。
         st.send_to_user(
             posted.message.sender_id,

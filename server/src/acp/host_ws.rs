@@ -57,16 +57,18 @@ pub async fn host_session(
         json!([])
     };
 
+    let Some(storage) = crate::backup::storage_operation(&st) else {
+        let _ = socket.send(Message::Close(None)).await;
+        return Ok(());
+    };
     let host_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO acp_hosts (user_id, install_id, name, os, ip, roots_json, online, latency_ms, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6, true, 0, now())
+         VALUES ($1, $2, $3, $4, $5, $6, false, 0, now())
          ON CONFLICT (user_id, install_id)
          DO UPDATE SET
              os = EXCLUDED.os,
              ip = EXCLUDED.ip,
-             roots_json = EXCLUDED.roots_json,
-             online = true,
-             last_seen = now()
+             roots_json = EXCLUDED.roots_json
          RETURNING id",
     )
     .bind(uid)
@@ -83,27 +85,38 @@ pub async fn host_session(
     };
 
     let conn_id = Uuid::new_v4();
+    let run_ids = hello["run_ids"].as_bool() == Some(true);
     let (tx, mut rx) = mpsc::channel::<ConnMsg>(crate::state::CONN_QUEUE);
-    let superseded = st.register_acp_host(host_id, uid, conn_id, sid, tx.clone());
-
-    if !crate::auth::grant_valid(&st.pool, uid, grant.session_version, sid).await {
-        st.unregister_acp_host(host_id, conn_id);
-        let _ = socket.send(Message::Close(None)).await;
-        return Ok(());
+    {
+        let _lifecycle = st.lock_acp_host(host_id).await;
+        if !crate::auth::grant_valid(&st.pool, uid, grant.session_version, sid).await {
+            let _ = socket.send(Message::Close(None)).await;
+            return Ok(());
+        }
+        let online = sqlx::query(
+            "UPDATE acp_hosts SET online = true, latency_ms = 0, last_seen = now() WHERE id = $1",
+        )
+        .bind(host_id)
+        .execute(&st.pool)
+        .await;
+        if !matches!(online, Ok(result) if result.rows_affected() == 1) {
+            let _ = socket.send(Message::Close(None)).await;
+            return Ok(());
+        }
+        // Hold the lifecycle lock until old runs are settled, before this connection can receive
+        // a prompt. An old socket cannot mutate the replacement or its newly started runs.
+        if st.register_acp_host(host_id, uid, conn_id, sid, tx.clone(), run_ids) {
+            st.fail_acp_host_rpcs(host_id);
+        }
+        settle_host_running_sessions(&st, uid, host_id).await;
+        let _ = tx.try_send(ConnMsg::Frame(
+            json!({ "type": "host_ready", "host_id": host_id }).to_string(),
+        ));
+        if let Ok(h) = load_host(&st, uid, host_id).await {
+            broadcast_acp(&st, uid, "host_upserted", json!({ "host": h }));
+        }
     }
-
-    if superseded {
-        st.fail_acp_host_rpcs(host_id);
-    }
-    // 新建立的宿主 WS 连接不继承旧连接的在途任务；若重连顶替了旧连接或曾非正常断连，在此立即收敛遗留运行态
-    settle_host_running_sessions(&st, uid, host_id).await;
-
-    let _ = tx.try_send(ConnMsg::Frame(
-        json!({ "type": "host_ready", "host_id": host_id }).to_string(),
-    ));
-    if let Ok(h) = load_host(&st, uid, host_id).await {
-        broadcast_acp(&st, uid, "host_upserted", json!({ "host": h }));
-    }
+    drop(storage);
 
     let (mut sink, mut stream) = socket.split();
     let ping_every = Duration::from_millis(st.ws_ping_interval_ms.load(Ordering::Relaxed).max(10));
@@ -136,11 +149,25 @@ pub async fn host_session(
                 match frame {
                     Some(Ok(Message::Text(txt))) => {
                         last_inbound = Instant::now();
-                        handle_host_frame(&st, uid, host_id, &txt).await;
+                        let Some(_storage) = crate::backup::storage_operation(&st) else {
+                            break;
+                        };
+                        let _lifecycle = st.lock_acp_host(host_id).await;
+                        if !is_current_host(&st, host_id, conn_id) {
+                            break;
+                        }
+                        handle_host_frame(&st, uid, host_id, run_ids, &txt).await;
                     }
                     Some(Ok(Message::Pong(_))) => {
                         last_inbound = Instant::now();
                         if let Some(sent) = last_ping_sent.take() {
+                            let Some(_storage) = crate::backup::storage_operation(&st) else {
+                                break;
+                            };
+                            let _lifecycle = st.lock_acp_host(host_id).await;
+                            if !is_current_host(&st, host_id, conn_id) {
+                                break;
+                            }
                             let ms = sent.elapsed().as_millis().min(9999) as i32;
                             let changed = last_latency_reported
                                 .map(|prev| (prev - ms).abs() >= 5)
@@ -187,8 +214,14 @@ pub async fn host_session(
         }
     }
 
+    let storage = crate::backup::storage_operation(&st);
+    let _lifecycle = st.lock_acp_host(host_id).await;
     if st.unregister_acp_host(host_id, conn_id) {
         st.fail_acp_host_rpcs(host_id);
+        let Some(_storage) = storage else {
+            // A new connection settles leftover runs after maintenance.
+            return Ok(());
+        };
         let _ = sqlx::query(
             "UPDATE acp_hosts SET online = false, latency_ms = 0, last_seen = now() WHERE id = $1",
         )
@@ -206,10 +239,16 @@ pub async fn host_session(
     Ok(())
 }
 
+fn is_current_host(st: &SharedState, host_id: Uuid, conn_id: Uuid) -> bool {
+    st.acp_hosts
+        .get(&host_id)
+        .is_some_and(|conn| conn.conn_id == conn_id)
+}
+
 /// 停止该宿主所有正在进行的会话、拒绝挂起的权限卡片并收敛流式与进行中工具块，防止断连/重连顶替后前端卡在运行态。
 async fn settle_host_running_sessions(st: &SharedState, uid: Uuid, host_id: Uuid) {
     let paused_sessions = sqlx::query_scalar::<_, Uuid>(
-        "UPDATE acp_sessions s SET running = false, updated_at = now()
+        "UPDATE acp_sessions s SET running = false, run_id = NULL, updated_at = now()
           FROM acp_workspaces w
          WHERE s.acp_workspace_id = w.id AND w.acp_host_id = $1 AND s.running = true
          RETURNING s.id",
@@ -311,7 +350,7 @@ async fn settle_host_running_sessions(st: &SharedState, uid: Uuid, host_id: Uuid
     }
 }
 
-async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str) {
+async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, run_ids: bool, raw: &str) {
     if raw.len() > 8 * 1024 * 1024 {
         tracing::warn!(host_id = %host_id, bytes = raw.len(), "dropping oversized acp host frame");
         return;
@@ -322,6 +361,13 @@ async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str
     let Some(kind) = v["type"].as_str() else {
         return;
     };
+
+    if matches!(kind, "agent_status" | "agent_models")
+        && !v["run_id"].is_null()
+        && matching_run(st, uid, host_id, run_ids, &v).await.is_none()
+    {
+        return;
+    }
 
     match kind {
         "rpc_result" => {
@@ -391,21 +437,25 @@ async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str
             .await;
         }
         "session_update" => {
-            handle_session_update(st, uid, host_id, &v).await;
+            handle_session_update(st, uid, host_id, run_ids, &v).await;
         }
         _ => {}
     }
 }
 
-async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &Value) {
-    let Some(sess_id) = v["session_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
-        return;
-    };
-    let Some(ws_id) = sqlx::query_scalar::<_, Uuid>(
-        "SELECT s.acp_workspace_id
+async fn matching_run(
+    st: &SharedState,
+    uid: Uuid,
+    host_id: Uuid,
+    run_ids: bool,
+    v: &Value,
+) -> Option<(Uuid, Uuid, Option<Uuid>)> {
+    let sess_id = v["session_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())?;
+    let (ws_id, run_id) = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        "SELECT s.acp_workspace_id, s.run_id
            FROM acp_sessions s
            JOIN acp_workspaces w ON w.id = s.acp_workspace_id
-          WHERE s.id = $1 AND s.user_id = $2 AND w.acp_host_id = $3",
+          WHERE s.id = $1 AND s.user_id = $2 AND w.acp_host_id = $3 AND s.running",
     )
     .bind(sess_id)
     .bind(uid)
@@ -413,10 +463,22 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
     .fetch_optional(&st.pool)
     .await
     .ok()
-    .flatten() else {
+    .flatten()?;
+
+    let incoming_run = &v["run_id"];
+    if (run_ids || !incoming_run.is_null())
+        && incoming_run.as_str().and_then(|id| Uuid::parse_str(id).ok())
+            .is_none_or(|id| Some(id) != run_id)
+    {
+        return None;
+    }
+    Some((sess_id, ws_id, run_id))
+}
+
+async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, run_ids: bool, v: &Value) {
+    let Some((sess_id, ws_id, run_id)) = matching_run(st, uid, host_id, run_ids, v).await else {
         return;
     };
-
     let Some(kind) = v["kind"].as_str() else {
         return;
     };
@@ -425,17 +487,19 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
         "plan" => {
             let run_key = v["run_key"].as_str().unwrap_or("");
             let steps = v["steps"].clone();
-            let payload = json!({ "run_key": run_key, "steps": steps });
+            let payload = json!({ "run_key": run_key, "run_id": run_id, "steps": steps });
             let row = if !run_key.is_empty() {
                 sqlx::query(
                     "UPDATE acp_turns SET payload = $3, status = 'done', updated_at = now()
                       WHERE acp_session_id = $1 AND role = 'agent_plan'
                         AND payload->>'run_key' = $2
+                        AND payload->>'run_id' IS NOT DISTINCT FROM $4::uuid::text
                       RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
                 )
                 .bind(sess_id)
                 .bind(run_key)
                 .bind(&payload)
+                .bind(run_id)
                 .fetch_optional(&st.pool)
                 .await
                 .ok()
@@ -458,13 +522,13 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
             }
         }
         "text_delta" | "text" => {
-            upsert_stream_turn(st, sess_id, uid, "agent_text", kind, v).await;
+            upsert_stream_turn(st, sess_id, uid, run_id, "agent_text", kind, v).await;
         }
         "thought_delta" | "thought" => {
-            upsert_stream_turn(st, sess_id, uid, "agent_thought", kind, v).await;
+            upsert_stream_turn(st, sess_id, uid, run_id, "agent_thought", kind, v).await;
         }
         "tool_call" => {
-            handle_tool_call_update(st, sess_id, uid, v).await;
+            handle_tool_call_update(st, sess_id, uid, run_id, v).await;
         }
         "activity" => {
             let phase = truncate_chars(v["phase"].as_str().unwrap_or("").trim(), 40);
@@ -509,6 +573,7 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
         "permission_request" => {
             let payload = json!({
                 "req_id": v["req_id"].as_str().unwrap_or(""),
+                "run_id": run_id,
                 "tool_kind": v["tool_kind"].as_str().unwrap_or("tool"),
                 "command": v["command"].as_str().unwrap_or(""),
                 "cwd": v["cwd"].as_str().unwrap_or(""),
@@ -568,17 +633,24 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
         }
         "prompt_done" => {
             let acp_session_key = v["acp_session_key"].as_str().map(str::to_string);
-            let _ = sqlx::query(
+            let settled = sqlx::query(
                 "UPDATE acp_sessions
                     SET running = false,
+                        run_id = NULL,
                         acp_session_key = COALESCE($2, acp_session_key),
                         updated_at = now()
-                  WHERE id = $1",
+                  WHERE id = $1 AND run_id IS NOT DISTINCT FROM $3",
             )
             .bind(sess_id)
             .bind(&acp_session_key)
+            .bind(run_id)
             .execute(&st.pool)
             .await;
+            // A newer run may have claimed this session after the event was
+            // matched. Never settle its turns or overwrite its cancel state.
+            if settled.map(|result| result.rows_affected()).unwrap_or(0) == 0 {
+                return;
+            }
 
             // 将残留的流式正文与思考块收敛为 done
             let settled_streams = sqlx::query(
@@ -593,6 +665,27 @@ async fn handle_session_update(st: &SharedState, uid: Uuid, host_id: Uuid, v: &V
             .await
             .unwrap_or_default();
             for r in &settled_streams {
+                let tv = turn_from_row(r);
+                broadcast_acp(
+                    st,
+                    uid,
+                    "turn_upserted",
+                    json!({ "session_id": sess_id, "turn": tv }),
+                );
+            }
+
+            let expired_permissions = sqlx::query(
+                "UPDATE acp_turns SET status = 'rejected',
+                        payload = payload || jsonb_build_object('chosen_option', 'cancelled'),
+                        updated_at = now()
+                  WHERE acp_session_id = $1 AND role = 'permission' AND status = 'pending'
+                  RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
+            )
+            .bind(sess_id)
+            .fetch_all(&st.pool)
+            .await
+            .unwrap_or_default();
+            for r in &expired_permissions {
                 let tv = turn_from_row(r);
                 broadcast_acp(
                     st,
@@ -875,6 +968,7 @@ async fn upsert_stream_turn(
     st: &SharedState,
     sess_id: Uuid,
     uid: Uuid,
+    run_id: Option<Uuid>,
     role: &str,
     kind: &str,
     v: &Value,
@@ -915,6 +1009,7 @@ async fn upsert_stream_turn(
             "UPDATE acp_turns
                 SET payload = jsonb_strip_nulls(jsonb_build_object(
                         'turn_key', $4::text,
+                        'run_id', $9::uuid,
                         'text', CASE WHEN $5::text IS NOT NULL
                                      THEN left($5, 262144)
                                      ELSE left(COALESCE(payload->>'text', '') || $6::text, 262144)
@@ -927,6 +1022,7 @@ async fn upsert_stream_turn(
                   SELECT id FROM acp_turns
                    WHERE acp_session_id = $1 AND role = $2
                      AND payload->>'turn_key' = $3
+                     AND payload->>'run_id' IS NOT DISTINCT FROM $9::uuid::text
                    LIMIT 1
               )
               RETURNING id, acp_session_id, seq, role, status, payload, created_at, updated_at",
@@ -939,6 +1035,7 @@ async fn upsert_stream_turn(
         .bind(&delta)
         .bind(duration_ms)
         .bind(status)
+        .bind(run_id)
         .fetch_optional(&mut *tx)
         .await
         .unwrap_or(None)
@@ -950,7 +1047,7 @@ async fn upsert_stream_turn(
         Some(r) => Some(r),
         None => {
             let initial = full_text.unwrap_or(delta);
-            let mut initial_payload = json!({ "turn_key": turn_key, "text": initial });
+            let mut initial_payload = json!({ "turn_key": turn_key, "run_id": run_id, "text": initial });
             if let Some(ms) = duration_ms {
                 initial_payload["duration_ms"] = json!(ms);
             }
@@ -977,7 +1074,13 @@ async fn upsert_stream_turn(
     }
 }
 
-async fn handle_tool_call_update(st: &SharedState, sess_id: Uuid, uid: Uuid, v: &Value) {
+async fn handle_tool_call_update(
+    st: &SharedState,
+    sess_id: Uuid,
+    uid: Uuid,
+    run_id: Option<Uuid>,
+    v: &Value,
+) {
     let tool_call_id = v["tool_call_id"]
         .as_str()
         .map(str::trim)
@@ -1009,10 +1112,12 @@ async fn handle_tool_call_update(st: &SharedState, sess_id: Uuid, uid: Uuid, v: 
         "SELECT id, status, payload FROM acp_turns
           WHERE acp_session_id = $1 AND role = 'tool_call'
             AND payload->>'tool_call_id' = $2
+            AND payload->>'run_id' IS NOT DISTINCT FROM $3::uuid::text
           LIMIT 1",
     )
     .bind(sess_id)
     .bind(&tool_call_id)
+    .bind(run_id)
     .fetch_optional(&mut *tx)
     .await
     .ok()
@@ -1027,11 +1132,12 @@ async fn handle_tool_call_update(st: &SharedState, sess_id: Uuid, uid: Uuid, v: 
                 .unwrap_or_else(|| "in_progress".to_string())
         });
 
-    let merged_payload = merge_tool_call_payload(
+    let mut merged_payload = merge_tool_call_payload(
         existing.as_ref().map(|(_, _, p)| p),
         v,
         &tool_call_id,
     );
+    merged_payload["run_id"] = json!(run_id);
 
     let row = match existing {
         Some((turn_id, _, _)) => sqlx::query(

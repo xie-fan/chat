@@ -427,14 +427,34 @@ pub(super) async fn bot_updates(
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(q.timeout.min(UPDATES_MAX_WAIT_SECS));
     let wake = st.bot_wake.entry(bot).or_default().clone();
+    let maintenance_error = || AppError::coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "maintenance",
+        "服务维护中，请稍后",
+    );
+    let restoring = st.maintenance_started.notified();
+    tokio::pin!(restoring);
+    restoring.as_mut().enable();
+    if st.maintenance.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(maintenance_error());
+    }
     loop {
         // 先登记再查：查完到开始等的空档里来的消息也叫得醒
         let notified = wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         let events = take_updates(&st, bot, limit).await?;
-        if !events.is_empty() || tokio::time::timeout_at(deadline, notified).await.is_err() {
+        if !events.is_empty() {
             return Ok(Json(json!({ "events": events })));
+        }
+        tokio::select! {
+            biased;
+            _ = &mut restoring => return Err(maintenance_error()),
+            wait = tokio::time::timeout_at(deadline, notified) => {
+                if wait.is_err() {
+                    return Ok(Json(json!({ "events": [] })));
+                }
+            }
         }
     }
 }
@@ -488,6 +508,23 @@ async fn take_updates(st: &SharedState, bot: Uuid, limit: usize) -> AppResult<Ve
         convs.push(conv);
         cursors.push(cursor);
     }
+    // 先取得完整消息。查询失败时，交付游标与当前事务一起回退。
+    let mut events = Vec::with_capacity(ids.len());
+    if !ids.is_empty() {
+        let messages = sqlx::query_as::<_, domain::MsgViewRow>(
+            "SELECT * FROM message_views WHERE id = ANY($1) ORDER BY created_at, seq",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        if messages.len() != ids.len() {
+            return Err(AppError::conflict("消息在拉取期间变更，请重试"));
+        }
+        for message in messages {
+            let conv = message.conversation_id;
+            events.push(bot_event(bot, conv, &kinds[&conv], &message.into_view(bot)));
+        }
+    }
     sqlx::query(
         "UPDATE memberships m SET delivered_seq = v.seq
            FROM unnest($2::uuid[], $3::bigint[]) AS v(conv, seq)
@@ -499,22 +536,7 @@ async fn take_updates(st: &SharedState, bot: Uuid, limit: usize) -> AppResult<Ve
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = sqlx::query_as::<_, domain::MsgViewRow>(
-        "SELECT * FROM message_views WHERE id = ANY($1) ORDER BY created_at, seq",
-    )
-    .bind(&ids)
-    .fetch_all(&st.pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let conv = r.conversation_id;
-            bot_event(bot, conv, &kinds[&conv], &r.into_view(bot))
-        })
-        .collect())
+    Ok(events)
 }
 
 /// GET /bot/openapi.json：Bot API 的 OpenAPI 描述。不要令牌，agent 平台可以直接按这个地址导入；
@@ -545,9 +567,18 @@ fn bot_event(bot: Uuid, conv: Uuid, kind: &str, msg: &MessageView) -> Value {
 /// 私聊里 bot 是对方就算发给它；群里只算被 @ 的 bot。bot 发的消息不算给任何 bot（防互相 @ 死循环）。
 /// 主人被禁用、或 bot 自己被管理员禁用时都不回调（令牌那边由 bot_auth / require_user 挡）。
 pub(crate) fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) {
+    use std::sync::atomic::Ordering;
+
+    let epoch = st.restore_epoch.load(Ordering::Acquire);
     let st = st.clone();
     let msg = msg.clone();
     tokio::spawn(async move {
+        let Some(storage) = crate::backup::storage_operation(&st) else {
+            return;
+        };
+        if st.restore_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
         let targets = match sqlx::query_as::<_, (Uuid, String, String, String)>(
             "SELECT b.user_id, b.webhook_url, b.secret, c.type
                FROM bots b
@@ -572,6 +603,7 @@ pub(crate) fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) {
                 return;
             }
         };
+        drop(storage);
         for (bot, url, secret, kind) in targets {
             if let Some(w) = st.bot_wake.get(&bot) {
                 w.notify_waiters();
@@ -582,8 +614,19 @@ pub(crate) fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) {
             let st = st.clone();
             let msg = msg.clone();
             tokio::spawn(async move {
+                if st.restore_epoch.load(Ordering::Acquire) != epoch
+                    || st.maintenance.load(Ordering::Acquire)
+                {
+                    return;
+                }
                 match call_webhook(&url, &secret, bot, conv, &kind, &msg).await {
                     Ok(Some(reply)) => {
+                        let Some(_storage) = crate::backup::storage_operation(&st) else {
+                            return;
+                        };
+                        if st.restore_epoch.load(Ordering::Acquire) != epoch {
+                            return;
+                        }
                         let r = ws::post_and_broadcast(
                             &st,
                             domain::PostMessage::text(conv, bot, &reply),

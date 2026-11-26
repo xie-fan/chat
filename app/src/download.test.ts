@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { saveAttachment } from "./download";
-import { getServer } from "./api";
+import { files, getServer } from "./api";
 import { getState, setState } from "./store";
 import type { AttachmentView } from "./types";
 // 入口接线校验用源码（C6：所有下载入口必须共用 saveAttachment）
@@ -20,16 +20,20 @@ function toasts() {
   return getState().toasts;
 }
 
+const downloadUrl = () => `${getServer()}/v1/files/${ATT.id}?dl=1&ticket=file.ticket.signature`;
+
 describe("saveAttachment：平台分发", () => {
   beforeEach(() => {
     setState({ toasts: [] });
+    vi.spyOn(files, "access").mockImplementation(async () => ({ url: downloadUrl(), expiresAt: Infinity }));
   });
+  afterEach(() => vi.restoreAllMocks());
 
-  it("Web：<a download> 直接跳 ?dl=1 能力 URL，不弹 toast", async () => {
+  it("Web：<a download> 使用限时附件地址，不弹 toast", async () => {
     const anchor = vi.fn();
     await saveAttachment(ATT, { tauri: false, anchor });
     expect(anchor).toHaveBeenCalledWith(
-      `${getServer()}/v1/files/${ATT.id}?dl=1`,
+      downloadUrl(),
       "报表.pdf",
     );
     expect(toasts()).toHaveLength(0);
@@ -41,7 +45,7 @@ describe("saveAttachment：平台分发", () => {
     expect(invoke).toHaveBeenCalledWith(
       "download_to_downloads",
       expect.objectContaining({
-        url: `${getServer()}/v1/files/${ATT.id}?dl=1`,
+        url: downloadUrl(),
         fileName: "报表.pdf",
         // C1：origin 白名单由前端服务器存储给出
         allowedOrigins: expect.arrayContaining([getServer()]),
@@ -70,6 +74,14 @@ describe("saveAttachment：平台分发", () => {
     expect(t[0].title).toBe("下载失败");
     expect(t[0].text).toContain("文件已撤回或不存在");
     expect(t[0].filePath).toBeUndefined();
+  });
+
+  it("An unavailable attachment never starts a browser download", async () => {
+    vi.mocked(files.access).mockRejectedValue(new Error("file not found"));
+    const anchor = vi.fn();
+    await saveAttachment(ATT, { tauri: false, anchor });
+    expect(anchor).not.toHaveBeenCalled();
+    expect(toasts()[0].title).toBe("下载失败");
   });
 });
 

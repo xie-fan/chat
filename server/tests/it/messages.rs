@@ -288,6 +288,7 @@ async fn lifecycle_delete() {
     let att_id = att["id"].as_str().unwrap().to_string();
     let dl = c
         .get(format!("{base}/v1/files/{att_id}"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();
@@ -313,6 +314,7 @@ async fn lifecycle_delete() {
     assert!(tomb["edit_version"].as_i64().unwrap() >= 1);
     let dl = c
         .get(format!("{base}/v1/files/{att_id}"))
+        .header("authorization", authz(&a.access))
         .send()
         .await
         .unwrap();

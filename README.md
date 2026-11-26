@@ -194,6 +194,8 @@ cd gen/android && ./gradlew assembleDebug \
 
 推 `v*` 标签后，GitHub Actions 在免费托管 runner 上打 Windows 安装包、Android APK、deb 和 AppImage，先挂到草稿 Release，7 个产物齐了自动转公开。Chat 服务端读最新 Release：「我」页显示新版本，Windows / Linux 点「更新并重启」自动装，Android 下载 APK 后由系统覆盖安装。浏览器端不用管，服务端更新后刷新就是新版。
 
+升级到启用会话附件鉴权的服务端时，请同步更新桌面和 Android 客户端。旧客户端的无凭据附件读取会被拒绝。浏览器端刷新即可使用新协议。直接调用 API 的用户使用 `Authorization: Bearer <access_token>` 访问 `/v1/files/{id}`，Bot 使用 Bot 令牌访问 `/v1/bot/files/{id}`。
+
 发一个版本：
 
 ```bash

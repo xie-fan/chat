@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub mod host_ws;
 pub mod routes;
+mod transfer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpSettingsView {
@@ -85,6 +86,8 @@ pub struct AcpSessionView {
     pub permission_policy: String,
     pub acp_session_key: Option<String>,
     pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
     pub diffs: Value,
     pub rpc_logs: Value,
     pub created_at: DateTime<Utc>,
@@ -484,7 +487,7 @@ pub(crate) async fn apply_agent_probed_models(
     // 对尚未真正启动过对话（acp_session_key IS NULL 且非运行态）的会话，若仍处于占位/旧默认模型或不在有效列表中则同步到新默认模型
     let candidate_sessions = sqlx::query(
         "SELECT id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
-                permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                permission_policy, acp_session_key, running, run_id, diffs_json, rpc_logs_json,
                 created_at, updated_at
            FROM acp_sessions
           WHERE user_id = $1 AND acp_agent_id = $2 AND running = false AND acp_session_key IS NULL",
@@ -506,7 +509,7 @@ pub(crate) async fn apply_agent_probed_models(
                     SET selected_model = $3, updated_at = now()
                   WHERE id = $1 AND user_id = $2 AND running = false
                   RETURNING id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
-                            permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                            permission_policy, acp_session_key, running, run_id, diffs_json, rpc_logs_json,
                             created_at, updated_at",
             )
             .bind(sid)
@@ -557,7 +560,7 @@ pub async fn reset_stale_acp_state(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE acp_hosts SET online = false, latency_ms = 0 WHERE online = true")
         .execute(pool)
         .await?;
-    sqlx::query("UPDATE acp_sessions SET running = false WHERE running = true")
+    sqlx::query("UPDATE acp_sessions SET running = false, run_id = NULL WHERE running OR run_id IS NOT NULL")
         .execute(pool)
         .await?;
     sqlx::query(
@@ -679,6 +682,7 @@ pub(crate) fn session_from_row(
         permission_policy: row.get("permission_policy"),
         acp_session_key: row.get("acp_session_key"),
         running: row.get("running"),
+        run_id: row.get("run_id"),
         diffs: row.get("diffs_json"),
         rpc_logs: row.get("rpc_logs_json"),
         created_at: row.get("created_at"),
@@ -694,7 +698,7 @@ pub(crate) async fn load_session_meta(
 ) -> AppResult<AcpSessionView> {
     let row = sqlx::query(
         "SELECT id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
-                permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                permission_policy, acp_session_key, running, run_id, diffs_json, rpc_logs_json,
                 created_at, updated_at
            FROM acp_sessions WHERE id = $1 AND user_id = $2",
     )
@@ -740,7 +744,7 @@ pub(crate) async fn load_bootstrap(st: &SharedState, uid: Uuid) -> AppResult<Acp
 
     let sess_rows = sqlx::query(
         "SELECT id, acp_workspace_id, acp_agent_id, title, selected_model, thinking_level,
-                permission_policy, acp_session_key, running, diffs_json, rpc_logs_json,
+                permission_policy, acp_session_key, running, run_id, diffs_json, rpc_logs_json,
                 created_at, updated_at
            FROM acp_sessions WHERE user_id = $1 ORDER BY updated_at DESC, created_at ASC",
     )

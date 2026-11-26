@@ -699,7 +699,7 @@ fn build_prompt_payload(msg: &PromptStartMsg, dir: &Path) -> (String, Vec<Value>
     }
 
     let mut images = Vec::new();
-    let upload_dir = session_upload_dir(&msg.session_id);
+    let upload_dir = session_upload_dir(msg);
     for att in &msg.attachments {
         let Some(b64) = &att.data_base64 else {
             continue;
@@ -1686,6 +1686,7 @@ mod tests {
 
     fn sample_msg(policy: &str, session_key: Option<&str>) -> PromptStartMsg {
         PromptStartMsg {
+            run_id: None,
             session_id: "s-1".into(),
             acp_session_key: session_key.map(str::to_string),
             cwd: ".".into(),

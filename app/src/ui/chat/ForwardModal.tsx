@@ -1,3 +1,4 @@
+import { newClientId } from "../../clientId";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, msgs as msgsApi, session } from "../../api";
 import { applyLiveMessage, convTitle, getState, setState, useApp } from "../../store";
@@ -30,7 +31,7 @@ export function prepareForwardSubmission(
   if (sorted.length === 0 || sorted.length > MAX_TARGETS) {
     throw new Error(`请选择 1–${MAX_TARGETS} 个目标会话`);
   }
-  return { messageId, targets: sorted, clientOpId: crypto.randomUUID() };
+  return { messageId, targets: sorted, clientOpId: newClientId() };
 }
 
 type ForwardDone = {

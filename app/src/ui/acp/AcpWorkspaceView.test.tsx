@@ -1002,6 +1002,7 @@ it("点击停止运行后即使未收到 WS 事件也立即收敛活动状态栏
   };
   const runningSess: AcpSession = {
     id: "s-cancel-ui",
+    run_id: "1888ab81-2df4-4a6d-825f-b9cc2ef27e14",
     workspace_id: "w1",
     agent_id: "a1",
     title: "卡住的会话",
@@ -1029,7 +1030,7 @@ it("点击停止运行后即使未收到 WS 事件也立即收敛活动状态栏
   };
   const cancelSpy = vi
     .spyOn(acp, "cancelSession")
-    .mockResolvedValue({ ...runningSess, running: false });
+    .mockResolvedValue({ ...runningSess, running: false, run_id: null });
 
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -1067,7 +1068,7 @@ it("点击停止运行后即使未收到 WS 事件也立即收敛活动状态栏
       stopBtn.click();
     });
 
-    expect(cancelSpy).toHaveBeenCalledWith(runningSess.id);
+    expect(cancelSpy).toHaveBeenCalledWith(runningSess.id, runningSess.run_id);
     await vi.waitFor(() => {
       expect(container.querySelector(".acp-activity-bar")).toBeNull();
       expect(

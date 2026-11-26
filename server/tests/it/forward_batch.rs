@@ -577,7 +577,7 @@ async fn mf1_nesting_depth() {
 }
 
 /// merged 附件克隆：record_message_id=新消息、uploader=转发者、共享物理文件；
-/// 非源会话成员凭 capability URL 也能下载；GET record 里的附件 id 是克隆 id。
+/// 附件按目标会话校验；GET record 里的附件 id 是克隆 id。
 #[tokio::test]
 async fn mf1_merged_attachment_clones() {
     let base = spawn().await;
@@ -624,11 +624,12 @@ async fn mf1_merged_attachment_clones() {
     assert_eq!(up, uuid::Uuid::parse_str(&a.id).unwrap(), "克隆 uploader = 转发者");
     assert_eq!(sp, rsp, "共享物理路径");
 
-    // 非源会话成员凭 capability URL 直接下载（公开能力 URL）
-    let dl = c.get(format!("{base}/v1/files/{clone_id}")).send().await.unwrap();
+    let path = format!("/v1/files/{clone_id}");
+    let dl = c_get(&base, &a, &path).await;
     assert_eq!(dl.status(), 200);
     assert_eq!(dl.bytes().await.unwrap().as_ref(), png_bytes().as_slice());
-    let _ = cuser; // 记录查看权由 GET record 的 403 覆盖，附件本身走能力 URL
+    assert_eq!(c_get(&base, &b, &path).await.status(), 404, "源会话成员无目标会话权限");
+    assert_eq!(c_get(&base, &cuser, &path).await.status(), 404);
 
     // 配额不变：a 的 used_bytes 与转发前一致（克隆共享路径不重复计）
     let used: Value = c
@@ -667,7 +668,7 @@ async fn mf1_merged_attachment_clones() {
         .await
         .unwrap();
     assert_eq!(up2, uuid::Uuid::parse_str(&a.id).unwrap());
-    let dl = c.get(format!("{base}/v1/files/{reclone}")).send().await.unwrap();
+    let dl = c_get(&base, &a, &format!("/v1/files/{reclone}")).await;
     assert_eq!(dl.status(), 200);
 }
 
@@ -783,7 +784,7 @@ async fn mf1_recall_cascade() {
 
     // GET record → 404；克隆公开下载立即 404；record-item → 400
     assert_eq!(get_record(&base, &a, &rid).await.status(), 404);
-    let dl = c.get(format!("{base}/v1/files/{clone_id}")).send().await.unwrap();
+    let dl = c_get(&base, &a, &format!("/v1/files/{clone_id}")).await;
     assert_eq!(dl.status(), 404);
     let r = http()
         .post(format!("{base}/v1/messages/{rid}/forward"))
@@ -804,7 +805,7 @@ async fn mf1_recall_cascade() {
 
     // 别处拷贝仍完整可用
     assert_eq!(get_record(&base, &a, &copy_id).await.status(), 200);
-    let dl = c.get(format!("{base}/v1/files/{copy_att}")).send().await.unwrap();
+    let dl = c_get(&base, &b, &format!("/v1/files/{copy_att}")).await;
     assert_eq!(dl.status(), 200);
 
     // 清扫语义：撤回记录 + 撤回源附件 → 两行过期清扫；物理文件只被别处拷贝引用而保留
@@ -828,7 +829,7 @@ async fn mf1_recall_cascade() {
     assert!(swept >= 2);
     let path = std::env::temp_dir().join("chat-it-files").join(&att_id);
     assert!(path.exists(), "别处拷贝仍引用 storage_path，文件不得删");
-    let dl = c.get(format!("{base}/v1/files/{copy_att}")).send().await.unwrap();
+    let dl = c_get(&base, &b, &format!("/v1/files/{copy_att}")).await;
     assert_eq!(dl.status(), 200, "清扫后别处拷贝仍可下载");
 }
 

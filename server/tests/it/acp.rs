@@ -2,10 +2,10 @@ use super::*;
 use reqwest::multipart::{Form, Part};
 use uuid::Uuid;
 
-async fn host_ws_connect(
-    base: &str,
-    u: &TestUser,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+type AcpTestSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn host_ws_connect(base: &str, u: &TestUser) -> AcpTestSocket {
     let url = format!("{}&role=host", ws_url(base, u).await);
     let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     ws
@@ -1377,8 +1377,18 @@ async fn acp_streams_thoughts_tool_calls_and_activity_events() {
     assert!(verified, "bootstrap should persist thought, tool_call, and text turns");
 }
 
-#[tokio::test]
-async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
+struct RunningAcpFixture {
+    base: String,
+    user: TestUser,
+    host_ws: AcpTestSocket,
+    client_ws: AcpTestSocket,
+    host_id: String,
+    install_id: Uuid,
+    session_id: String,
+    run_id: Value,
+}
+
+async fn running_acp_fixture(supports_run_ids: bool) -> RunningAcpFixture {
     let base = spawn().await;
     let u = register(&base, &format!("acpr_{}", uniq())).await;
     let (mut client_ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await)
@@ -1395,7 +1405,8 @@ async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
                 "name": "DevBox",
                 "os": "linux · x86_64",
                 "ip": "Client-Daemon",
-                "roots": ["/tmp"]
+                "roots": ["/tmp"],
+                "run_ids": supports_run_ids,
             })
             .to_string()
             .into(),
@@ -1468,8 +1479,33 @@ async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
         .await
         .unwrap();
     assert_eq!(p_res.status(), 200);
-    let _ = next_of(&mut host_ws_1, "prompt_start").await;
+    let start = next_of(&mut host_ws_1, "prompt_start").await;
+    let _ = next_acp_event(&mut client_ws, "turn_upserted").await;
+    let _ = next_acp_event(&mut client_ws, "session_upserted").await;
+    RunningAcpFixture {
+        base,
+        user: u,
+        host_ws: host_ws_1,
+        client_ws,
+        host_id,
+        install_id,
+        session_id: sess_id,
+        run_id: start["run_id"].clone(),
+    }
+}
 
+#[tokio::test]
+async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
+    let RunningAcpFixture {
+        base,
+        user: u,
+        host_ws: mut host_ws_1,
+        mut client_ws,
+        host_id,
+        install_id,
+        session_id: sess_id,
+        ..
+    } = running_acp_fixture(false).await;
     host_ws_1
         .send(WsMsg::Text(
             json!({
@@ -1499,7 +1535,7 @@ async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
                 "name": "DevBox",
                 "os": "linux · x86_64",
                 "ip": "Client-Daemon",
-                "roots": ["/tmp"]
+                "roots": ["/tmp"],
             })
             .to_string()
             .into(),
@@ -1540,4 +1576,175 @@ async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
         .unwrap();
     assert_eq!(settled_tc["status"], "failed");
     assert_eq!(settled_tc["payload"]["is_error"], true);
+}
+
+#[tokio::test]
+async fn acp_late_cancelled_run_updates_do_not_affect_replacement() {
+    let RunningAcpFixture {
+        base,
+        user,
+        mut host_ws,
+        mut client_ws,
+        session_id,
+        run_id: first,
+        ..
+    } = running_acp_fixture(true).await;
+    let url = format!("{base}/v1/acp/sessions/{session_id}");
+    let cancel = |run: &Value| {
+        http()
+            .post(format!("{url}/cancel"))
+            .header("authorization", authz(&user.access))
+            .query(&[("run_id", run.as_str().unwrap())])
+    };
+    let stopped: Value = cancel(&first)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stopped["running"], false);
+    assert_eq!(
+        next_of(&mut host_ws, "prompt_cancel").await["run_id"],
+        first
+    );
+
+    http()
+        .post(format!("{url}/prompts"))
+        .header("authorization", authz(&user.access))
+        .json(&json!({ "text": "replacement" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let next = next_of(&mut host_ws, "prompt_start").await["run_id"].clone();
+    assert_ne!(next, first);
+    for mut frame in [
+        json!({"run_id": first, "kind": "prompt_done", "acp_session_key": "stale"}),
+        json!({"run_id": first, "kind": "permission_request", "req_id": "stale"}),
+        json!({"run_id": first, "kind": "text", "text": "stale"}),
+        json!({"run_id": next, "kind": "text", "text": "replacement output"}),
+    ] {
+        frame["type"] = json!("session_update");
+        frame["session_id"] = json!(session_id);
+        host_ws
+            .send(WsMsg::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Dur::from_secs(2), async {
+        loop {
+            let turn = next_acp_event(&mut client_ws, "turn_upserted").await;
+            if turn["data"]["turn"]["payload"]["text"] == "replacement output" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("replacement run should still be able to emit output");
+
+    let bs: Value = http()
+        .get(format!("{base}/v1/acp/bootstrap"))
+        .header("authorization", authz(&user.access))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = bs["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == session_id)
+        .unwrap();
+    assert_eq!(session["running"], true);
+    assert_eq!(session["run_id"], next);
+    assert_ne!(session["acp_session_key"], "stale");
+    assert!(!session["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["payload"]["text"] == "stale" || t["payload"]["req_id"] == "stale"));
+
+    let stale_cancel: Value = cancel(&first)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stale_cancel["run_id"], next);
+    let stopped: Value = cancel(&next)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stopped["running"], false);
+    assert_eq!(next_of(&mut host_ws, "prompt_cancel").await["run_id"], next);
+}
+
+#[tokio::test]
+async fn acp_legacy_host_keeps_cancelled_run_busy_until_done() {
+    let RunningAcpFixture {
+        base,
+        user,
+        mut host_ws,
+        mut client_ws,
+        session_id,
+        ..
+    } = running_acp_fixture(false).await;
+    let url = format!("{base}/v1/acp/sessions/{session_id}");
+    let stop: Value = http()
+        .post(format!("{url}/cancel"))
+        .header("authorization", authz(&user.access))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stop["running"], true);
+    let _ = next_of(&mut host_ws, "prompt_cancel").await;
+
+    let start = || {
+        http()
+            .post(format!("{url}/prompts"))
+            .header("authorization", authz(&user.access))
+            .json(&json!({ "text": "next run" }))
+    };
+    assert_eq!(start().send().await.unwrap().status(), 409);
+    host_ws
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": session_id,
+                "kind": "prompt_done",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let settled = tokio::time::timeout(
+        Dur::from_secs(2),
+        next_acp_event(&mut client_ws, "session_upserted"),
+    )
+    .await
+    .expect("legacy completion should release the session");
+    assert_eq!(settled["data"]["session"]["running"], false);
+    assert_eq!(start().send().await.unwrap().status(), 200);
 }

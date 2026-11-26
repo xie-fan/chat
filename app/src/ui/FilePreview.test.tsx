@@ -75,6 +75,68 @@ describe("FilePreview", () => {
     expect(classifyPreviewKind("archive.zip", "application/zip")).toBe("unsupported");
   });
 
+  it("only embeds a PDF after checking its file header", async () => {
+    const hadCreateObjectUrl = typeof URL.createObjectURL === "function";
+    const previousCreateObjectUrl = URL.createObjectURL;
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(() => "blob:validated-pdf"),
+    });
+    const { host, unmount } = await mountPreview({
+      variant: "chat",
+      target: {
+        kind: "local-file",
+        key: "local:document.pdf",
+        file: new File(["%PDF-1.7\n1 0 obj\n"], "document.pdf", {
+          type: "application/octet-stream",
+        }),
+      },
+    });
+    try {
+      await vi.waitFor(() => {
+        expect(host.querySelector('iframe[src="blob:validated-pdf"]')).not.toBeNull();
+      });
+      expect(host.querySelector(".pv-unsupported")).toBeNull();
+    } finally {
+      unmount();
+      if (hadCreateObjectUrl) {
+        Object.defineProperty(URL, "createObjectURL", {
+          configurable: true,
+          writable: true,
+          value: previousCreateObjectUrl,
+        });
+      } else {
+        Object.defineProperty(URL, "createObjectURL", {
+          configurable: true,
+          writable: true,
+          value: undefined,
+        });
+      }
+    }
+  });
+
+  it("does not send a PDF-looking HTML file to the embedded viewer", async () => {
+    const { host, unmount } = await mountPreview({
+      variant: "chat",
+      target: {
+        kind: "local-file",
+        key: "local:fake.pdf",
+        file: new File(["<!doctype html><script>alert(1)</script>"], "fake.pdf", {
+          type: "application/pdf",
+        }),
+      },
+    });
+    try {
+      await vi.waitFor(() => {
+        expect(host.textContent).toContain("文件不是可预览的 PDF");
+      });
+      expect(host.querySelector("iframe")).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
   it("evaluates swipe collapse / expand thresholds and velocity", () => {
     expect(shouldCollapseOnSwipeRight(96, 0.1, 340)).toBe(true);
     expect(shouldCollapseOnSwipeRight(28, 0.55, 340)).toBe(true);
@@ -330,6 +392,9 @@ describe("FilePreview", () => {
       "fetch",
       vi.fn(async (url: RequestInfo | URL) => {
         const s = String(url);
+        if (s.endsWith("/v1/files/f-recv/ticket")) {
+          return Response.json({ ticket: "file.ticket.signature", expires_in: 600 });
+        }
         if (s.includes("/v1/files/f-recv")) {
           return new Response("hello from chat file\n", {
             status: 200,

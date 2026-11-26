@@ -9,12 +9,17 @@ import {
   sendPromptLocalFirst,
   setCloudControlEnabled,
   setLocalAcpHostId,
+  uploadAttachmentLocalFirst,
 } from "./acpHost";
 import {
   addLocalVaultAgent,
   addLocalVaultSession,
+  appendLocalUserTurnAndStart,
   applyLocalRunnerEvent,
   ensureLocalOnlyHost,
+  getLocalVault,
+  localVaultOwnerMatches,
+  patchLocalVaultSession,
   resetLocalVaultForTests,
   settleLocalSessionOnCancel,
   upsertLocalVaultWorkspace,
@@ -22,10 +27,17 @@ import {
 import { resetAcpOverlayForTests } from "./acpOverlay";
 import * as api from "./api";
 import { applyAcpBootstrap, getState, resetSessionState, setState } from "./store";
-import type { AcpAgent, AcpHost, AcpSession, AcpWorkspace } from "./types";
+import type { AcpAgent, AcpHost, AcpHostSnapshot, AcpSession, AcpWorkspace } from "./types";
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn(async (..._args: unknown[]) => () => {});
+const localFiles = vi.hoisted(() => new Map<string, Blob>());
+
+vi.mock("./acpAttachmentStore", () => ({
+  storeLocalAcpBlob: async (id: string, blob: Blob) => localFiles.set(id, blob),
+  readLocalAcpBlob: async (id: string) => localFiles.get(id),
+  removeLocalAcpBlob: async (id: string) => localFiles.delete(id),
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
@@ -39,6 +51,7 @@ afterEach(() => {
   invokeMock.mockReset();
   listenMock.mockClear();
   setLocalAcpHostId(null);
+  localFiles.clear();
   resetLocalVaultForTests();
   resetAcpOverlayForTests();
   setState(resetSessionState());
@@ -176,9 +189,19 @@ it("本机 @Host 浏览目录、探测模型与切换分支直接走本地 Tauri
   });
 });
 
+it("纯本地 Vault 首次挂载绑定服务器账号，旧账号事件不会通过所有者校验", () => {
+  const vault = ensureLocalOnlyHost(
+    { install_id: "owner-host", name: "Desktop", os: "win", roots: [] },
+    JSON.stringify(["http://server-a", "user-a"]),
+  );
+  expect(vault.owner).toBe(JSON.stringify(["http://server-a", "user-a"]));
+  expect(localVaultOwnerMatches(JSON.stringify(["http://server-a", "user-a"]))).toBe(true);
+  expect(localVaultOwnerMatches(JSON.stringify(["http://server-a", "user-b"]))).toBe(false);
+});
+
 it("关闭「本机允许被云端控制」后立即删除云端主机全部数据，本机仍可纯本地使用且不再同步云端", async () => {
   vi.spyOn(api, "isDesktopShell").mockReturnValue(true);
-  const deleteHostSpy = vi.spyOn(api.acp, "deleteHost").mockResolvedValue(undefined);
+  const deleteHostSpy = vi.spyOn(api.acp, "deleteHostSnapshot").mockResolvedValue(undefined);
   const serverUpdateAgentSpy = vi.spyOn(api.acp, "updateAgent");
   const serverCreateSessSpy = vi.spyOn(api.acp, "createSession");
   const serverSendPromptSpy = vi.spyOn(api.acp, "sendPrompt");
@@ -221,6 +244,11 @@ it("关闭「本机允许被云端控制」后立即删除云端主机全部数�
     created_at: "2026-11-20T00:00:00Z",
     updated_at: "2026-11-20T00:00:00Z",
   };
+  vi.spyOn(api.acp, "exportHostSnapshot").mockResolvedValue({
+    revision: "saved-revision",
+    import_id: null,
+    snapshot: { host: cloudHost, agents: [agent], workspaces: [ws], sessions: [], attachments: [] },
+  });
 
   setLocalAcpHostId("cloud-host-1");
   setState({
@@ -263,10 +291,28 @@ it("关闭「本机允许被云端控制」后立即删除云端主机全部数�
     return null;
   });
 
-  // 1. 关闭云端控制：断开并调用 deleteHost 从云端擦除全部数据，本机节点转为 Local-Only 保留可用
+  const oldStorage = localStorage;
+  vi.stubGlobal("localStorage", {
+    getItem: oldStorage.getItem.bind(oldStorage),
+    removeItem: oldStorage.removeItem.bind(oldStorage),
+    setItem: (key: string, value: string) => {
+      if (key === "chat_acp_local_vault_v1") throw new DOMException("quota", "QuotaExceededError");
+      oldStorage.setItem(key, value);
+    },
+  });
+  try {
+    await expect(setCloudControlEnabled(false)).rejects.toMatchObject({ name: "QuotaExceededError" });
+    expect(deleteHostSpy).not.toHaveBeenCalled();
+    expect(invokeMock).not.toHaveBeenCalledWith("acp_host_set_cloud_control", { enabled: false });
+    expect(getLocalVault().active).toBe(false);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+
+  // 磁盘写入成功后，才关闭连接并移除已核对的云端版本。
   const policy = await setCloudControlEnabled(false);
   expect(policy.cloud_control_enabled).toBe(false);
-  expect(deleteHostSpy).toHaveBeenCalledWith("cloud-host-1");
+  expect(deleteHostSpy).toHaveBeenCalledWith("install-uuid-1", "saved-revision");
   expect(getState().acpHosts).toHaveLength(1);
   expect(getState().acpHosts[0].ip).toBe("Local-Only");
   expect(getState().acpHosts[0].id).toBe("install-uuid-1");
@@ -322,6 +368,69 @@ it("关闭「本机允许被云端控制」后立即删除云端主机全部数�
   );
 });
 
+it("保留本地历史与附件直到云端导入确认，重试保持同一个传输 ID", async () => {
+  vi.spyOn(api, "isDesktopShell").mockReturnValue(true);
+  const local = ensureLocalOnlyHost({ install_id: "install-id", name: "Desktop", os: "win", roots: [] });
+  const agent = addLocalVaultAgent({ preset: "custom", name: "Agent", cmd: "acp", status: "online" });
+  const workspace = upsertLocalVaultWorkspace({ cwd: "/repo", name: "repo", branch: "", branches: [] });
+  const localSession = addLocalVaultSession({ workspace, agent, title: "Archive", defaultPermission: "auto_read" });
+  const attachment = await uploadAttachmentLocalFirst(
+    new File(["durable bytes"], "history.txt", { type: "text/plain" }),
+    localSession.id,
+  );
+  const turn = {
+    id: "record-id",
+    session_id: localSession.id,
+    seq: 1,
+    role: "user" as const,
+    status: "done",
+    payload: { text: "saved question", attachments: [attachment] },
+    created_at: localSession.created_at,
+    updated_at: localSession.updated_at,
+  };
+  const savedSession = patchLocalVaultSession(localSession.id, { turns: [turn] })!;
+  const cloudHost = { ...local.host!, id: "target-host", ip: "Client-Daemon" };
+  const empty: AcpHostSnapshot = {
+    host: cloudHost, agents: [], workspaces: [], sessions: [], attachments: [],
+  };
+  vi.spyOn(api.acp, "exportHostSnapshot").mockResolvedValue({
+    revision: "destination-revision", import_id: null, snapshot: empty,
+  });
+  const upload = vi.spyOn(api.acp, "uploadTransferFile").mockResolvedValue(attachment);
+  const send = vi.spyOn(api.acp, "importHostSnapshot")
+    .mockRejectedValueOnce(new Error("connection dropped"))
+    .mockImplementation(async (_, transferId) => ({ host_id: cloudHost.id, transfer_id: transferId }));
+  vi.spyOn(api.acp, "bootstrap").mockResolvedValue({
+    settings: { default_permission: "auto_read" },
+    hosts: [cloudHost],
+    agents: [{ ...agent, host_id: cloudHost.id }],
+    workspaces: [{ ...workspace, host_id: cloudHost.id }],
+    sessions: [savedSession],
+  });
+  invokeMock.mockImplementation(async (cmd: string, args?: { enabled: boolean }) => {
+    if (cmd === "acp_host_info") {
+      return { host_id: cloudHost.id, install_id: "install-id", name: "Desktop", os: "win", roots: [] };
+    }
+    if (cmd === "acp_host_set_cloud_control" || cmd === "acp_host_local_policy") {
+      return { allow_all_local: false, cloud_control_enabled: args?.enabled ?? true, approved_count: 0 };
+    }
+    return null;
+  });
+  await expect(setCloudControlEnabled(true)).rejects.toThrow("connection dropped");
+  expect(getLocalVault().sessions[0].turns).toEqual([turn]);
+  expect(localFiles.get(attachment.id)?.size).toBe(13);
+  expect(invokeMock).toHaveBeenCalledWith("acp_host_set_cloud_control", { enabled: false });
+  const pending = getLocalVault().cloudImport?.id;
+  expect(pending).toBeTruthy();
+
+  await expect(setCloudControlEnabled(true)).resolves.toMatchObject({ cloud_control_enabled: true });
+  expect(send.mock.calls.map(([, id]) => id)).toEqual([pending, pending]);
+  expect(send.mock.calls[1][2].sessions[0].turns).toEqual([turn]);
+  expect(upload.mock.calls[1][0]).toEqual({ ...attachment, session_id: localSession.id });
+  expect(getLocalVault().active).toBe(false);
+  expect(getState().acpSessions[0].turns).toEqual([turn]);
+});
+
 it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非落盘 activity 以及 prompt_done/取消收敛", () => {
   ensureLocalOnlyHost({ install_id: "h-loc", name: "mac", os: "macos", roots: ["/repo"] });
   const ag = addLocalVaultAgent({
@@ -343,41 +452,48 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
     defaultPermission: "auto_read",
   });
 
+  const startRun = () =>
+    appendLocalUserTurnAndStart(sess.id, {
+      text: "Check state",
+      files: [],
+      attachments: [],
+      model: sess.selected_model,
+      thinking_level: sess.thinking_level,
+      permission_policy: sess.permission_policy,
+    })!.session.run_id!;
+  let runId = startRun();
+  const applyRunEvent = (event: Record<string, unknown>) =>
+    applyLocalRunnerEvent({ type: "session_update", session_id: sess.id, run_id: runId, ...event });
   const setItemSpy = vi.spyOn(localStorage, "setItem");
   setItemSpy.mockClear();
 
   // 1. thought_delta 中间态不触发 localStorage 写盘；done=true 后落盘
-  const t1 = applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  const t1 = applyRunEvent({
     kind: "thought_delta",
     turn_key: "tk-1",
     delta: "Step 1 ",
     done: false,
   });
-  expect(t1.session?.turns?.[0].role).toBe("agent_thought");
-  expect(t1.session?.turns?.[0].status).toBe("streaming");
+  const thought = t1.session?.turns?.find((t) => t.role === "agent_thought");
+  expect(thought?.status).toBe("streaming");
   expect(setItemSpy).not.toHaveBeenCalled();
 
-  const t2 = applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  const t2 = applyRunEvent({
     kind: "thought_delta",
     turn_key: "tk-1",
     delta: "done",
     done: true,
     duration_ms: 320,
   });
-  expect(t2.session?.turns?.[0].status).toBe("done");
-  expect(t2.session?.turns?.[0].payload.text).toBe("Step 1 done");
-  expect(t2.session?.turns?.[0].payload.duration_ms).toBe(320);
+  const completeThought = t2.session?.turns?.find((t) => t.role === "agent_thought");
+  expect(completeThought?.status).toBe("done");
+  expect(completeThought?.payload.text).toBe("Step 1 done");
+  expect(completeThought?.payload.duration_ms).toBe(320);
   expect(setItemSpy).toHaveBeenCalledTimes(1);
   setItemSpy.mockClear();
 
   // 2. tool_call 增量合并不覆盖已累计输出，且中间态不落盘
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  applyRunEvent({
     kind: "tool_call",
     tool_call_id: "tc-1",
     name: "edit",
@@ -386,17 +502,13 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
     status: "pending",
     locations: ["src/a.ts"],
   });
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  applyRunEvent({
     kind: "tool_call",
     tool_call_id: "tc-1",
     status: "in_progress",
     output_delta: "chunk1\n",
   });
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  applyRunEvent({
     kind: "tool_call",
     tool_call_id: "tc-1",
     output_delta: "chunk2",
@@ -404,9 +516,7 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
   });
   expect(setItemSpy).not.toHaveBeenCalled();
 
-  const tcDone = applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  const tcDone = applyRunEvent({
     kind: "tool_call",
     tool_call_id: "tc-1",
     status: "completed",
@@ -422,9 +532,7 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
   setItemSpy.mockClear();
 
   // 3. activity 仅作短暂返回，不写入 Vault 或 localStorage
-  const actDelta = applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  const actDelta = applyRunEvent({
     kind: "activity",
     phase: "tooling",
     detail: "执行测试…",
@@ -436,25 +544,19 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
   expect(setItemSpy).not.toHaveBeenCalled();
 
   // 4. prompt_done 自动收敛残留 streaming 思考/正文与 in_progress 工具，并发送 idle
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  applyRunEvent({
     kind: "thought_delta",
     turn_key: "tk-stale",
     delta: "partial",
     done: false,
   });
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  applyRunEvent({
     kind: "tool_call",
     tool_call_id: "tc-stale",
     name: "bash",
     status: "in_progress",
   });
-  const doneDelta = applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  const doneDelta = applyRunEvent({
     kind: "prompt_done",
     acp_session_key: "pi-k1",
   });
@@ -467,25 +569,27 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
     doneDelta.session?.turns?.find((t) => t.payload.tool_call_id === "tc-stale")?.status,
   ).toBe("completed");
 
-  // 5. settleLocalSessionOnCancel 收敛流式正文/思考、工具与待审批权限
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  // 5. 屏蔽上一次运行迟到的事件，收敛当前任务的工具与审批。
+  const previousRun = runId;
+  runId = startRun();
+  expect(runId).not.toBe(previousRun);
+  expect(applyRunEvent({ run_id: previousRun, kind: "prompt_done", acp_session_key: "stale" })).toEqual({});
+  expect(applyRunEvent({ run_id: previousRun, kind: "text_delta", delta: "stale" })).toEqual({});
+  expect(settleLocalSessionOnCancel(sess.id, previousRun)?.running).toBe(true);
+  applyRunEvent({
     kind: "permission_request",
     req_id: "pr-cancel",
     tool_kind: "bash",
     command: "rm -rf build",
     reason: "clean",
   });
-  applyLocalRunnerEvent({
-    type: "session_update",
-    session_id: sess.id,
+  applyRunEvent({
     kind: "tool_call",
     tool_call_id: "tc-cancel",
     name: "bash",
     status: "in_progress",
   });
-  const cancelled = settleLocalSessionOnCancel(sess.id);
+  const cancelled = settleLocalSessionOnCancel(sess.id, runId);
   expect(cancelled?.running).toBe(false);
   expect(
     cancelled?.turns?.find((t) => t.payload.req_id === "pr-cancel")?.status,

@@ -197,14 +197,16 @@ pub(crate) async fn read_upload(
 }
 
 /// 写盘 + 图片尺寸/缩略图 + attachments 行。
-pub(crate) async fn store_upload(
+async fn store_upload(
     st: &SharedState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     uploader: Uuid,
     conv: Uuid,
     file_name: String,
     mime: String,
     file: TempUpload,
     duration_ms: Option<i32>,
+    client_upload_id: Option<Uuid>,
 ) -> AppResult<AttachmentView> {
     let id = Uuid::new_v4();
     // 只存文件名，文件固定在 FILES_DIR 里
@@ -252,8 +254,8 @@ pub(crate) async fn store_upload(
     sqlx::query(
         "INSERT INTO attachments
              (id, uploader_id, conv_id, file_name, mime, size, storage_path, width, height, thumb_path,
-              duration_ms)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              duration_ms, client_upload_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(uploader)
@@ -266,7 +268,8 @@ pub(crate) async fn store_upload(
     .bind(height)
     .bind(&thumb_path)
     .bind(duration_ms)
-    .execute(&st.pool)
+    .bind(client_upload_id)
+    .execute(&mut **tx)
     .await?;
     Ok(AttachmentView {
         id,
@@ -294,24 +297,47 @@ pub(super) async fn upload_file(
         st.cfg.upload_max_bytes,
         quota_bytes,
         used_bytes,
-        &["conversation_id", "duration_ms"],
+        &["conversation_id", "duration_ms", "client_upload_id"],
     )
     .await?;
-    if rd.over_quota {
-        return Err(AppError::payload_too_large(quota_message(
-            used_bytes, quota_mb,
-        )));
-    }
     let conv = match rd.fields.get("conversation_id") {
         None => return Err(AppError::bad_request("missing conversation_id")),
         Some(v) => {
             Uuid::parse_str(v.trim()).map_err(|_| AppError::bad_request("bad conversation_id"))?
         }
     };
+    require_member(&st, conv, uid).await?;
+    let upload_key = rd.fields.get("client_upload_id")
+        .map(|raw| Uuid::parse_str(raw.trim()).map_err(|_| AppError::bad_request("bad client_upload_id")))
+        .transpose()?;
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
+    if let Some(key) = upload_key {
+        // 锁在收完文件之后获取，重试和两次并发提交都只记一份；已占满配额也能回放。
+        let lock = i64::from_be_bytes(key.as_bytes()[..8].try_into().unwrap());
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(lock).execute(&mut *tx).await?;
+        let existing = sqlx::query_as::<_, AttachmentView>(
+            "SELECT id, file_name, mime, size, width, height, thumb_path IS NOT NULL AS has_thumb, duration_ms
+               FROM attachments WHERE uploader_id = $1 AND conv_id = $2 AND client_upload_id = $3",
+        )
+        .bind(uid)
+        .bind(conv)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(existing) = existing {
+            return Ok(Json(existing));
+        }
+    }
+    if rd.over_quota {
+        return Err(AppError::payload_too_large(quota_message(used_bytes, quota_mb)));
+    }
     if !rd.has_file() {
         return Err(AppError::bad_request("missing file"));
     }
-    require_member(&st, conv, uid).await?;
     let duration_ms = match rd.fields.get("duration_ms") {
         Some(raw) => {
             // 语音时长只接受音频附件；普通文件即使漏传字段也不写成语音。
@@ -324,18 +350,69 @@ pub(super) async fn upload_file(
         }
         None => None,
     };
-    Ok(Json(
-        store_upload(
+    let attachment = store_upload(
             &st,
+            &mut tx,
             uid,
             conv,
             rd.file_name,
             rd.mime,
             rd.file.expect("has_file"),
             duration_ms,
+            upload_key,
         )
-        .await?,
-    ))
+        .await?;
+    tx.commit().await?;
+    Ok(Json(attachment))
+}
+
+/// 删除尚未发送的上传。客户端在多附件发送中途失败时调用，避免孤儿附件持续占用配额。
+pub(super) async fn delete_unattached_file(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    let uid = uid_of(&headers, &st).await?;
+    let mut tx = st.pool.begin().await?;
+    // Serialize deletion with uploads from this account before taking the attachment lock.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT a.storage_path, a.thumb_path
+           FROM attachments a
+          WHERE a.id = $1 AND a.uploader_id = $2
+            AND a.recalled_at IS NULL AND a.record_message_id IS NULL
+          FOR UPDATE",
+    )
+    .bind(id)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((path, thumb)) = row else {
+        tx.rollback().await?;
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let deleted = sqlx::query(
+        "DELETE FROM attachments a
+          WHERE a.id = $1 AND a.uploader_id = $2
+            AND a.recalled_at IS NULL AND a.record_message_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.attachment_id = a.id)",
+    )
+    .bind(id)
+    .bind(uid)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    if deleted == 0 {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let paths = [Some(path), thumb].into_iter().flatten().collect::<Vec<_>>();
+    crate::domain::cleanup_unreferenced_attachment_files(&st.pool, &st.cfg.files_dir, &paths)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 语音时长：仅整数，1–300000 毫秒（5 分钟）。空串、小数、越界都拒绝。
@@ -357,11 +434,100 @@ pub(super) fn mime_base(mime: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// 按 UUID 直链下载（能力 URL：id 不可猜测，仅会话内可见）。
 #[derive(Deserialize)]
 pub(super) struct FileQuery {
     dl: Option<u8>,
     thumb: Option<u8>,
+    ticket: Option<String>,
+}
+
+pub(super) const FILE_CACHE_CONTROL: &str = "private, no-store";
+const FILE_TICKET_TTL_SECS: i64 = 600;
+const FILE_TICKET_KIND: &str = "attachment";
+
+#[derive(Serialize, Deserialize)]
+struct FileTicket {
+    kind: String,
+    sub: Uuid,
+    sid: Option<Uuid>,
+    sv: i64,
+    file: Uuid,
+    exp: usize,
+}
+
+#[derive(sqlx::FromRow)]
+struct FileDownload {
+    file_name: String,
+    mime: String,
+    storage_path: String,
+    thumb_path: Option<String>,
+}
+
+/// 从附件自己的会话判断成员资格。转发共享物理路径，访问权仍取决于每个副本所属会话。
+async fn member_attachment(st: &SharedState, id: Uuid, uid: Uuid) -> AppResult<FileDownload> {
+    sqlx::query_as::<_, FileDownload>(
+        "SELECT a.file_name, a.mime, a.storage_path, a.thumb_path
+           FROM attachments a
+           JOIN memberships m ON m.conversation_id = a.conv_id AND m.user_id = $2
+          WHERE a.id = $1 AND a.recalled_at IS NULL
+            AND (a.uploader_id = $2 OR a.record_message_id IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM messages msg WHERE msg.attachment_id = a.id
+                    AND msg.conversation_id = a.conv_id AND msg.deleted_at IS NULL))",
+    )
+    .bind(id)
+    .bind(uid)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("file not found"))
+}
+
+/// img/audio/video 标签与浏览器下载不能附加 Bearer。签发仅供这个附件使用、绑定登录会话的短时票据。
+pub(super) async fn issue_file_ticket(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    let ctx = auth::require_auth(&st, &headers).await?;
+    member_attachment(&st, id, ctx.user.id).await?;
+    let claims = FileTicket {
+        kind: FILE_TICKET_KIND.into(),
+        sub: ctx.user.id,
+        sid: ctx.sid,
+        sv: ctx.user.session_version.into(),
+        file: id,
+        exp: (Utc::now().timestamp() + FILE_TICKET_TTL_SECS) as usize,
+    };
+    let ticket = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(st.cfg.jwt_secret.as_bytes()),
+    )
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({ "ticket": ticket, "expires_in": FILE_TICKET_TTL_SECS })))
+}
+
+async fn ticket_uid(st: &SharedState, id: Uuid, raw: &str) -> AppResult<Uuid> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+    let invalid = || AppError::unauthorized("invalid or expired attachment ticket");
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    let ticket = decode::<FileTicket>(
+        raw,
+        &DecodingKey::from_secret(st.cfg.jwt_secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|_| invalid())?
+    .claims;
+    if ticket.kind != FILE_TICKET_KIND
+        || ticket.file != id
+        || !auth::grant_valid(&st.pool, ticket.sub, ticket.sv, ticket.sid).await
+    {
+        return Err(invalid());
+    }
+    Ok(ticket.sub)
 }
 
 /// 允许 inline 预览的 MIME 白名单：仅渲染型媒体。SVG 可携带脚本，必须排除；
@@ -379,13 +545,7 @@ pub(crate) fn inline_safe(mime: &str) -> bool {
         || m == "application/pdf"
 }
 
-/// 公开下载的缓存策略（能力 URL 可长期缓存）。
-const PUBLIC_CACHE: &str = "private, max-age=31536000, immutable";
-/// 撤回件强制不走缓存扩散（与公开下载刻意相反）。
-const NO_STORE: &str = "private, no-store";
-
-/// 按 ?thumb/?dl 选响应体后交给 serve_stored：两条下载路径共用，
-/// 区别只在 Cache-Control——公开 immutable、撤回件 no-store。
+/// 按 ?thumb/?dl 选响应体后交给 serve_stored。每次取附件都由服务端核对权限。
 async fn serve_attachment(
     st: &SharedState,
     q: &FileQuery,
@@ -393,7 +553,6 @@ async fn serve_attachment(
     mime: &str,
     stored: &str,
     thumb_stored: Option<&str>,
-    cache_control: &'static str,
     req: axum::extract::Request,
 ) -> AppResult<axum::response::Response> {
     // ?thumb=1：有缩略图返回 JPEG 缩略图（缓存头与原图一致）；没有/读取失败回退原图。dl=1 忽略 thumb。
@@ -405,7 +564,7 @@ async fn serve_attachment(
                     "inline; filename*=UTF-8''{}",
                     pct_encode(&format!("{file_name}.thumb.jpg"))
                 );
-                return serve_stored(path, req, "image/jpeg", &dispo, cache_control).await;
+                return serve_stored(path, req, "image/jpeg", &dispo, FILE_CACHE_CONTROL).await;
             }
         }
     }
@@ -421,47 +580,40 @@ async fn serve_attachment(
         req,
         mime,
         &dispo,
-        cache_control,
+        FILE_CACHE_CONTROL,
     )
     .await
 }
 
-/// 公开下载（能力 URL）。撤回中的附件对所有人一律 404：
-/// 行还在、物理文件还在（上传者可在 TTL 内走 /files/{id}/recalled），但这条路径彻底封口。
+/// 读取附件（Bearer 或短时附件票据）。非成员和撤回件统一返回 404。
 pub(super) async fn download_file(
     State(st): State<SharedState>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
     Query(q): Query<FileQuery>,
     req: axum::extract::Request,
 ) -> AppResult<axum::response::Response> {
-    let (file_name, mime, stored, thumb_stored) =
-        sqlx::query_as::<_, (String, String, String, Option<String>)>(
-            "SELECT file_name, mime, storage_path, thumb_path FROM attachments
-             WHERE id = $1 AND recalled_at IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&st.pool)
-        .await?
-        .ok_or_else(|| AppError::not_found("file not found"))?;
+    let uid = match q.ticket.as_deref() {
+        Some(raw) if !headers.contains_key(header::AUTHORIZATION) => ticket_uid(&st, id, raw).await?,
+        _ => uid_of(&headers, &st).await?,
+    };
+    let file = member_attachment(&st, id, uid).await?;
     serve_attachment(
         &st,
         &q,
-        &file_name,
-        &mime,
-        &stored,
-        thumb_stored.as_deref(),
-        PUBLIC_CACHE,
+        &file.file_name,
+        &file.mime,
+        &file.storage_path,
+        file.thumb_path.as_deref(),
         req,
     )
     .await
 }
 
-/// 撤回附件取回：GET /files/{id}/recalled，仅 Bearer + 上传者本人 + 保留期内。
+/// 撤回附件取回：仅持有 Bearer 的会话成员、上传者本人、保留期内可取回。
 /// 不满足一律 404（不泄露行是否存在）；无 Bearer → 401。
 /// 记录内克隆行（record_message_id 非空）恒 404——它们没有重发语义，
 /// 记录撤回后走这条取回路径不该再拿到内容（MF1）。
-/// ?thumb=1 / ?dl=1 语义与公开下载一致，但强制 Cache-Control: private, no-store——
-/// 撤回件不应再被缓存扩散（与公开下载的 immutable 缓存策略刻意相反）。
 pub(super) async fn download_recalled(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -472,36 +624,33 @@ pub(super) async fn download_recalled(
     let uid = uid_of(&headers, &st).await?;
     let ttl = st.cfg.recall_attachment_ttl_secs as f64;
     #[allow(clippy::type_complexity)]
-    let row = sqlx::query_as::<_, (Uuid, String, String, String, Option<String>, bool)>(
-        "SELECT uploader_id, file_name, mime, storage_path, thumb_path,
-                recalled_at IS NOT NULL AND recalled_at + make_interval(secs => $2) > now()
-           FROM attachments WHERE id = $1 AND record_message_id IS NULL",
+    let file = sqlx::query_as::<_, FileDownload>(
+        "SELECT a.file_name, a.mime, a.storage_path, a.thumb_path
+           FROM attachments a
+           JOIN memberships m ON m.conversation_id = a.conv_id AND m.user_id = $3
+          WHERE a.id = $1 AND a.uploader_id = $3 AND a.record_message_id IS NULL
+            AND a.recalled_at + make_interval(secs => $2) > now()",
     )
     .bind(id)
     .bind(ttl)
+    .bind(uid)
     .fetch_optional(&st.pool)
     .await?
     .ok_or_else(|| AppError::not_found("file not found"))?;
-    let (uploader, file_name, mime, stored, thumb_stored, fresh) = row;
-    if uploader != uid || !fresh {
-        return Err(AppError::not_found("file not found"));
-    }
     serve_attachment(
         &st,
         &q,
-        &file_name,
-        &mime,
-        &stored,
-        thumb_stored.as_deref(),
-        NO_STORE,
+        &file.file_name,
+        &file.mime,
+        &file.storage_path,
+        file.thumb_path.as_deref(),
         req,
     )
     .await
 }
 
 /// 流式发文件（不整个读进内存），支持 Range（音视频拖动、iOS 播放要用）和条件请求。
-/// 类型、下载方式、缓存头用库里记的，不用按扩展名猜的；缓存策略由调用方给定
-/// （公开下载 immutable；撤回取回 no-store）。
+/// 类型、下载方式、缓存头由调用方给定。
 pub(crate) async fn serve_stored(
     path: std::path::PathBuf,
     req: axum::extract::Request,

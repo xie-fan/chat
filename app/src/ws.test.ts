@@ -209,21 +209,57 @@ describe("WebSocket delivery", () => {
     expect(getState().conversations[0]).toMatchObject({ unread_count: 0, has_mention: false });
   });
 
-  it("resolves the optimistic bubble when the ack is lost but the message echoes via broadcast", async () => {
+  it("confirms a pending send from its exact echoed id when the ack is lost", async () => {
     const sock = await open();
     sendChat("c", "echo me");
     const [frame] = sock.sent.filter((f) => f.type === "send_message");
-    // 消息本体经广播到达、ack 帧丢失：乐观气泡应按 ack 语义收敛，不与真身并存
-    sock.frame({ type: "message", message: { ...message(1), sender_id: "me", sender_username: "me", sender_name: "Me", content: "echo me" } });
-    await vi.advanceTimersByTimeAsync(5_000);
+    sock.frame({
+      type: "message",
+      client_msg_id: frame.client_msg_id,
+      message: { ...message(1), sender_id: "me", content: "echo me" },
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
     expect(getState().messages.c.map((m) => m.id)).toEqual(["m1"]);
-    // 已入库的消息不得再重放：重连 flush 不重发，不产生第二条
-    sock.close();
-    await vi.advanceTimersByTimeAsync(1000);
+    expect(Socket.all).toEqual([sock]);
+  });
+
+  it("replays a new send even when an earlier message has the same content", async () => {
+    const sock = await open();
+    const prior = { ...message(1), sender_id: "me", content: "same text" };
+    sock.frame({ type: "message", message: prior });
+    const clientMsgId = sendChat("c", "same text");
+    const [sent] = sock.sent.filter((frame) => frame.type === "send_message");
+    expect(clientMsgId).toBe(sent.client_msg_id);
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(getState().messages.c.map((m) => m.id)).toEqual(["m1", `client:${clientMsgId}`]);
+    await vi.advanceTimersByTimeAsync(10_000);
     const second = Socket.all[Socket.all.length - 1];
+    expect(second).not.toBe(sock);
     second.onopen?.();
     await vi.advanceTimersByTimeAsync(0);
-    expect(second.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id)).not.toContain(frame.client_msg_id);
+    expect(second.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id))
+      .toEqual([sent.client_msg_id]);
+    second.frame({
+      type: "message_ack",
+      client_msg_id: sent.client_msg_id,
+      message: { ...prior, id: "m2", seq: 2 },
+    });
+    expect(getState().messages.c.map((m) => m.id)).toEqual(["m1", "m2"]);
+  });
+
+  it("sends distinct UUID v4 keys on LAN HTTP without crypto.randomUUID", async () => {
+    const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+    vi.stubGlobal("crypto", { getRandomValues });
+    const sock = await open();
+    sendChat("c", "same text");
+    sendChat("c", "same text");
+    const ids = sock.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id);
+    expect(ids).toHaveLength(2);
+    for (const id of ids) {
+      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    }
+    expect(new Set(ids).size).toBe(2);
   });
 
   it("keeps an unsent offline message pending for the reconnect flush instead of failing it", async () => {

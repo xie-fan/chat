@@ -3,9 +3,8 @@
 //! - Android：URL 校验与文件名净化仍在 Rust 侧完成，随后委托 Kotlin DownloadPlugin
 //!   （MediaStore.Downloads，IS_PENDING 行，API 29+；旧版本由 Kotlin 拒绝）。
 //!
-//! 安全边界：能力 URL /v1/files/{id}?dl=1 本身无鉴权，所以这里强校验——
-//!   origin 必须在前端传入的服务器列表内、路径恰为 /v1/files/<uuid>、query 只允许 dl=1，
-//!   且不跟重定向、绝不附带 Authorization。
+//! origin 必须在前端传入的服务器列表内，路径为 /v1/files/<uuid>。
+//! 短时附件票据通过 URL 提供，原生下载器不跟重定向，也不接收账号凭据。
 
 #[cfg(target_os = "android")]
 use tauri::Manager; // manage/try_state
@@ -108,8 +107,8 @@ fn truncate_keep_ext(name: &str) -> String {
 
 // ---------- 下载地址校验（C1） ----------
 
-/// 仅放行服务器能力 URL：http/https、路径恰为 [<服务器路径前缀>/]v1/files/<uuid>、
-/// query 为空或仅 dl=1、无 userinfo/fragment，origin 必须在允许的服务器列表内。
+/// 仅放行服务器附件 URL：http/https、路径恰为 [<服务器路径前缀>/]v1/files/<uuid>、
+/// query 只接受 dl=1 和单个附件票据，origin 须在允许列表内。
 fn validate_download_url(raw: &str, allowed_origins: &[String]) -> Result<url::Url, String> {
     const BAD: &str = "下载地址无效";
     let mut u = url::Url::parse(raw.trim()).map_err(|_| BAD.to_string())?;
@@ -122,9 +121,12 @@ fn validate_download_url(raw: &str, allowed_origins: &[String]) -> Result<url::U
     }
     u.set_fragment(None);
     let mut saw_dl = false;
+    let mut saw_ticket = false;
     for (k, v) in u.query_pairs() {
         if k == "dl" && v == "1" && !saw_dl {
             saw_dl = true;
+        } else if k == "ticket" && !saw_ticket && valid_ticket(&v) {
+            saw_ticket = true;
         } else {
             return Err(BAD.into());
         }
@@ -146,6 +148,17 @@ fn validate_download_url(raw: &str, allowed_origins: &[String]) -> Result<url::U
         return Ok(u);
     }
     Err("下载地址不在允许的服务器列表".into())
+}
+
+fn valid_ticket(ticket: &str) -> bool {
+    ticket.len() <= 512
+        && ticket.split('.').count() == 3
+        && ticket.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+        })
 }
 
 // ---------- 平台实现 ----------
@@ -276,7 +289,7 @@ mod imp {
         if e.is_timeout() {
             "下载超时".into()
         } else {
-            format!("下载失败：{e}")
+            format!("下载失败：{}", e.without_url())
         }
     }
 
@@ -395,8 +408,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_url_accepts_capability_url() {
-        for q in [format!("/v1/files/{UUID}?dl=1"), format!("/v1/files/{UUID}")] {
+    fn validate_url_accepts_attachment_ticket() {
+        for q in [
+            format!("/v1/files/{UUID}?dl=1&ticket=header.payload.signature"),
+            format!("/v1/files/{UUID}?dl=1"),
+            format!("/v1/files/{UUID}"),
+        ] {
             validate_download_url(&ok_url(&q), &[ORIGIN.to_string()]).unwrap();
         }
         // 服务器带路径前缀也认
@@ -418,6 +435,9 @@ mod tests {
             ok_url(&format!("/v1/files/{UUID}?dl=1&x=1")),
             ok_url(&format!("/v1/files/{UUID}?thumb=1")),
             ok_url(&format!("/v1/files/{UUID}?dl=1&dl=1")),
+            ok_url(&format!("/v1/files/{UUID}?ticket=a.b.c&ticket=d.e.f")),
+            ok_url(&format!("/v1/files/{UUID}?ticket=a..c")),
+            ok_url(&format!("/v1/files/{UUID}?ticket=a.b.c%2F")),
             format!("http://evil.example/v1/files/{UUID}?dl=1"),
             format!("http://u:p@127.0.0.1:28080/v1/files/{UUID}"),
             "not a url".to_string(),

@@ -23,8 +23,10 @@ export type FilePreviewTarget =
       mime: string;
       size?: number;
       badge?: string;
-      /** 直接可访问的媒体/文件 URL（如 /v1/files/{id}） */
+      /** 已准备好的媒体地址，例如撤回件草稿的 Object URL。 */
       url?: string;
+      /** 预览打开时为会话附件签发地址。 */
+      loadUrl?: () => Promise<string>;
       /** 需鉴权或本地异步获取的 Blob（如撤回保留件） */
       loadBlob?: () => Promise<Blob>;
     }
@@ -414,6 +416,26 @@ export default function FilePreview({
       return revokeUrl;
     };
 
+    const showPdf = async (blob: Blob, file: Omit<LoadedData, "status" | "viewKind">) => {
+      const header = await blob.slice(0, 1024).text();
+      if (!alive) return;
+      if (!/%PDF-[12]\.\d/.test(header)) {
+        setData({
+          ...file,
+          status: "ready",
+          viewKind: "unsupported",
+          unsupportedReason: "文件不是可预览的 PDF",
+        });
+        return;
+      }
+      setData({
+        ...file,
+        status: "ready",
+        viewKind: "pdf",
+        mediaUrl: assignObjectUrl(blob.slice(0, blob.size, "application/pdf")),
+      });
+    };
+
     const load = async () => {
       try {
         if (target.kind === "local-file") {
@@ -442,7 +464,11 @@ export default function FilePreview({
             });
             return;
           }
-          if (vk === "image" || vk === "pdf" || vk === "audio" || vk === "video") {
+          if (vk === "pdf") {
+            await showPdf(f, { fileName: f.name, mime: f.type, size: f.size, downloadBlob: f });
+            return;
+          }
+          if (vk === "image" || vk === "audio" || vk === "video") {
             const url = assignObjectUrl(f);
             let svgText: string | undefined;
             if (
@@ -486,6 +512,26 @@ export default function FilePreview({
             viewKind: vk,
           });
 
+          if (vk === "pdf") {
+            let blob: Blob;
+            if (target.loadBlob) {
+              blob = await target.loadBlob();
+            } else {
+              const url = target.url ?? await target.loadUrl?.();
+              if (!alive) return;
+              if (!url) throw new Error("找不到 PDF 附件");
+              const resp = await fetch(url, { cache: "no-store", referrerPolicy: "no-referrer" });
+              if (!resp.ok) throw new Error(`加载失败 (${resp.status})`);
+              blob = await resp.blob();
+            }
+            await showPdf(blob, {
+              fileName: target.fileName,
+              mime: target.mime,
+              size: target.size ?? blob.size,
+            });
+            return;
+          }
+
           if (target.loadBlob) {
             const blob = await target.loadBlob();
             if (!alive) return;
@@ -515,19 +561,13 @@ export default function FilePreview({
             return;
           }
 
-          if (!target.url) {
-            setData({
-              status: "loading",
-              fileName: target.fileName,
-              mime: target.mime,
-              size: target.size,
-              viewKind: vk,
-            });
+          const url = target.url ?? (vk !== "unsupported" ? await target.loadUrl?.() : undefined);
+          if (!alive || (!url && vk !== "unsupported")) {
             return;
           }
 
-          if (vk === "markdown" || vk === "csv" || vk === "code") {
-            const resp = await fetch(target.url);
+          if (url && (vk === "markdown" || vk === "csv" || vk === "code")) {
+            const resp = await fetch(url, { cache: "no-store", referrerPolicy: "no-referrer" });
             if (!resp.ok) throw new Error(`加载失败 (${resp.status})`);
             const txt = await resp.text();
             if (!alive) return;
@@ -549,7 +589,7 @@ export default function FilePreview({
             mime: target.mime,
             size: target.size,
             viewKind: vk,
-            mediaUrl: vk === "unsupported" ? undefined : target.url,
+            mediaUrl: url,
           });
           return;
         }
@@ -581,7 +621,13 @@ export default function FilePreview({
             });
             return;
           }
-          if (vk === "image" || vk === "pdf" || vk === "audio" || vk === "video") {
+          if (vk === "pdf") {
+            await showPdf(blob, {
+              fileName: att.file_name, mime: att.mime, size: att.size || blob.size, downloadBlob: blob,
+            });
+            return;
+          }
+          if (vk === "image" || vk === "audio" || vk === "video") {
             const url = assignObjectUrl(blob);
             let svgText: string | undefined;
             if (
@@ -626,6 +672,21 @@ export default function FilePreview({
         const res = await target.loadHostFile();
         if (!alive) return;
         const vk = classifyPreviewKind(res.file_name, res.mime);
+
+        if (vk === "pdf" && res.content !== null) {
+          const blob = res.encoding === "base64"
+            ? base64ToBlob(res.content, res.mime)
+            : new Blob([res.content], { type: res.mime });
+          await showPdf(blob, {
+            fileName: res.file_name,
+            mime: res.mime,
+            size: res.size,
+            resolvedPath: res.path,
+            downloadBlob: res.truncated ? undefined : blob,
+            truncated: res.truncated,
+          });
+          return;
+        }
 
         if (res.encoding === "utf8" && res.content !== null) {
           const effectiveKind = vk === "unsupported" ? "code" : vk;
@@ -1142,7 +1203,7 @@ export default function FilePreview({
         {data.viewKind === "pdf" && (
           <div className="pv-pdf-stage">
             {data.mediaUrl ? (
-              <iframe src={data.mediaUrl} title={data.fileName} />
+              <iframe src={data.mediaUrl} title={data.fileName} referrerPolicy="no-referrer" />
             ) : (
               <div className="pv-unsupported">PDF 加载中…</div>
             )}

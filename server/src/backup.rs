@@ -4,12 +4,14 @@
 //!      + FILES_DIR 全量文件，打成 tar.gz 存到 FILES_DIR/.backups/；
 //!      先写 *.part 再原子改名，列表只出成品。
 //! 恢复 = 上传留档 → 只读校验 → 维护模式踢掉在线连接（restoring，发起者会话除外）
-//!      → 单事务 TRUNCATE+COPY 回灌 → 原子换文件目录 → 全量吊销凭据。
+//!      → 单事务 TRUNCATE+COPY 回灌 → 记录并换位文件 → 提交回灌和恢复标记。
 //! 同一把 backup_busy 锁保证备份生成与恢复互不重叠。
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read as _,
+    ffi::OsString,
+    fs,
+    io::{self, Read as _, Write as _},
     path::{Component, Path, PathBuf},
     sync::atomic::Ordering,
     time::Duration,
@@ -43,6 +45,9 @@ const TABLES_SQL: &str = "SELECT table_name FROM information_schema.tables
 const MIGRATION_VERSION_SQL: &str =
     "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success";
 
+// 这些迁移只新增数据可从空表开始的功能。对应旧备份可以不携带这些表。
+const ADDITIVE_RESTORE_TABLES: &[(&str, i64)] = &[("android_fcm_devices", 44)];
+
 /// 备份/恢复过程中 FILES_DIR 里需要排除的顶层前缀
 /// 快照里数据库引用的文件（相对 FILES_DIR）：附件原文件、缩略图、头像
 const REFERENCED_FILES_SQL: &str = "SELECT storage_path FROM attachments
@@ -56,6 +61,9 @@ fn missing_list_path(bdir: &Path, name: &str) -> PathBuf {
 }
 
 const EXCLUDE_PREFIXES: &[&str] = &[".backups", ".restore-", ".spool-", ".upload-"];
+const ACTIVE_RESTORE: &str = ".restore-transaction";
+const STAGED_RESTORE: &str = ".restore-tmp-";
+const FINISHED_RESTORE: &str = ".restore-cleanup-";
 
 fn qi(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -157,13 +165,31 @@ pub async fn maintenance_gate(
     next: Next,
 ) -> Response {
     if st.maintenance.load(Ordering::SeqCst) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "服务维护中，请稍后" })),
-        )
-            .into_response();
+        return maintenance_response();
     }
+    // 恢复请求本身会获取独占锁，不能持有读锁等待自己的后台任务。
+    let _storage = if req.uri().path() == "/admin/restore" {
+        None
+    } else {
+        match storage_operation(&st) {
+            Some(guard) => Some(guard),
+            None => return maintenance_response(),
+        }
+    };
     next.run(req).await
+}
+
+fn maintenance_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "服务维护中，请稍后" })),
+    )
+        .into_response()
+}
+
+pub(crate) fn storage_operation(st: &SharedState) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+    let guard = st.storage_barrier.try_read().ok()?;
+    (!st.maintenance.load(Ordering::SeqCst)).then_some(guard)
 }
 
 // ---------- REST handlers ----------
@@ -661,10 +687,12 @@ pub async fn restore(
     }
 
     // 第一步：只读校验（不解包落盘、不动任何状态）
-    let _manifest = validate_archive(st.clone(), upload_path.clone()).await?;
+    let manifest = validate_archive(st.clone(), upload_path.clone()).await?;
+    check_legacy_restore(&files_dir)?;
+    let archived_tables = manifest.tables.into_iter().map(|table| table.name).collect();
 
     // 第二步：恢复挪进独立任务执行——客户端中断连接（浏览器登出/断网）后恢复必须继续
-    // 跑完并把维护闸放下，否则服务会永久卡在 503。锁/旗标/清理都由任务的 Drop 守卫兜底。
+    // 跑完并收敛文件和数据库状态。锁、维护闸和上传暂存文件均由守卫管理。
     // 踢下线原因 restoring（区别于「维护中」：前端提示恢复完成后重新登录）；
     // 发起者的会话连接保留——它的恢复请求还在等结果，踢掉会先弹出踢下线文案。
     let keep_sid = ctx.sid;
@@ -673,9 +701,11 @@ pub async fn restore(
     let task = tokio::spawn(async move {
         let _busy = busy;
         let _cleanup_upload = cleanup_upload;
-        let _maint = MaintGuard::enter(&st2); // 进维护态；Drop 兜底退出（含 panic/取消路径）
+        // 从这一步起拒绝新操作，排空已通过维护闸的请求后才换位文件。
+        let _maint = MaintGuard::enter(&st2);
         st2.kick_all_except_session(keep_sid, "restoring");
-        do_restore(&st2, &upload2).await
+        let _storage = st2.storage_barrier.write().await;
+        do_restore(&st2, &upload2, &archived_tables).await
     });
     match task.await {
         Ok(res) => Ok(Json(res?)),
@@ -683,17 +713,24 @@ pub async fn restore(
     }
 }
 
-/// 维护态进入/退出守卫：Drop 时强制落下闸，panic 与 future 被取消都不会卡死服务。
+/// 仅在没有未完成文件换位时退出维护模式。恢复日志会在重启时继续处理。
 struct MaintGuard(SharedState);
 impl MaintGuard {
     fn enter(st: &SharedState) -> Self {
         st.maintenance.store(true, Ordering::SeqCst);
+        st.restore_epoch.fetch_add(1, Ordering::AcqRel);
+        st.maintenance_started.notify_waiters();
         Self(st.clone())
     }
 }
 impl Drop for MaintGuard {
     fn drop(&mut self) {
-        self.0.maintenance.store(false, Ordering::SeqCst);
+        let active = Path::new(&self.0.cfg.files_dir).join(ACTIVE_RESTORE);
+        if matches!(active.try_exists(), Ok(false)) {
+            self.0.maintenance.store(false, Ordering::SeqCst);
+        } else {
+            tracing::error!(path = %active.display(), "restore recovery pending; API stays in maintenance");
+        }
     }
 }
 
@@ -737,6 +774,9 @@ async fn validate_archive(st: SharedState, upload_path: PathBuf) -> AppResult<Ma
                 return Err(AppError::bad_request("备份包含非法路径"));
             }
             let s = p.to_string_lossy().replace('\\', "/");
+            if !safe_rel_path(Path::new(&s)) {
+                return Err(AppError::bad_request("备份包含非法路径"));
+            }
             if s == "manifest.json" {
                 let mut buf = Vec::new();
                 e.read_to_end(&mut buf)
@@ -749,13 +789,23 @@ async fn validate_archive(st: SharedState, upload_path: PathBuf) -> AppResult<Ma
                 if let Some(tn) = t.strip_suffix(".csv") {
                     db_csvs.insert(tn.to_string());
                 }
+            } else if let Some(rel) = s.strip_prefix("files/").filter(|rel| !rel.is_empty()) {
+                let rel = Path::new(rel);
+                if !safe_rel_path(rel) {
+                    return Err(AppError::bad_request("备份包含非法路径"));
+                }
+                if let Some(Component::Normal(name)) = rel.components().next() {
+                    if !restore_data_entry(name) {
+                        return Err(AppError::internal("备份包含保留的附件目录"));
+                    }
+                }
             }
         }
         let m = manifest.ok_or_else(|| AppError::bad_request("备份缺少 manifest.json"))?;
         if m.format != 1 {
             return Err(AppError::bad_request("备份格式版本不支持"));
         }
-        // 只允许「不比当前新」的备份：更老版本的备份可恢复——表集合仍须一致，
+        // 只允许「不比当前新」的备份，已知新增表可以在对应旧备份中缺省。
         // 逐表按 CSV 表头列清单回灌，备份里缺的新列（如 attachments.recalled_at）
         // 落默认值；更新版本生成的备份拒绝，防止降级灌库。
         if m.migration_version > mv {
@@ -764,7 +814,13 @@ async fn validate_archive(st: SharedState, upload_path: PathBuf) -> AppResult<Ma
             ));
         }
         let mset: BTreeSet<String> = m.tables.iter().map(|t| t.name.clone()).collect();
-        if mset != expected {
+        if !mset.is_subset(&expected)
+            || expected.difference(&mset).any(|missing| {
+                !ADDITIVE_RESTORE_TABLES.iter().any(|&(table, introduced)| {
+                    missing == table && m.migration_version < introduced
+                })
+            })
+        {
             return Err(AppError::bad_request("备份表结构与当前服务端不一致"));
         }
         for t in &mset {
@@ -778,7 +834,7 @@ async fn validate_archive(st: SharedState, upload_path: PathBuf) -> AppResult<Ma
     .map_err(AppError::internal)?
 }
 
-/// 解包：db/*.csv → staging/db/；files/* → FILES_DIR/.restore-new/。
+/// 解包：db/*.csv → staging/db/；files/* → staging/new/。
 /// 返回解出的文件数。
 fn extract_archive(upload: &Path, db_dir: &Path, new_dir: &Path) -> Result<u64, String> {
     std::fs::create_dir_all(db_dir).map_err(|e| e.to_string())?;
@@ -798,6 +854,9 @@ fn extract_archive(upload: &Path, db_dir: &Path, new_dir: &Path) -> Result<u64, 
             return Err("备份包含非法路径".to_string());
         }
         let s = p.to_string_lossy().replace('\\', "/");
+        if !safe_rel_path(Path::new(&s)) {
+            return Err("备份包含非法路径".to_string());
+        }
         if let Some(t) = s.strip_prefix("db/") {
             // db 条目只允许单层文件名
             if t.contains('/') || t.contains('\\') || t.is_empty() {
@@ -810,12 +869,16 @@ fn extract_archive(upload: &Path, db_dir: &Path, new_dir: &Path) -> Result<u64, 
             if rel.is_empty() {
                 continue;
             }
+            if !safe_rel_path(Path::new(rel)) {
+                return Err("备份包含非法路径".to_string());
+            }
             let dst = new_dir.join(rel);
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let mut o = std::fs::File::create(&dst).map_err(|e| e.to_string())?;
             std::io::copy(&mut e, &mut o).map_err(|e| e.to_string())?;
+            o.sync_all().map_err(|e| e.to_string())?;
             n += 1;
         }
     }
@@ -875,6 +938,7 @@ fn restore_order(
 async fn restore_db(
     st: &SharedState,
     db_dir: &Path,
+    archived_tables: &BTreeSet<String>,
 ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Vec<String>), AppError> {
     let tables = current_tables(st).await?;
     let edges_raw: Vec<(String, String, String, String)> = sqlx::query_as(
@@ -913,7 +977,8 @@ async fn restore_db(
     .execute(&mut *tx)
     .await?;
     tracing::info!("restore_db: truncate ok, copying {} tables", order.len());
-    for t in &order {
+    // 仍然清空所有当前业务表。备份时代尚未创建的表保持为空。
+    for t in order.iter().filter(|table| archived_tables.contains(*table)) {
         let csv = db_dir.join(format!("{t}.csv"));
         if !csv.is_file() {
             return Err(AppError::internal(format!("missing csv for table {t}")));
@@ -964,7 +1029,9 @@ async fn copy_column_list(
     csv: &Path,
 ) -> Result<String, AppError> {
     use tokio::io::AsyncBufReadExt;
-    let f = tokio::fs::File::open(csv).await.map_err(AppError::internal)?;
+    let f = tokio::fs::File::open(csv)
+        .await
+        .map_err(AppError::internal)?;
     let header = tokio::io::BufReader::new(f)
         .lines()
         .next_line()
@@ -984,7 +1051,9 @@ async fn copy_column_list(
     for raw in header.trim_end_matches('\r').split(',') {
         let c = raw.trim().trim_matches('"');
         if c.is_empty() || !known.contains(c) {
-            return Err(AppError::bad_request(format!("备份表 {table} 含未知列 {c}")));
+            return Err(AppError::bad_request(format!(
+                "备份表 {table} 含未知列 {c}"
+            )));
         }
         cols.push(qi(c));
     }
@@ -1003,132 +1072,398 @@ fn unqualify(reg: &str) -> String {
         .to_string()
 }
 
-/// files_dir 顶层里参与替换的条目（.backups/.restore-*/.spool-* 两边都不动）
-fn swap_entries(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let name = e.map_err(|e| e.to_string())?.file_name();
-        if !EXCLUDE_PREFIXES
-            .iter()
-            .any(|x| name.to_string_lossy().starts_with(x))
-        {
-            out.push(name);
-        }
-    }
-    Ok(out)
+fn entry_names(dir: &Path) -> io::Result<Vec<OsString>> {
+    fs::read_dir(dir)?
+        .map(|entry| entry.map(|e| e.file_name()))
+        .collect()
 }
 
-/// 逐个 rename from → to；中途失败把已挪的挪回去再报错（尽力而为，挪回失败只记日志）
-fn move_all(names: &[std::ffi::OsString], from: &Path, to: &Path) -> Result<(), String> {
-    for (i, n) in names.iter().enumerate() {
-        if let Err(e) = std::fs::rename(from.join(n), to.join(n)) {
-            for n in &names[..i] {
-                if let Err(e2) = std::fs::rename(to.join(n), from.join(n)) {
-                    tracing::error!(name = ?n, error = %e2, "restore: move back failed");
-                }
+fn restore_data_entry(name: &std::ffi::OsStr) -> bool {
+    !EXCLUDE_PREFIXES
+        .iter()
+        .any(|prefix| name.to_string_lossy().starts_with(prefix))
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> io::Result<()> {
+    // Windows 的目录句柄不能用 File::sync_all。文件内容仍会同步，目录换位均为同卷改名。
+    Ok(())
+}
+
+fn sync_directory_tree(root: &Path) -> io::Result<()> {
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs.push(entry.path());
             }
-            return Err(format!("{}: {e}", n.to_string_lossy()));
         }
+        sync_directory(&dir)?;
     }
     Ok(())
 }
 
-/// 文件替换：当前文件 → .restore-old，.restore-new → 原位。失败时撤回到原状再报错。
-/// 返回 (旧条目, 新条目)，数据库提交失败时交给 unswap_files 撤回。
-type Swapped = (Vec<std::ffi::OsString>, Vec<std::ffi::OsString>);
-fn swap_files(files_dir: &Path, new_dir: &Path, old_dir: &Path) -> Result<Swapped, String> {
-    std::fs::create_dir_all(old_dir).map_err(|e| e.to_string())?;
-    let old = swap_entries(files_dir)?;
-    let new: Vec<_> = std::fs::read_dir(new_dir)
-        .map_err(|e| e.to_string())?
-        .map(|e| e.map(|e| e.file_name()).map_err(|e| e.to_string()))
-        .collect::<Result<_, _>>()?;
-    move_all(&old, files_dir, old_dir)?;
-    if let Err(e) = move_all(&new, new_dir, files_dir) {
-        move_all(&old, old_dir, files_dir)
-            .map_err(|e2| format!("{e}; 旧文件挪回失败（保留在 .restore-old）: {e2}"))?;
-        return Err(e);
+fn move_restore_entries(
+    names: impl IntoIterator<Item = OsString>,
+    from: &Path,
+    to: &Path,
+) -> io::Result<()> {
+    for name in names {
+        let dst = to.join(&name);
+        match fs::symlink_metadata(&dst) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("恢复目标已存在：{}", dst.display()),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::rename(from.join(name), &dst)?;
     }
-    Ok((old, new))
+    sync_directory(from)?;
+    sync_directory(to)
 }
 
-fn unswap_files(
-    files_dir: &Path,
-    new_dir: &Path,
-    old_dir: &Path,
-    sw: &Swapped,
-) -> Result<(), String> {
-    move_all(&sw.1, files_dir, new_dir)?;
-    move_all(&sw.0, old_dir, files_dir)
+fn mark_restore_phase(journal: &Path, phase: &str) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(journal.join(phase))?
+        .sync_all()?;
+    sync_directory(journal)
 }
 
-async fn do_restore(st: &SharedState, upload_path: &Path) -> AppResult<Value> {
-    tracing::info!("restore: begin");
-    let files_dir = PathBuf::from(&st.cfg.files_dir);
-    let staging = files_dir.join(format!(".restore-tmp-{}", Uuid::new_v4().simple()));
-    let new_dir = files_dir.join(".restore-new");
-    let old_dir = files_dir.join(".restore-old");
-    // 上次恢复撤回失败时原文件留在 .restore-old：不能再往里挪、更不能在成功后连它一起删
-    if std::fs::read_dir(&old_dir).is_ok_and(|mut d| d.next().is_some()) {
+fn install_restore_files(files_dir: &Path, staging: &Path, id: Uuid) -> io::Result<()> {
+    let new = entry_names(&staging.join("new"))?;
+    if new.iter().any(|name| !restore_data_entry(name)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "备份包含保留的附件目录",
+        ));
+    }
+
+    // 日志与两个同卷目录准备完成后，才开始移动任何现有文件。
+    fs::create_dir(staging.join("old"))?;
+    {
+        let mut marker = fs::File::create(staging.join("id"))?;
+        marker.write_all(id.to_string().as_bytes())?;
+        marker.sync_all()?;
+    }
+    sync_directory_tree(&staging.join("new"))?;
+    sync_directory(&staging.join("old"))?;
+    sync_directory(staging)?;
+    let journal = files_dir.join(ACTIVE_RESTORE);
+    if journal.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "已有未完成的恢复日志",
+        ));
+    }
+    fs::rename(staging, &journal)?;
+    sync_directory(files_dir)?;
+
+    let old = entry_names(files_dir)?
+        .into_iter()
+        .filter(|name| restore_data_entry(name));
+    move_restore_entries(old, files_dir, &journal.join("old"))?;
+    mark_restore_phase(&journal, "old_saved")?;
+    move_restore_entries(new, &journal.join("new"), files_dir)
+}
+
+fn complete_restore_files(files_dir: &Path, id: Uuid, committed: bool) -> io::Result<()> {
+    let journal = files_dir.join(ACTIVE_RESTORE);
+    let old_saved = journal.join("old_saved").try_exists()?;
+    if committed {
+        // 数据库提交前已经完成全部换位，旧目录只剩清理。
+        if !old_saved || !entry_names(&journal.join("new"))?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "已提交的恢复日志缺少文件换位记录",
+            ));
+        }
+    } else {
+        // 新文件只在全部旧文件搬完后才开始换入。回退时先清空新文件，再搬回旧文件。
+        // 单独记录回退进度，避免第二次中断后把已经搬回的旧文件当成新文件处理。
+        if old_saved && !journal.join("new_removed").try_exists()? {
+            let installed = entry_names(files_dir)?
+                .into_iter()
+                .filter(|name| restore_data_entry(name));
+            move_restore_entries(installed, files_dir, &journal.join("new"))?;
+            mark_restore_phase(&journal, "new_removed")?;
+        }
+        let old_dir = journal.join("old");
+        move_restore_entries(entry_names(&old_dir)?, &old_dir, files_dir)?;
+    }
+
+    // 换位或回退完成后，先原子移走日志，再清理已完成的目录。中断清理不影响恢复判断。
+    let finished = files_dir.join(format!("{FINISHED_RESTORE}{}", id.simple()));
+    fs::rename(journal, &finished)?;
+    sync_directory(files_dir)?;
+    remove_restore_dir(&finished);
+    Ok(())
+}
+
+fn remove_restore_dir(path: &Path) {
+    if let Err(e) = fs::remove_dir_all(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), error = %e, "restore temporary directory cleanup failed");
+        }
+    }
+}
+
+fn check_legacy_restore(files_dir: &Path) -> AppResult<()> {
+    let old = files_dir.join(".restore-old");
+    let mut entries = match fs::read_dir(&old) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::internal(e)),
+    };
+    if entries.next().is_some()
+        || files_dir
+            .join(".restore-new")
+            .try_exists()
+            .map_err(AppError::internal)?
+    {
         return Err(AppError::internal(format!(
-            "{} 非空（上次恢复遗留的原文件），请人工处理后再恢复",
-            old_dir.display()
+            "{} 留有旧版本恢复数据，请核对数据库与附件后再继续",
+            old.display()
         )));
     }
-    // .restore-new 只会是解包出的备份副本，残留直接清掉
-    let _ = tokio::fs::remove_dir_all(&new_dir).await;
-    let upload2 = upload_path.to_path_buf();
-    let db_dir = staging.join("db");
-    let new2 = new_dir.clone();
-    let staging2 = staging.clone();
-    let files = match tokio::task::spawn_blocking(move || extract_archive(&upload2, &db_dir, &new2))
+    Ok(())
+}
+
+/// 等待 PostgreSQL 确定事务结果，再判断附件应该保留新版本还是回退。
+async fn reconcile_restore(pool: &sqlx::PgPool, files_dir: &Path) -> AppResult<Option<bool>> {
+    let journal = files_dir.join(ACTIVE_RESTORE);
+    if !journal.try_exists().map_err(AppError::internal)? {
+        return Ok(None);
+    }
+    let id = tokio::fs::read_to_string(journal.join("id"))
+        .await
+        .map_err(AppError::internal)?;
+    let id = Uuid::parse_str(&id).map_err(AppError::internal)?;
+    // 连接中断可能发生在 COMMIT 已送达、尚未收到回执时。行锁等待该事务真正结束。
+    let committed_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT operation_id FROM chat_internal.backup_restore WHERE singleton FOR UPDATE",
+    )
+    .fetch_one(pool)
+    .await?;
+    let committed = committed_id == Some(id);
+    let files_dir = files_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || complete_restore_files(&files_dir, id, committed))
         .await
         .map_err(AppError::internal)?
-    {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&staging2).await;
-            let _ = tokio::fs::remove_dir_all(&new_dir).await;
-            return Err(AppError::bad_request(format!("备份解包失败: {e}")));
-        }
-    };
+        .map_err(AppError::internal)?;
+    tracing::info!(%id, committed, "restore journal resolved");
+    Ok(Some(committed))
+}
 
-    // 顺序：库回灌（不提交）→ 换文件 → 提交。换文件失败丢弃事务；提交失败把文件换回去。
-    let r = async {
-        tracing::info!("restore: extracted files={files}, restore_db start");
-        let (tx, tables) = restore_db(st, &staging.join("db")).await?;
-        let (f2, n2, o2) = (files_dir.clone(), new_dir.clone(), old_dir.clone());
-        let swapped = tokio::task::spawn_blocking(move || swap_files(&f2, &n2, &o2))
+/// 正式启动在接受请求及清扫附件之前调用。发现有未完成的换位时先收敛到数据库的版本。
+pub(crate) async fn recover_interrupted_restore(
+    pool: &sqlx::PgPool,
+    files_dir: &Path,
+) -> AppResult<()> {
+    check_legacy_restore(files_dir)?;
+    reconcile_restore(pool, files_dir).await?;
+    let files_dir = files_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        for entry in fs::read_dir(files_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let id = name
+                .strip_prefix(STAGED_RESTORE)
+                .or_else(|| name.strip_prefix(FINISHED_RESTORE));
+            if id.is_some_and(|id| Uuid::parse_str(id).is_ok()) {
+                remove_restore_dir(&entry.path());
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(AppError::internal)?
+    .map_err(AppError::internal)
+}
+
+async fn do_restore(
+    st: &SharedState,
+    upload_path: &Path,
+    archived_tables: &BTreeSet<String>,
+) -> AppResult<Value> {
+    let files_dir = PathBuf::from(&st.cfg.files_dir);
+    let id = Uuid::new_v4();
+    let staging = files_dir.join(format!("{STAGED_RESTORE}{}", id.simple()));
+    let upload = upload_path.to_path_buf();
+    let db_dir = staging.join("db");
+    let new_dir = staging.join("new");
+
+    let attempt = async {
+        let files =
+            tokio::task::spawn_blocking(move || extract_archive(&upload, &db_dir, &new_dir))
+                .await
+                .map_err(AppError::internal)?
+                .map_err(|e| AppError::bad_request(format!("备份解包失败: {e}")))?;
+        let (mut tx, tables) = restore_db(st, &staging.join("db"), archived_tables).await?;
+        sqlx::query("SET LOCAL synchronous_commit = on")
+            .execute(&mut *tx)
+            .await?;
+        let marker = sqlx::query(
+            "UPDATE chat_internal.backup_restore SET operation_id = $1 WHERE singleton",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if marker.rows_affected() != 1 {
+            return Err(AppError::internal("数据库缺少恢复提交标记"));
+        }
+        let root = files_dir.clone();
+        let stage = staging.clone();
+        tokio::task::spawn_blocking(move || install_restore_files(&root, &stage, id))
             .await
             .map_err(AppError::internal)?
-            .map_err(|e| AppError::internal(format!("文件替换失败（数据库未改动）: {e}")))?;
-        if let Err(e) = tx.commit().await {
-            let (f2, n2, o2) = (files_dir.clone(), new_dir.clone(), old_dir.clone());
-            let back = tokio::task::spawn_blocking(move || unswap_files(&f2, &n2, &o2, &swapped))
-                .await
-                .map_err(AppError::internal)?;
-            return Err(AppError::internal(match back {
-                Ok(()) => format!("数据库提交失败，文件已换回: {e}"),
-                Err(b) => {
-                    format!("数据库提交失败，文件换回失败（原文件在 .restore-old）: {e}; {b}")
-                }
-            }));
-        }
-        tracing::info!("restore: committed");
-        Ok::<_, AppError>(json!({
-            "tables": tables,
-            "files": files,
-        }))
+            .map_err(|e| AppError::internal(format!("文件替换失败: {e}")))?;
+        Ok::<_, AppError>((files, tables, tx.commit().await))
     }
     .await;
 
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    let _ = tokio::fs::remove_dir_all(&new_dir).await;
-    if r.is_ok() {
-        let _ = tokio::fs::remove_dir_all(&old_dir).await;
-    } else if tokio::fs::remove_dir(&old_dir).await.is_err() && old_dir.exists() {
-        // 只删空目录：非空说明原文件没能挪回，留给人工
-        tracing::error!(dir = %old_dir.display(), "restore failed; original files kept here");
+    let outcome = reconcile_restore(&st.pool, &files_dir).await;
+    tokio::task::spawn_blocking(move || remove_restore_dir(&staging))
+        .await
+        .map_err(AppError::internal)?;
+    let committed = outcome? == Some(true);
+    let (files, tables, commit) = attempt?;
+    if !committed {
+        return Err(AppError::internal(format!(
+            "数据库恢复未提交，附件已回退: {commit:?}"
+        )));
     }
-    r
+    if let Err(e) = commit {
+        tracing::warn!(error = %e, %id, "restore commit verified after connection error");
+    }
+    Ok(json!({ "tables": tables, "files": files }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RestoreTestDir(PathBuf);
+
+    impl RestoreTestDir {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("chat-restore-test-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for RestoreTestDir {
+        fn drop(&mut self) {
+            remove_restore_dir(&self.0);
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn startup_recovers_partial_file_swap(pool: sqlx::PgPool) {
+        let dir = RestoreTestDir::new();
+        let root = &dir.0;
+        let journal = root.join(ACTIVE_RESTORE);
+        fs::create_dir_all(journal.join("old")).unwrap();
+        fs::create_dir(journal.join("new")).unwrap();
+        fs::write(journal.join("id"), Uuid::new_v4().to_string()).unwrap();
+        // 第一批旧文件刚移走一条，此时根目录仍有旧内容，新文件尚未安装。
+        fs::write(journal.join("old/already-moved"), b"old").unwrap();
+        fs::write(root.join("not-yet-moved"), b"still here").unwrap();
+        fs::write(journal.join("new/replacement"), b"incoming").unwrap();
+
+        recover_interrupted_restore(&pool, root).await.unwrap();
+
+        assert_eq!(fs::read(root.join("already-moved")).unwrap(), b"old");
+        assert_eq!(fs::read(root.join("not-yet-moved")).unwrap(), b"still here");
+        assert!(!root.join("replacement").exists());
+        assert!(!journal.exists());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn startup_rolls_back_files_after_uncommitted_restore(pool: sqlx::PgPool) {
+        let dir = RestoreTestDir::new();
+        let root = &dir.0;
+        let id = Uuid::new_v4();
+        let stage = root.join(format!("{STAGED_RESTORE}{}", id.simple()));
+        fs::create_dir_all(stage.join("new")).unwrap();
+        fs::write(stage.join("new/shared"), b"new").unwrap();
+        fs::write(stage.join("new/added"), b"new only").unwrap();
+        fs::write(root.join("shared"), b"old").unwrap();
+        fs::write(root.join("removed"), b"old only").unwrap();
+        install_restore_files(root, &stage, id).unwrap();
+
+        recover_interrupted_restore(&pool, root).await.unwrap();
+
+        assert_eq!(fs::read(root.join("shared")).unwrap(), b"old");
+        assert_eq!(fs::read(root.join("removed")).unwrap(), b"old only");
+        assert!(!root.join("added").exists());
+        assert!(!root.join(ACTIVE_RESTORE).exists());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn startup_waits_for_commit_and_keeps_committed_files(pool: sqlx::PgPool) {
+        let dir = RestoreTestDir::new();
+        let root = &dir.0;
+        let id = Uuid::new_v4();
+        let stage = root.join(format!("{STAGED_RESTORE}{}", id.simple()));
+        fs::create_dir_all(stage.join("new")).unwrap();
+        fs::write(stage.join("new/shared"), b"new").unwrap();
+        fs::write(root.join("shared"), b"old").unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE chat_internal.backup_restore SET operation_id = $1 WHERE singleton")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        install_restore_files(root, &stage, id).unwrap();
+
+        // 连接断开时 PostgreSQL 可能仍在提交。恢复要等待事务决定，而不是读取旧行。
+        let recovery = recover_interrupted_restore(&pool, root);
+        tokio::pin!(recovery);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut recovery)
+                .await
+                .is_err()
+        );
+        tx.commit().await.unwrap();
+        recovery.await.unwrap();
+
+        assert_eq!(fs::read(root.join("shared")).unwrap(), b"new");
+        assert!(!root.join(ACTIVE_RESTORE).exists());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn startup_resumes_an_interrupted_rollback(pool: sqlx::PgPool) {
+        let dir = RestoreTestDir::new();
+        let root = &dir.0;
+        let journal = root.join(ACTIVE_RESTORE);
+        fs::create_dir_all(journal.join("old")).unwrap();
+        fs::create_dir(journal.join("new")).unwrap();
+        fs::write(journal.join("id"), Uuid::new_v4().to_string()).unwrap();
+        mark_restore_phase(&journal, "old_saved").unwrap();
+        mark_restore_phase(&journal, "new_removed").unwrap();
+        fs::write(journal.join("new/shared"), b"new").unwrap();
+        fs::write(journal.join("old/remaining"), b"old only").unwrap();
+        fs::write(root.join("shared"), b"old").unwrap();
+
+        recover_interrupted_restore(&pool, root).await.unwrap();
+
+        assert_eq!(fs::read(root.join("shared")).unwrap(), b"old");
+        assert_eq!(fs::read(root.join("remaining")).unwrap(), b"old only");
+        assert!(!journal.exists());
+    }
 }

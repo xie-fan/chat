@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::time::Instant;
+use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
 mod account;
@@ -166,6 +167,7 @@ pub fn router(cfg: &crate::config::Config, st: &SharedState) -> Router<SharedSta
                         cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,
                     )),
                 )
+                .route("/bot/files/{id}", get(download_file))
                 .route("/bot/messages/{id}", patch(edit_message))
                 .route("/bot/messages/{id}/recall", post(recall_message))
                 .route("/bot/messages/{id}/record", get(get_record))
@@ -177,9 +179,20 @@ pub fn router(cfg: &crate::config::Config, st: &SharedState) -> Router<SharedSta
                 cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,
             )),
         )
-        .route("/files/{id}", get(download_file))
-        // 撤回附件取回：仅上传者本人、Bearer 认证、TTL 内；no-store
-        .route("/files/{id}/recalled", get(download_recalled))
+        .merge(
+            Router::new()
+                .route("/files/{id}", get(download_file).delete(delete_unattached_file))
+                .route("/files/{id}/ticket", get(issue_file_ticket))
+                .route("/files/{id}/recalled", get(download_recalled))
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static(FILE_CACHE_CONTROL),
+                ))
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::REFERRER_POLICY,
+                    header::HeaderValue::from_static("no-referrer"),
+                )),
+        )
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
         .route("/server-info", get(settings::server_info))

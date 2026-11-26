@@ -164,19 +164,6 @@ async fn set_repo(pool: &sqlx::PgPool, v: &str) {
     .unwrap();
 }
 
-/// 直接写 server_settings.public_url。代码默认已是公网地址，要测
-/// 「显式空 = 按请求 Host 拼下载地址」的用例需先置空。
-async fn set_public_url(pool: &sqlx::PgPool, v: &str) {
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('public_url', to_jsonb($1::text))
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .bind(v)
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
 #[tokio::test]
 async fn github_release_flow() {
     let _lock = ENV_LOCK.lock().await;
@@ -189,8 +176,6 @@ async fn github_release_flow() {
     ]);
     let (_guard, base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
     set_repo(&st.pool, "octo/chat").await;
-    // public_url 默认是公网地址；本用例断言下载 url 按请求 Host 拼，须显式置空
-    set_public_url(&st.pool, "").await;
 
     // /client/latest：GitHub release 字段映射
     let r: Value = http()
@@ -233,9 +218,7 @@ async fn github_release_flow() {
 
     // /client/download：跨 host 302 流式回源
     let resp = http()
-        .get(format!(
-            "{base}/v1/client/download/Chat_9.9.9_x64-setup.exe"
-        ))
+        .get(r["url"].as_str().unwrap())
         .send()
         .await
         .unwrap();

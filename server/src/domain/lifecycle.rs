@@ -449,27 +449,87 @@ pub async fn sweep_recalled_attachments(
 
     // 提交后逐个路径重查引用计数再删文件：行删除与新克隆行插入可能交错。
     // storage_path 与 thumb_path 分开判定（克隆行共享两者，各自独立计数）。
-    for (_, path, thumb) in &expired {
-        for stored in [Some(path), thumb.as_ref()].into_iter().flatten() {
-            let still_used = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM attachments
-                  WHERE storage_path = $1 OR thumb_path = $1)",
-            )
-            .bind(stored)
-            .fetch_one(pool)
-            .await?;
-            if !still_used {
-                let fp = crate::api::stored_file_path(files_dir, stored);
-                if let Err(e) = tokio::fs::remove_file(&fp).await {
-                    // 文件不存在不算错（可能已被上一轮删过）
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(path = %fp.display(), error = %e, "recalled attachment cleanup failed");
-                    }
-                }
+    let paths = expired
+        .iter()
+        .flat_map(|(_, path, thumb)| [Some(path), thumb.as_ref()])
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    cleanup_unreferenced_attachment_files(pool, files_dir, &paths).await?;
+    Ok(n)
+}
+
+/// 删除已经没有附件行引用的物理文件。数据库行删除必须先完成，再调用此函数。
+/// 这样共享物理文件的转发副本仍然可以继续使用。
+pub async fn cleanup_unreferenced_attachment_files(
+    pool: &PgPool,
+    files_dir: &str,
+    paths: &[String],
+) -> Result<(), sqlx::Error> {
+    for stored in paths {
+        let still_used = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM attachments
+              WHERE storage_path = $1 OR thumb_path = $1)",
+        )
+        .bind(stored)
+        .fetch_one(pool)
+        .await?;
+        if still_used {
+            continue;
+        }
+        let fp = crate::api::stored_file_path(files_dir, stored);
+        if let Err(e) = tokio::fs::remove_file(&fp).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %fp.display(), error = %e, "attachment cleanup failed");
             }
         }
     }
-    Ok(n)
+    Ok(())
+}
+
+/// 清理上传后长期未关联消息的附件。先锁附件行，再用新的 READ COMMITTED 快照重查引用，
+/// 避免与发送消息的 attachment 行锁互相竞态时删除刚要发送的文件。
+pub async fn sweep_unattached_attachments(
+    pool: &PgPool,
+    files_dir: &str,
+    age: std::time::Duration,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let candidates = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+        "SELECT a.id, a.storage_path, a.thumb_path
+           FROM attachments a
+          WHERE a.created_at <= now() - make_interval(secs => $1)
+            AND a.recalled_at IS NULL AND a.record_message_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.attachment_id = a.id)
+          FOR UPDATE SKIP LOCKED",
+    )
+    .bind(age.as_secs_f64())
+    .fetch_all(&mut *tx)
+    .await?;
+    if candidates.is_empty() {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    let ids: Vec<Uuid> = candidates.iter().map(|row| row.0).collect();
+    let deleted = sqlx::query(
+        "DELETE FROM attachments a
+          WHERE a.id = ANY($1)
+            AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.attachment_id = a.id)",
+    )
+    .bind(&ids)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+
+    let paths = candidates
+        .iter()
+        .flat_map(|(_, path, thumb)| [Some(path), thumb.as_ref()])
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    cleanup_unreferenced_attachment_files(pool, files_dir, &paths).await?;
+    Ok(deleted)
 }
 
 pub(super) const PIN_CAP: i64 = 20;

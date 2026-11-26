@@ -52,7 +52,10 @@ pub fn build_router(state: SharedState, cfg: &Config) -> Router {
             error::AppError::internal(format!("handler panic: {msg}")).into_response()
         }))
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+            // Authenticated media and WebSocket upgrades can carry short-lived tickets in the query.
+            tracing::debug_span!("request", method = %req.method(), path = %req.uri().path())
+        }))
         .with_state(state);
     if let Some(dist) = &cfg.app_dist {
         let index = format!("{dist}/index.html");
@@ -78,7 +81,7 @@ pub fn build_router(state: SharedState, cfg: &Config) -> Router {
 }
 
 /// 和 app/src-tauri/tauri.conf.json 的 csp 保持一致，另加不许被别的站点嵌进 iframe（点击劫持）。
-const WEB_CSP: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob: http: https:; media-src 'self' http: https: blob:; frame-src 'self' http: https:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'self'; frame-ancestors 'self'";
+const WEB_CSP: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob: http: https:; media-src 'self' http: https: blob:; frame-src 'self' http: https: blob:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'self'; frame-ancestors 'self'";
 
 pub async fn run() {
     tracing_subscriber::fmt()
@@ -92,12 +95,15 @@ pub async fn run() {
         .run(&pool)
         .await
         .expect("migrations failed");
+    backup::recover_interrupted_restore(&pool, std::path::Path::new(&cfg.files_dir))
+        .await
+        .expect("interrupted backup restore recovery failed");
     if let Err(e) = acp::reset_stale_acp_state(&pool).await {
         tracing::warn!(error = %e, "failed to reset stale acp state on startup");
     }
 
     let state = AppState::new_with_fcm(pool.clone(), cfg.clone(), fcm::FcmFile::from_env());
-    let app = build_router(state, &cfg);
+    let app = build_router(state.clone(), &cfg);
 
     // 撤回附件 & 未关联的过期 ACP 附件定时清扫（默认每小时）：
     // 过保留期的附件行删除、无引用的物理文件清掉。
@@ -110,10 +116,24 @@ pub async fn run() {
             let mut tick = tokio::time::interval(every);
             loop {
                 tick.tick().await;
+                let Some(_storage) = backup::storage_operation(&state) else {
+                    continue;
+                };
                 match domain::sweep_recalled_attachments(&pool, &files_dir, ttl).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(swept = n, "recalled attachments swept"),
                     Err(e) => tracing::error!(error = %e, "recalled attachment sweep failed"),
+                }
+                match domain::sweep_unattached_attachments(
+                    &pool,
+                    &files_dir,
+                    std::time::Duration::from_secs(86400),
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(swept = n, "abandoned uploads swept"),
+                    Err(e) => tracing::error!(error = %e, "abandoned upload sweep failed"),
                 }
                 match acp::sweep_orphan_acp_attachments(&pool, &files_dir).await {
                     Ok(0) => {}
