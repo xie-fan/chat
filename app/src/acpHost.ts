@@ -1137,29 +1137,47 @@ export async function sendPromptLocalFirst(
     });
 
     const rawEnv = getLocalVaultRawEnv(ag.id);
-    await tauriInvoke("acp_host_local_prompt_start", {
-      msg: {
-        session_id: sess.id,
-        acp_session_key: sess.acp_session_key,
-        cwd: ws.cwd,
-        agent: {
-          id: ag.id,
-          preset: ag.preset,
-          cmd: ag.cmd,
-          env: rawEnv,
+    try {
+      await tauriInvoke("acp_host_local_prompt_start", {
+        msg: {
+          session_id: sess.id,
+          acp_session_key: sess.acp_session_key,
+          cwd: ws.cwd,
+          agent: {
+            id: ag.id,
+            preset: ag.preset,
+            cmd: ag.cmd,
+            env: rawEnv,
+          },
+          model: body.model,
+          thinking_level: body.thinking_level,
+          permission_policy: body.permission_policy,
+          text: body.text,
+          files: body.files,
+          attachments: staged.map((s) => ({
+            file_name: s.file_name,
+            mime: s.mime,
+            data_base64: s.data_base64,
+          })),
         },
-        model: body.model,
-        thinking_level: body.thinking_level,
-        permission_policy: body.permission_policy,
-        text: body.text,
-        files: body.files,
-        attachments: staged.map((s) => ({
-          file_name: s.file_name,
-          mime: s.mime,
-          data_base64: s.data_base64,
-        })),
-      },
-    });
+      });
+    } catch (e) {
+      const rolled = patchLocalVaultSession(sess.id, { running: false });
+      setState((cur) => {
+        const nextSess = cur.acpSessions.map((x) =>
+          x.id === sess.id ? (rolled ?? { ...x, running: false }) : x,
+        );
+        return {
+          acpSessions: nextSess,
+          ...applyAcpEvent({ ...cur, acpSessions: nextSess }, "session_activity", {
+            session_id: sess.id,
+            phase: "idle",
+            detail: "",
+          }),
+        };
+      });
+      throw e;
+    }
     return { localHandled: true, turn: claimed.turn };
   }
 

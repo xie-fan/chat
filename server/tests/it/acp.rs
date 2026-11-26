@@ -1376,3 +1376,168 @@ async fn acp_streams_thoughts_tool_calls_and_activity_events() {
     }
     assert!(verified, "bootstrap should persist thought, tool_call, and text turns");
 }
+
+#[tokio::test]
+async fn acp_host_reconnect_settles_orphaned_running_session_and_activity() {
+    let base = spawn().await;
+    let u = register(&base, &format!("acpr_{}", uniq())).await;
+    let (mut client_ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await)
+        .await
+        .unwrap();
+
+    let install_id = Uuid::new_v4();
+    let mut host_ws_1 = host_ws_connect(&base, &u).await;
+    host_ws_1
+        .send(WsMsg::Text(
+            json!({
+                "type": "host_hello",
+                "install_id": install_id,
+                "name": "DevBox",
+                "os": "linux · x86_64",
+                "ip": "Client-Daemon",
+                "roots": ["/tmp"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ready1 = next_of(&mut host_ws_1, "host_ready").await;
+    let host_id = ready1["host_id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "host_upserted").await;
+
+    let ag_res: Value = http()
+        .post(format!("{base}/v1/acp/agents"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "host_id": host_id,
+            "preset": "codex",
+            "name": "Codex",
+            "cmd": "codex-acp",
+            "local_probed": true,
+            "status": "online"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let agent_id = ag_res["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "agent_upserted").await;
+
+    let ws_json: Value = http()
+        .post(format!("{base}/v1/acp/workspaces"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "host_id": host_id,
+            "cwd": "/tmp/repo",
+            "local_probed": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "workspace_upserted").await;
+
+    let sess: Value = http()
+        .post(format!("{base}/v1/acp/sessions"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "workspace_id": ws_id,
+            "agent_id": agent_id,
+            "skip_model_probe": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sess_id = sess["id"].as_str().unwrap().to_string();
+    let _ = next_acp_event(&mut client_ws, "session_upserted").await;
+
+    let p_res = http()
+        .post(format!("{base}/v1/acp/sessions/{sess_id}/prompts"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "text": "长任务执行" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(p_res.status(), 200);
+    let _ = next_of(&mut host_ws_1, "prompt_start").await;
+
+    host_ws_1
+        .send(WsMsg::Text(
+            json!({
+                "type": "session_update",
+                "session_id": sess_id,
+                "kind": "tool_call",
+                "tool_call_id": "tc-hang",
+                "name": "bash",
+                "tool_kind": "execute",
+                "title": "bash: long-task",
+                "status": "in_progress"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = next_acp_event(&mut client_ws, "turn_upserted").await;
+
+    // 模拟宿主在旧 WS 未主动断开的情况下直接重连（顶替旧连接）
+    let mut host_ws_2 = host_ws_connect(&base, &u).await;
+    host_ws_2
+        .send(WsMsg::Text(
+            json!({
+                "type": "host_hello",
+                "install_id": install_id,
+                "name": "DevBox",
+                "os": "linux · x86_64",
+                "ip": "Client-Daemon",
+                "roots": ["/tmp"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let superseded = next_of(&mut host_ws_1, "host_superseded").await;
+    assert_eq!(superseded["type"], "host_superseded");
+    let ready2 = next_of(&mut host_ws_2, "host_ready").await;
+    assert_eq!(ready2["host_id"], host_id);
+
+    let act_idle = next_acp_event(&mut client_ws, "session_activity").await;
+    assert_eq!(act_idle["data"]["session_id"], sess_id);
+    assert_eq!(act_idle["data"]["phase"], "idle");
+
+    let bs: Value = http()
+        .get(format!("{base}/v1/acp/bootstrap"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let settled_sess = bs["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == sess_id)
+        .unwrap();
+    assert_eq!(settled_sess["running"], false);
+    let settled_tc = settled_sess["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["payload"]["tool_call_id"] == "tc-hang")
+        .unwrap();
+    assert_eq!(settled_tc["status"], "failed");
+    assert_eq!(settled_tc["payload"]["is_error"], true);
+}

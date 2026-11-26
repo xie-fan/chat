@@ -127,6 +127,7 @@ impl AppState {
     }
 
     /// 登记 ACP 宿主 WS 连接；同一 host_id 重连时先向旧连接下发 host_superseded 并关闭。
+    /// 返回是否顶替了既有的同 host_id 连接。
     pub fn register_acp_host(
         &self,
         host_id: Uuid,
@@ -134,7 +135,7 @@ impl AppState {
         conn_id: Uuid,
         sid: Option<Uuid>,
         tx: mpsc::Sender<ConnMsg>,
-    ) {
+    ) -> bool {
         if let Some(prev) = self.acp_hosts.insert(
             host_id,
             AcpHostConn {
@@ -146,6 +147,9 @@ impl AppState {
         ) {
             let frame = serde_json::json!({ "type": "host_superseded" }).to_string();
             let _ = prev.tx.try_send(ConnMsg::Shutdown(frame));
+            true
+        } else {
+            false
         }
     }
 
@@ -414,5 +418,54 @@ impl AppState {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn dummy_state() -> SharedState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://chat:chat@localhost:5432/postgres")
+            .unwrap();
+        let cfg = Config {
+            database_url: String::new(),
+            jwt_secret: "x".repeat(32),
+            bind: "127.0.0.1".into(),
+            port: 0,
+            app_dist: None,
+            files_dir: String::new(),
+            upload_max_bytes: 0,
+            trust_proxy: false,
+            recall_attachment_ttl_secs: 86400,
+            recall_sweep_interval_secs: 3600,
+        };
+        AppState::new(pool, cfg)
+    }
+
+    #[tokio::test]
+    async fn register_acp_host_reports_superseded_and_guards_unregister() {
+        let st = dummy_state();
+        let host_id = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+        let conn1 = Uuid::new_v4();
+        let conn2 = Uuid::new_v4();
+
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+
+        assert!(!st.register_acp_host(host_id, uid, conn1, None, tx1));
+        assert!(st.register_acp_host(host_id, uid, conn2, None, tx2));
+
+        match rx1.recv().await {
+            Some(ConnMsg::Shutdown(frame)) => assert!(frame.contains("host_superseded")),
+            _ => panic!("expected host_superseded shutdown message on old connection"),
+        }
+
+        // 旧连接退出时 unregister_acp_host 返回 false；只有新连接退出才返回 true
+        assert!(!st.unregister_acp_host(host_id, conn1));
+        assert!(st.unregister_acp_host(host_id, conn2));
     }
 }

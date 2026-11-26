@@ -1,0 +1,31 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "app",
+        "run",
+        "dev"
+      ],
+      "port": 5173
+    },
+    {
+      "name": "web-test",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "app",
+        "run",
+        "dev"
+      ],
+      "port": 5179,
+      "env": {
+        "CHAT_API": "http://localhost:28199",
+        "CHAT_WEB_PORT": "5179"
+      }
+    }
+  ]
+}

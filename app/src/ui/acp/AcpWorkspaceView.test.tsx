@@ -1,4 +1,6 @@
 // @vitest-environment happy-dom
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
@@ -835,6 +837,250 @@ it("Agent 对话支持预览已发送附件、待发送 @文件 引用及模型�
     container.remove();
     setState(resetSessionState());
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("CSS 规则确保折叠卡与目录卡不会被 Flex 滚动容器压扁裁切", () => {
+  const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8").replace(
+    /\/\*[\s\S]*?\*\//g,
+    "",
+  );
+  const blockOf = (selector: string) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+    return m ? m[1] : "";
+  };
+
+  expect(blockOf(".acp-turns > *")).toMatch(/flex-shrink\s*:\s*0/);
+  expect(blockOf(".acp-tree > *")).toMatch(/flex-shrink\s*:\s*0/);
+  expect(blockOf(".acp-ws-card")).toMatch(/flex-shrink\s*:\s*0/);
+
+  const accBlock = blockOf(".acp-accordion");
+  expect(accBlock).toMatch(/flex-shrink\s*:\s*0/);
+  expect(accBlock).toMatch(/overflow\s*:\s*clip/);
+
+  const detailsOpenBlock = blockOf(".acp-accordion[open]::details-content");
+  expect(detailsOpenBlock).toMatch(/block-size\s*:\s*auto/);
+});
+
+it("无输出工具卡与空终端输出展开后展示占位提示，失败工具卡同时保留耗时徽章", () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const agent: AcpAgent = {
+    id: "a1",
+    host_id: "h1",
+    preset: "codex",
+    name: "Codex CLI",
+    adapter: "codex-acp",
+    cmd: "codex-acp",
+    env: {},
+    short_tag: "CX",
+    badge_bg: "from-emerald-500 to-teal-600",
+    default_model: "default",
+    model_options: ["default"],
+    permission_override: "inherit",
+    capabilities: [],
+    status: "online",
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+  };
+  const sess: AcpSession = {
+    id: "s-empty-acc",
+    workspace_id: "w1",
+    agent_id: "a1",
+    title: "折叠边界测试",
+    selected_model: "default",
+    thinking_level: "中",
+    permission_policy: "auto_read",
+    acp_session_key: null,
+    running: false,
+    diffs: [],
+    rpc_logs: [],
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+    turns: [
+      {
+        id: "tc-empty-fail",
+        session_id: "s-empty-acc",
+        seq: 1,
+        role: "tool_call",
+        status: "failed",
+        payload: {
+          tool_call_id: "c1",
+          kind: "read",
+          title: "read missing.txt",
+          duration_ms: 420,
+          is_error: true,
+        },
+        created_at: "2026-11-20T00:00:00Z",
+        updated_at: "2026-11-20T00:00:00Z",
+      },
+      {
+        id: "term-empty",
+        session_id: "s-empty-acc",
+        seq: 2,
+        role: "terminal_out",
+        status: "done",
+        payload: {
+          command: "true",
+          exit_code: 0,
+          output: "",
+        },
+        created_at: "2026-11-20T00:00:01Z",
+        updated_at: "2026-11-20T00:00:01Z",
+      },
+    ],
+  };
+
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  try {
+    act(() => {
+      setState({
+        acpLoaded: true,
+        acpHosts: [sampleHost],
+        acpAgents: [agent],
+        acpWorkspaces: [sampleWorkspace],
+        acpSessions: [sess],
+        activeAcpHostId: sampleHost.id,
+        activeAcpWorkspaceId: sampleWorkspace.id,
+        activeAcpSessionId: sess.id,
+      });
+      root.render(<AcpWorkspaceView />);
+    });
+
+    const group = container.querySelector(".acp-process-group") as HTMLDetailsElement;
+    expect(group).not.toBeNull();
+    act(() => {
+      (group.querySelector(":scope > summary") as HTMLElement).click();
+    });
+
+    const toolCard = container.querySelector(".acp-tool-card") as HTMLDetailsElement;
+    expect(toolCard).not.toBeNull();
+    expect(toolCard.textContent).toContain("失败");
+    expect(toolCard.textContent).toContain("420ms");
+    act(() => {
+      (toolCard.querySelector(":scope > summary") as HTMLElement).click();
+    });
+    expect(toolCard.querySelector(".acp-acc-empty")?.textContent).toContain("无额外参数或输出");
+
+    const termCard = container.querySelector(".acp-term-card") as HTMLDetailsElement;
+    expect(termCard).not.toBeNull();
+    act(() => {
+      (termCard.querySelector(":scope > summary") as HTMLElement).click();
+    });
+    expect(termCard.querySelector(".acp-acc-empty")?.textContent).toContain("无终端输出");
+    expect(termCard.querySelector(".acp-term-pre")).toBeNull();
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+    setState(resetSessionState());
+    vi.unstubAllGlobals();
+  }
+});
+
+it("点击停止运行后即使未收到 WS 事件也立即收敛活动状态栏与运行态", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const agent: AcpAgent = {
+    id: "a1",
+    host_id: "h1",
+    preset: "codex",
+    name: "Codex CLI",
+    adapter: "codex-acp",
+    cmd: "codex-acp",
+    env: {},
+    short_tag: "CX",
+    badge_bg: "from-emerald-500 to-teal-600",
+    default_model: "default",
+    model_options: ["default"],
+    permission_override: "inherit",
+    capabilities: [],
+    status: "online",
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+  };
+  const runningSess: AcpSession = {
+    id: "s-cancel-ui",
+    workspace_id: "w1",
+    agent_id: "a1",
+    title: "卡住的会话",
+    selected_model: "default",
+    thinking_level: "中",
+    permission_policy: "auto_read",
+    acp_session_key: null,
+    running: true,
+    diffs: [],
+    rpc_logs: [],
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+    turns: [
+      {
+        id: "u-stuck",
+        session_id: "s-cancel-ui",
+        seq: 1,
+        role: "user",
+        status: "done",
+        payload: { text: "执行任务" },
+        created_at: "2026-11-20T00:00:00Z",
+        updated_at: "2026-11-20T00:00:00Z",
+      },
+    ],
+  };
+  const cancelSpy = vi
+    .spyOn(acp, "cancelSession")
+    .mockResolvedValue({ ...runningSess, running: false });
+
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  try {
+    act(() => {
+      setState({
+        acpLoaded: true,
+        acpHosts: [sampleHost],
+        acpAgents: [agent],
+        acpWorkspaces: [sampleWorkspace],
+        acpSessions: [runningSess],
+        acpActivity: {
+          [runningSess.id]: {
+            phase: "tooling",
+            detail: "执行工具中…",
+            startedAt: Date.now() - 5000,
+            updatedAt: Date.now(),
+          },
+        },
+        activeAcpHostId: sampleHost.id,
+        activeAcpWorkspaceId: sampleWorkspace.id,
+        activeAcpSessionId: runningSess.id,
+      });
+      root.render(<AcpWorkspaceView />);
+    });
+
+    expect(container.querySelector(".acp-activity-bar")).not.toBeNull();
+    const stopBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "停止运行",
+    ) as HTMLButtonElement;
+    expect(stopBtn).not.toBeUndefined();
+
+    await act(async () => {
+      stopBtn.click();
+    });
+
+    expect(cancelSpy).toHaveBeenCalledWith(runningSess.id);
+    await vi.waitFor(() => {
+      expect(container.querySelector(".acp-activity-bar")).toBeNull();
+      expect(
+        Array.from(container.querySelectorAll("button")).some(
+          (b) => b.textContent?.trim() === "发送指令",
+        ),
+      ).toBe(true);
+    });
+  } finally {
+    cancelSpy.mockRestore();
+    act(() => root.unmount());
+    container.remove();
+    setState(resetSessionState());
     vi.unstubAllGlobals();
   }
 });

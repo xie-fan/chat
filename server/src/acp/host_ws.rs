@@ -84,13 +84,19 @@ pub async fn host_session(
 
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ConnMsg>(crate::state::CONN_QUEUE);
-    st.register_acp_host(host_id, uid, conn_id, sid, tx.clone());
+    let superseded = st.register_acp_host(host_id, uid, conn_id, sid, tx.clone());
 
     if !crate::auth::grant_valid(&st.pool, uid, grant.session_version, sid).await {
         st.unregister_acp_host(host_id, conn_id);
         let _ = socket.send(Message::Close(None)).await;
         return Ok(());
     }
+
+    if superseded {
+        st.fail_acp_host_rpcs(host_id);
+    }
+    // 新建立的宿主 WS 连接不继承旧连接的在途任务；若重连顶替了旧连接或曾非正常断连，在此立即收敛遗留运行态
+    settle_host_running_sessions(&st, uid, host_id).await;
 
     let _ = tx.try_send(ConnMsg::Frame(
         json!({ "type": "host_ready", "host_id": host_id }).to_string(),
@@ -190,108 +196,7 @@ pub async fn host_session(
         .execute(&st.pool)
         .await;
 
-        // 停止该宿主所有正在进行的会话并拒绝挂起的权限卡片，防止前端卡在运行态
-        let paused_sessions = sqlx::query_scalar::<_, Uuid>(
-            "UPDATE acp_sessions s SET running = false, updated_at = now()
-              FROM acp_workspaces w
-             WHERE s.acp_workspace_id = w.id AND w.acp_host_id = $1 AND s.running = true
-             RETURNING s.id",
-        )
-        .bind(host_id)
-        .fetch_all(&st.pool)
-        .await
-        .unwrap_or_default();
-
-        for sess_id in &paused_sessions {
-            if let Ok(s) = load_session_meta(&st.pool, uid, *sess_id).await {
-                broadcast_acp(&st, uid, "session_upserted", json!({ "session": s }));
-            }
-        }
-
-        let aborted_turns = sqlx::query(
-            "UPDATE acp_turns t
-                SET status = 'rejected',
-                    payload = jsonb_set(t.payload, '{chosen_option}', '\"host_disconnected\"'::jsonb),
-                    updated_at = now()
-               FROM acp_sessions s
-               JOIN acp_workspaces w ON w.id = s.acp_workspace_id
-              WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
-                AND t.role = 'permission' AND t.status = 'pending'
-              RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
-        )
-        .bind(host_id)
-        .fetch_all(&st.pool)
-        .await
-        .unwrap_or_default();
-
-        for r in &aborted_turns {
-            let tv = turn_from_row(r);
-            broadcast_acp(
-                &st,
-                uid,
-                "turn_upserted",
-                json!({ "session_id": tv.session_id, "turn": tv }),
-            );
-        }
-
-        let settled_streams = sqlx::query(
-            "UPDATE acp_turns t
-                SET status = 'done', updated_at = now()
-               FROM acp_sessions s
-               JOIN acp_workspaces w ON w.id = s.acp_workspace_id
-              WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
-                AND t.role IN ('agent_text', 'agent_thought') AND t.status = 'streaming'
-              RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
-        )
-        .bind(host_id)
-        .fetch_all(&st.pool)
-        .await
-        .unwrap_or_default();
-
-        for r in &settled_streams {
-            let tv = turn_from_row(r);
-            broadcast_acp(
-                &st,
-                uid,
-                "turn_upserted",
-                json!({ "session_id": tv.session_id, "turn": tv }),
-            );
-        }
-
-        let failed_tools = sqlx::query(
-            "UPDATE acp_turns t
-                SET status = 'failed',
-                    payload = jsonb_set(t.payload, '{is_error}', 'true'::jsonb),
-                    updated_at = now()
-               FROM acp_sessions s
-               JOIN acp_workspaces w ON w.id = s.acp_workspace_id
-              WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
-                AND t.role = 'tool_call' AND t.status IN ('pending', 'in_progress')
-              RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
-        )
-        .bind(host_id)
-        .fetch_all(&st.pool)
-        .await
-        .unwrap_or_default();
-
-        for r in &failed_tools {
-            let tv = turn_from_row(r);
-            broadcast_acp(
-                &st,
-                uid,
-                "turn_upserted",
-                json!({ "session_id": tv.session_id, "turn": tv }),
-            );
-        }
-
-        for sess_id in paused_sessions {
-            broadcast_acp(
-                &st,
-                uid,
-                "session_activity",
-                json!({ "session_id": sess_id, "phase": "idle", "detail": "" }),
-            );
-        }
+        settle_host_running_sessions(&st, uid, host_id).await;
 
         if let Ok(h) = load_host(&st, uid, host_id).await {
             broadcast_acp(&st, uid, "host_upserted", json!({ "host": h }));
@@ -299,6 +204,111 @@ pub async fn host_session(
     }
 
     Ok(())
+}
+
+/// 停止该宿主所有正在进行的会话、拒绝挂起的权限卡片并收敛流式与进行中工具块，防止断连/重连顶替后前端卡在运行态。
+async fn settle_host_running_sessions(st: &SharedState, uid: Uuid, host_id: Uuid) {
+    let paused_sessions = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE acp_sessions s SET running = false, updated_at = now()
+          FROM acp_workspaces w
+         WHERE s.acp_workspace_id = w.id AND w.acp_host_id = $1 AND s.running = true
+         RETURNING s.id",
+    )
+    .bind(host_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+
+    for sess_id in &paused_sessions {
+        if let Ok(s) = load_session_meta(&st.pool, uid, *sess_id).await {
+            broadcast_acp(st, uid, "session_upserted", json!({ "session": s }));
+        }
+    }
+
+    let aborted_turns = sqlx::query(
+        "UPDATE acp_turns t
+            SET status = 'rejected',
+                payload = jsonb_set(t.payload, '{chosen_option}', '\"host_disconnected\"'::jsonb),
+                updated_at = now()
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
+            AND t.role = 'permission' AND t.status = 'pending'
+          RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
+    )
+    .bind(host_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+
+    for r in &aborted_turns {
+        let tv = turn_from_row(r);
+        broadcast_acp(
+            st,
+            uid,
+            "turn_upserted",
+            json!({ "session_id": tv.session_id, "turn": tv }),
+        );
+    }
+
+    let settled_streams = sqlx::query(
+        "UPDATE acp_turns t
+            SET status = 'done', updated_at = now()
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
+            AND t.role IN ('agent_text', 'agent_thought') AND t.status = 'streaming'
+          RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
+    )
+    .bind(host_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+
+    for r in &settled_streams {
+        let tv = turn_from_row(r);
+        broadcast_acp(
+            st,
+            uid,
+            "turn_upserted",
+            json!({ "session_id": tv.session_id, "turn": tv }),
+        );
+    }
+
+    let failed_tools = sqlx::query(
+        "UPDATE acp_turns t
+            SET status = 'failed',
+                payload = jsonb_set(t.payload, '{is_error}', 'true'::jsonb),
+                updated_at = now()
+           FROM acp_sessions s
+           JOIN acp_workspaces w ON w.id = s.acp_workspace_id
+          WHERE t.acp_session_id = s.id AND w.acp_host_id = $1
+            AND t.role = 'tool_call' AND t.status IN ('pending', 'in_progress')
+          RETURNING t.id, t.acp_session_id, t.seq, t.role, t.status, t.payload, t.created_at, t.updated_at",
+    )
+    .bind(host_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+
+    for r in &failed_tools {
+        let tv = turn_from_row(r);
+        broadcast_acp(
+            st,
+            uid,
+            "turn_upserted",
+            json!({ "session_id": tv.session_id, "turn": tv }),
+        );
+    }
+
+    for sess_id in paused_sessions {
+        broadcast_acp(
+            st,
+            uid,
+            "session_activity",
+            json!({ "session_id": sess_id, "phase": "idle", "detail": "" }),
+        );
+    }
 }
 
 async fn handle_host_frame(st: &SharedState, uid: Uuid, host_id: Uuid, raw: &str) {

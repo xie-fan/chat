@@ -240,9 +240,9 @@ function ThoughtTurnCard({ turn }: { turn: AcpTurn }) {
           ) : null}
         </span>
       </summary>
-      <div className="acp-acc-body">
+      <div className="acp-acc-body" style={{ paddingTop: 8 }}>
         {text ? (
-          <div className="acp-tool-sec-head" style={{ paddingTop: 8 }}>
+          <div className="acp-tool-sec-head">
             <span className="acp-tool-sec-label">推理内容</span>
             <button
               type="button"
@@ -390,14 +390,19 @@ function ToolCallCard({
           {isRunning ? (
             <span className="acp-mini-badge is-live">执行中</span>
           ) : isFailed ? (
-            <span className="acp-mini-badge is-err">失败</span>
+            <>
+              <span className="acp-mini-badge is-err">失败</span>
+              {durationLabel && (
+                <span className="acp-mini-badge">{durationLabel}</span>
+              )}
+            </>
           ) : durationLabel ? (
             <span className="acp-mini-badge">{durationLabel}</span>
           ) : null}
         </span>
       </summary>
 
-      {hasBody && (
+      {hasBody ? (
         <div className="acp-acc-body">
           {locations.length > 0 && (
             <div className="acp-tool-locs">
@@ -461,6 +466,12 @@ function ToolCallCard({
               </pre>
             </div>
           )}
+        </div>
+      ) : (
+        <div className="acp-acc-body">
+          <div className="acp-acc-empty">
+            {isRunning ? "正在执行，等待返回输出…" : "无额外参数或输出"}
+          </div>
         </div>
       )}
     </details>
@@ -646,36 +657,42 @@ function PlanTurnCard({ turn }: { turn: AcpTurn }) {
         </span>
       </summary>
       <div className="acp-acc-body" style={{ paddingTop: 10 }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {steps.map((st, idx) => (
-            <div
-              key={idx}
-              style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
-            >
-              <span
-                style={{
-                  width: 18,
-                  textAlign: "center",
-                  color:
-                    st.state === "done"
-                      ? "var(--ok)"
-                      : st.state === "active"
-                        ? "var(--accent)"
-                        : "var(--text-muted)",
-                }}
+        {steps.length === 0 ? (
+          <div className="acp-acc-empty" style={{ paddingTop: 0 }}>
+            暂无执行步骤
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {steps.map((st, idx) => (
+              <div
+                key={idx}
+                style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
               >
-                {st.state === "done" ? "✓" : st.state === "active" ? "●" : "○"}
-              </span>
-              <span
-                style={{
-                  color: st.state === "pending" ? "var(--text-muted)" : "var(--text-main)",
-                }}
-              >
-                {st.label}
-              </span>
-            </div>
-          ))}
-        </div>
+                <span
+                  style={{
+                    width: 18,
+                    textAlign: "center",
+                    color:
+                      st.state === "done"
+                        ? "var(--ok)"
+                        : st.state === "active"
+                          ? "var(--accent)"
+                          : "var(--text-muted)",
+                  }}
+                >
+                  {st.state === "done" ? "✓" : st.state === "active" ? "●" : "○"}
+                </span>
+                <span
+                  style={{
+                    color: st.state === "pending" ? "var(--text-muted)" : "var(--text-main)",
+                  }}
+                >
+                  {st.label}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </details>
   );
@@ -702,26 +719,32 @@ function TerminalOutTurnCard({ turn }: { turn: AcpTurn }) {
         </span>
       </summary>
       <div className="acp-acc-body" style={{ paddingTop: 8 }}>
-        {output && (
-          <div className="acp-tool-sec-head">
-            <span className="acp-tool-sec-label">终端输出</span>
-            <button
-              type="button"
-              className="acp-inline-icon-btn"
-              aria-label="复制终端输出"
-              onClick={() =>
-                copyClipboard(output, () => {
-                  setCopied(true);
-                  window.setTimeout(() => setCopied(false), 1500);
-                })
-              }
-            >
-              {copied ? <CheckIcon size={12} /> : <CopyIcon />}
-              <span>{copied ? "已复制" : "复制"}</span>
-            </button>
+        {output ? (
+          <>
+            <div className="acp-tool-sec-head">
+              <span className="acp-tool-sec-label">终端输出</span>
+              <button
+                type="button"
+                className="acp-inline-icon-btn"
+                aria-label="复制终端输出"
+                onClick={() =>
+                  copyClipboard(output, () => {
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1500);
+                  })
+                }
+              >
+                {copied ? <CheckIcon size={12} /> : <CopyIcon />}
+                <span>{copied ? "已复制" : "复制"}</span>
+              </button>
+            </div>
+            <pre className="acp-term-pre">{output}</pre>
+          </>
+        ) : (
+          <div className="acp-acc-empty" style={{ paddingTop: 0 }}>
+            无终端输出
           </div>
         )}
-        <pre className="acp-term-pre">{output}</pre>
       </div>
     </details>
   );

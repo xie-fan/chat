@@ -2052,7 +2052,7 @@ button.st-nav-item.on,
 .agent-policy-card span { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
 .host-group-card {
   border: 1px solid var(--border-color); border-radius: 14px;
-  background: var(--bg-elevated); overflow: hidden;
+  background: var(--bg-elevated); overflow: hidden; flex-shrink: 0;
 }
 .host-group-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -2097,7 +2097,7 @@ button.st-nav-item.on,
 }
 .acp-sidebar-top {
   padding: 14px; border-bottom: 1px solid var(--border-color);
-  display: flex; flex-direction: column; gap: 10px;
+  display: flex; flex-direction: column; gap: 10px; flex-shrink: 0;
 }
 .acp-sidebar-title-row {
   display: flex; align-items: center; justify-content: space-between;
@@ -2127,9 +2127,10 @@ button.st-nav-item.on,
 .acp-tree {
   flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px;
 }
+.acp-tree > * { flex-shrink: 0; }
 .acp-ws-card {
   border: 1px solid var(--border-color); border-radius: 14px;
-  background: var(--bg-elevated); overflow: hidden;
+  background: var(--bg-elevated); overflow: hidden; flex-shrink: 0;
 }
 .acp-ws-head {
   display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 11px;
@@ -2245,7 +2246,7 @@ button.st-nav-item.on,
   padding: 12px 20px; border-bottom: 1px solid var(--border-color);
   background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
   backdrop-filter: blur(14px);
-  display: flex; flex-direction: column; gap: 6px;
+  display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
 }
 .acp-header-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -2265,6 +2266,7 @@ button.st-nav-item.on,
   flex: 1; overflow-y: auto; padding: 20px 24px;
   display: flex; flex-direction: column; gap: 14px;
 }
+.acp-turns > * { flex-shrink: 0; }
 .acp-scroll-down-btn {
   position: absolute; right: 22px; bottom: 14px; z-index: 10;
   display: inline-flex; align-items: center; gap: 5px;
@@ -2324,33 +2326,37 @@ button.st-nav-item.on,
 .acp-accordion {
   align-self: stretch; max-width: 86%; border-radius: 14px;
   background: var(--bg-panel); border: 1px solid var(--border-color);
-  box-shadow: var(--shadow-sm); overflow: hidden;
+  box-shadow: var(--shadow-sm); flex-shrink: 0; min-width: 0;
+  overflow: hidden; overflow: clip;
 }
 .acp-acc-summary {
   list-style: none; display: flex; align-items: center; gap: 7px;
   padding: 9px 13px; cursor: pointer; user-select: none;
   font-size: 12.5px; color: var(--text-main);
+  min-width: 0; line-height: 1.4;
 }
+.acp-acc-summary::marker { display: none; }
 .acp-acc-summary::-webkit-details-marker { display: none; }
 .acp-acc-summary:hover { background: var(--bg-hover); }
+.acp-acc-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .acp-acc-chevron {
   flex-shrink: 0; color: var(--text-muted);
-  transition: transform .16s ease;
 }
 .acp-accordion[open] > .acp-acc-summary > .acp-acc-chevron { transform: rotate(90deg); }
 .acp-acc-label {
   font-weight: 600; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
 }
-.acp-acc-label:has(+ .acp-acc-preview) { flex-shrink: 0; }
+.acp-acc-label:has(+ .acp-acc-preview) { flex-shrink: 0; max-width: 65%; }
 .acp-acc-preview {
   color: var(--text-muted); font-weight: 400; font-size: 12px;
   min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .acp-acc-body {
   padding: 0 13px 12px; border-top: 1px solid var(--border-color);
-  display: flex; flex-direction: column; gap: 10px;
+  display: flex; flex-direction: column; gap: 10px; min-width: 0;
 }
+.acp-acc-empty { padding-top: 10px; font-size: 12px; color: var(--text-muted); }
 .acp-process-group {
   border-color: var(--border-color);
   background: var(--bg-panel);
@@ -2378,7 +2384,11 @@ button.st-nav-item.on,
   contain: layout;
 }
 .acp-accordion:not([open])::details-content { block-size: 0; }
+.acp-accordion[open]::details-content { block-size: auto; }
 @media (prefers-reduced-motion: no-preference) {
+  .acp-acc-chevron {
+    transition: transform .16s ease;
+  }
   .acp-accordion::details-content {
     transition: block-size .2s ease, content-visibility .2s ease, display .2s ease;
     transition-behavior: allow-discrete;
@@ -2443,14 +2453,14 @@ button.st-nav-item.on,
 .acp-tool-diffs { display: flex; flex-direction: column; gap: 8px; }
 .acp-tool-diff-file {
   border: 1px solid var(--border-color); border-radius: 10px; overflow: hidden;
-  background: var(--bg-elevated);
+  background: var(--bg-elevated); flex-shrink: 0;
 }
 .acp-tool-diff-path {
   display: flex; align-items: center; gap: 6px; padding: 6px 10px;
   font-size: 11.5px; border-bottom: 1px solid var(--border-color);
   background: var(--bg-subtle); color: var(--text-main);
 }
-.acp-diff-stat { margin-left: auto; display: inline-flex; gap: 6px; font-weight: 600; }
+.acp-diff-stat { margin-left: auto; display: inline-flex; gap: 6px; font-weight: 600; flex-shrink: 0; }
 .acp-diff-add-num { color: #16A34A; font-weight: 600; }
 .acp-diff-del-num { color: #DC2626; font-weight: 600; }
 .acp-tool-diff-pre {
@@ -2489,7 +2499,7 @@ button.st-nav-item.on,
 .acp-md-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .acp-md-code-block {
   border-radius: 10px; overflow: hidden; border: 1px solid rgba(148, 163, 184, 0.25);
-  background: #0F172A; color: #E2E8F0;
+  background: #0F172A; color: #E2E8F0; flex-shrink: 0;
 }
 .acp-md-code-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -2525,7 +2535,7 @@ button.st-nav-item.on,
   margin: 0 20px 6px; padding: 7px 14px; border-radius: 12px;
   border: 1px solid var(--accent-ring); background: color-mix(in srgb, var(--accent-soft) 55%, var(--bg-panel));
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  font-size: 12px;
+  font-size: 12px; flex-shrink: 0;
 }
 .acp-activity-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
 .acp-activity-phase { font-weight: 700; color: var(--accent); flex-shrink: 0; }
@@ -2570,7 +2580,7 @@ button.st-nav-item.on,
   border: 1px solid var(--border-color); background: var(--bg-panel);
   font-size: 12px; color: var(--text-secondary);
 }
-.acp-composer-wrap { padding: 4px 20px 18px; }
+.acp-composer-wrap { padding: 4px 20px 18px; flex-shrink: 0; }
 .acp-composer {
   border-radius: 18px; border: 1px solid var(--border-color);
   background: var(--bg-panel); box-shadow: var(--shadow-md);

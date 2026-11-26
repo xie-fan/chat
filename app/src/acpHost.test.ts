@@ -495,3 +495,48 @@ it("纯本地 Vault 对等支持思考流、tool_call 增量合并与 Diff、非
   ).toBe("failed");
 });
 
+it("纯本地发送指令时若 acp_host_local_prompt_start 抛错，自动回滚 running 与 idle 活动态", async () => {
+  vi.spyOn(api, "isDesktopShell").mockReturnValue(true);
+  ensureLocalOnlyHost({ install_id: "h-fail", name: "win", os: "windows", roots: ["C:\\repo"] });
+  const ag = addLocalVaultAgent({
+    preset: "codex",
+    name: "Codex",
+    cmd: "codex-acp",
+    env: {},
+    status: "online",
+  });
+  const ws = upsertLocalVaultWorkspace({
+    cwd: "C:\\repo",
+    name: "repo",
+    branch: "main",
+    branches: ["main"],
+  });
+  const sess = addLocalVaultSession({
+    workspace: ws,
+    agent: ag,
+    defaultPermission: "auto_read",
+  });
+  setState({
+    acpLoaded: true,
+    acpAgents: [ag],
+    acpWorkspaces: [ws],
+    acpSessions: [sess],
+  });
+
+  invokeMock.mockRejectedValueOnce(new Error("spawn failed"));
+
+  await expect(
+    sendPromptLocalFirst(sess, ws, ag, {
+      text: "hello",
+      files: [],
+      attachments: [],
+      model: ag.default_model,
+      thinking_level: "中",
+      permission_policy: "auto_read",
+    }),
+  ).rejects.toThrow("spawn failed");
+
+  expect(getState().acpSessions.find((s) => s.id === sess.id)?.running).toBe(false);
+  expect(getState().acpActivity[sess.id]).toBeUndefined();
+});
+

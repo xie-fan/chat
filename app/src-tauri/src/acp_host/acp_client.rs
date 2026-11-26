@@ -63,10 +63,10 @@ pub struct PromptStartMsg {
 }
 
 struct ManagedTerminal {
-    child: tokio::process::Child,
     command: String,
     output: Arc<Mutex<String>>,
-    exit_code: Option<i32>,
+    exit_rx: watch::Receiver<Option<i32>>,
+    kill_tx: Option<oneshot::Sender<()>>,
     done_tx: watch::Sender<bool>,
 }
 
@@ -76,12 +76,15 @@ struct Driver<W> {
     policy: String,
     writer: W,
     rx: mpsc::UnboundedReceiver<Option<Value>>,
+    outbound_tx: mpsc::UnboundedSender<Value>,
+    outbound_rx: mpsc::UnboundedReceiver<Value>,
     next_id: u64,
     suppress_chunks: bool,
     startup_text: Option<String>,
     stream: StreamCoalescer,
     plan_run_key: String,
     tool_starts: HashMap<String, Instant>,
+    tool_titles: HashMap<String, String>,
     tool_terminals: Arc<Mutex<HashMap<String, String>>>,
     last_activity: (String, String),
     sink: mpsc::Sender<Value>,
@@ -182,38 +185,67 @@ pub async fn run_prompt_task(
         });
     }
 
+    let child_pid = child.id();
     let upload_dir = session_upload_dir(&msg.session_id);
-    let res = if is_pi {
-        pi_rpc_client::drive_stdio(
-            stdout,
-            stdin,
-            &msg,
-            &dir,
-            sink.clone(),
-            pending_perms,
-            perm_cache,
-            cancel,
-            gate_token.as_deref(),
-        )
-        .await
-    } else {
-        drive_stdio(
-            stdout,
-            stdin,
-            &msg,
-            &dir,
-            sink.clone(),
-            pending_perms,
-            perm_cache,
-            cancel,
-        )
-        .await
+    let res = {
+        let drive_fut = async {
+            if is_pi {
+                pi_rpc_client::drive_stdio(
+                    stdout,
+                    stdin,
+                    &msg,
+                    &dir,
+                    sink.clone(),
+                    pending_perms,
+                    perm_cache,
+                    cancel,
+                    gate_token.as_deref(),
+                )
+                .await
+            } else {
+                drive_stdio(
+                    stdout,
+                    stdin,
+                    &msg,
+                    &dir,
+                    sink.clone(),
+                    pending_perms,
+                    perm_cache,
+                    cancel,
+                )
+                .await
+            }
+        };
+        tokio::pin!(drive_fut);
+        tokio::select! {
+            r = &mut drive_fut => r,
+            exit_res = child.wait() => {
+                match tokio::time::timeout(Duration::from_secs(2), &mut drive_fut).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let code_desc = match exit_res {
+                            Ok(st) => st
+                                .code()
+                                .map(|c| format!("exit {c}"))
+                                .unwrap_or_else(|| "信号终止".to_string()),
+                            Err(e) => format!("{e}"),
+                        };
+                        Err(format!("Agent 进程已提前退出（{code_desc}）"))
+                    }
+                }
+            }
+        }
     };
 
     if is_pi {
         let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
     }
     command::kill_child_tree(&mut child).await;
+    if child.id().is_none() {
+        if let Some(pid) = child_pid {
+            command::kill_pid_tree(pid).await;
+        }
+    }
     if let Some(udir) = upload_dir {
         let _ = std::fs::remove_dir_all(udir);
     }
@@ -572,18 +604,22 @@ where
 
     let (dummy_sink, _dummy_rx) = mpsc::channel::<Value>(4);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Value>();
     let mut drv = Driver {
         session_id: String::new(),
         cwd: dir.to_path_buf(),
         policy: "ask".to_string(),
         writer,
         rx,
+        outbound_tx,
+        outbound_rx,
         next_id: 1,
         suppress_chunks: true,
         startup_text: None,
         stream: StreamCoalescer::new(),
         plan_run_key: String::new(),
         tool_starts: HashMap::new(),
+        tool_titles: HashMap::new(),
         tool_terminals: Arc::new(Mutex::new(HashMap::new())),
         last_activity: (String::new(), String::new()),
         sink: dummy_sink,
@@ -767,6 +803,7 @@ where
         }
     });
 
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Value>();
     let mut drv = Driver {
         session_id: msg.session_id.clone(),
         cwd: dir.to_path_buf(),
@@ -777,12 +814,15 @@ where
         },
         writer,
         rx,
+        outbound_tx,
+        outbound_rx,
         next_id: 1,
         suppress_chunks: true,
         startup_text: None,
         stream: StreamCoalescer::new(),
         plan_run_key: Uuid::new_v4().to_string(),
         tool_starts: HashMap::new(),
+        tool_titles: HashMap::new(),
         tool_terminals: Arc::new(Mutex::new(HashMap::new())),
         last_activity: (String::new(), String::new()),
         sink,
@@ -899,7 +939,9 @@ where
     let cancelled = drv.wait_resp_or_cancel(prompt_req_id, &mut cancel_rx).await;
     for (_, mut term) in drv.terminals.drain() {
         let _ = term.done_tx.send(true);
-        command::kill_child_tree(&mut term.child).await;
+        if let Some(ktx) = term.kill_tx.take() {
+            let _ = ktx.send(());
+        }
     }
     let cancelled = cancelled?;
     if cancelled {
@@ -1302,6 +1344,9 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
                 } => {
                     self.stream.flush_due(&self.sink, &self.session_id).await;
                 }
+                Some(resp) = self.outbound_rx.recv() => {
+                    self.write_line(&resp).await?;
+                }
                 msg = self.rx.recv() => {
                     let msg = match msg {
                         Some(Some(v)) => v,
@@ -1339,6 +1384,9 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
                     }
                 } => {
                     self.stream.flush_due(&self.sink, &self.session_id).await;
+                }
+                Some(resp) = self.outbound_rx.recv() => {
+                    self.write_line(&resp).await?;
                 }
                 msg = self.rx.recv() => {
                     let msg = match msg {
@@ -1427,7 +1475,8 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
                         .entry(tool_call_id.clone())
                         .or_insert_with(Instant::now);
                 }
-                let duration_ms = if matches!(effective_status, Some("completed" | "failed")) {
+                let is_terminal = matches!(effective_status, Some("completed" | "failed"));
+                let duration_ms = if is_terminal {
                     self.tool_starts
                         .remove(&tool_call_id)
                         .map(|t| t.elapsed().as_millis() as u64)
@@ -1437,6 +1486,14 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
 
                 let title = upd["title"].as_str().map(str::trim).filter(|s| !s.is_empty());
                 let name = upd["name"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                if let Some(label) = title.or(name) {
+                    if !is_terminal {
+                        self.tool_titles.insert(tool_call_id.clone(), label.to_string());
+                    }
+                }
+                if is_terminal {
+                    self.tool_titles.remove(&tool_call_id);
+                }
                 let tool_kind = upd["kind"].as_str().map(str::trim).filter(|s| !s.is_empty());
                 let input = extract_acp_raw_input(&upd["rawInput"]);
                 let locations = extract_acp_locations(&upd["locations"]);
@@ -1530,9 +1587,26 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
                 }
                 let _ = self.sink.send(ev).await;
 
-                if matches!(effective_status, None | Some("pending" | "in_progress")) {
-                    let detail = title.or(name).unwrap_or("执行工具中…");
-                    self.emit_activity("tooling", detail).await;
+                if is_terminal {
+                    if let Some((next_id, _)) = self.tool_starts.iter().next() {
+                        let next_detail = self
+                            .tool_titles
+                            .get(next_id)
+                            .cloned()
+                            .unwrap_or_else(|| "执行工具中…".to_string());
+                        self.emit_activity("tooling", &next_detail).await;
+                    } else {
+                        self.emit_activity("connecting", "等待 Agent 响应…").await;
+                    }
+                } else if matches!(effective_status, Some("pending" | "in_progress"))
+                    || (effective_status.is_none() && self.tool_starts.contains_key(&tool_call_id))
+                {
+                    let detail = title
+                        .or(name)
+                        .map(str::to_string)
+                        .or_else(|| self.tool_titles.get(&tool_call_id).cloned())
+                        .unwrap_or_else(|| "执行工具中…".to_string());
+                    self.emit_activity("tooling", &detail).await;
                 }
             }
             Some("plan") => {
@@ -1604,30 +1678,35 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
 
-        let resp = match method {
-            "session/request_permission" => self.handle_permission_req(id, params).await?,
-            "fs/read_text_file" => self.handle_fs_read(id, params).await?,
-            "fs/write_text_file" => self.handle_fs_write(id, params).await?,
-            "terminal/create" => self.handle_term_create(id, params).await?,
-            "terminal/output" => self.handle_term_output(id, params).await?,
+        let resp_opt = match method {
+            "session/request_permission" => Some(self.handle_permission_req(id, params).await?),
+            "fs/read_text_file" => Some(self.handle_fs_read(id, params).await?),
+            "fs/write_text_file" => Some(self.handle_fs_write(id, params).await?),
+            "terminal/create" => Some(self.handle_term_create(id, params).await?),
+            "terminal/output" => Some(self.handle_term_output(id, params).await?),
             "terminal/wait_for_exit" => self.handle_term_wait(id, params).await?,
-            "terminal/kill" => self.handle_term_kill(id, params),
+            "terminal/kill" => Some(self.handle_term_kill(id, params)),
             "terminal/release" => {
                 if let Some(tid) = params["terminalId"].as_str() {
                     if let Some(mut t) = self.terminals.remove(tid) {
                         let _ = t.done_tx.send(true);
-                        let _ = t.child.kill().await;
+                        if let Some(ktx) = t.kill_tx.take() {
+                            let _ = ktx.send(());
+                        }
                     }
                 }
-                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+                Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} }))
             }
-            _ => json!({
+            _ => Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "error": { "code": -32601, "message": format!("unsupported method: {method}") }
-            }),
+            })),
         };
-        self.write_line(&resp).await
+        if let Some(resp) = resp_opt {
+            self.write_line(&resp).await?;
+        }
+        Ok(())
     }
 
     async fn handle_permission_req(&mut self, id: Value, params: &Value) -> Result<Value, String> {
@@ -1785,6 +1864,7 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         self.emit_activity("tooling", &display_cmd).await;
         let mut cmd = command::prepare(prog, &args);
         cmd.current_dir(&self.cwd)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1828,6 +1908,24 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         }
         let term_id = Uuid::new_v4().to_string();
         let (done_tx, mut done_rx) = watch::channel(false);
+        let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
+        let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+        let done_tx_reaper = done_tx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                st = child.wait() => {
+                    let c = st.ok().and_then(|s| s.code()).unwrap_or(-1);
+                    let _ = exit_tx.send(Some(c));
+                    let _ = done_tx_reaper.send(true);
+                }
+                _ = &mut kill_rx => {
+                    command::kill_child_tree(&mut child).await;
+                    let c = child.try_wait().ok().flatten().and_then(|s| s.code()).unwrap_or(-1);
+                    let _ = exit_tx.send(Some(c));
+                    let _ = done_tx_reaper.send(true);
+                }
+            }
+        });
         let tid_watch = term_id.clone();
         let out_watch = out_buf.clone();
         let sink_watch = self.sink.clone();
@@ -1873,10 +1971,10 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
         self.terminals.insert(
             term_id.clone(),
             ManagedTerminal {
-                child,
                 command: display_cmd,
                 output: out_buf,
-                exit_code: None,
+                exit_rx,
+                kill_tx: Some(kill_tx),
                 done_tx,
             },
         );
@@ -1885,14 +1983,10 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
 
     async fn handle_term_output(&mut self, id: Value, params: &Value) -> Result<Value, String> {
         let tid = params["terminalId"].as_str().unwrap_or("");
-        let Some(term) = self.terminals.get_mut(tid) else {
+        let Some(term) = self.terminals.get(tid) else {
             return Ok(json_err(id, -32002, "unknown terminalId"));
         };
-        if term.exit_code.is_none() {
-            if let Ok(Some(st)) = term.child.try_wait() {
-                term.exit_code = Some(st.code().unwrap_or(-1));
-            }
-        }
+        let exit_code = *term.exit_rx.borrow();
         let out = term.output.lock().unwrap().clone();
         Ok(json!({
             "jsonrpc": "2.0",
@@ -1900,65 +1994,122 @@ impl<W: AsyncWrite + Unpin + Send> Driver<W> {
             "result": {
                 "output": out,
                 "truncated": false,
-                "exitStatus": term.exit_code.map(|c| json!({ "exitCode": c }))
+                "exitStatus": exit_code.map(|c| json!({ "exitCode": c }))
             }
         }))
     }
 
-    async fn handle_term_wait(&mut self, id: Value, params: &Value) -> Result<Value, String> {
-        let tid = params["terminalId"].as_str().unwrap_or("");
-        let Some(term) = self.terminals.get_mut(tid) else {
-            return Ok(json_err(id, -32002, "unknown terminalId"));
+    async fn handle_term_wait(&mut self, id: Value, params: &Value) -> Result<Option<Value>, String> {
+        let tid = params["terminalId"].as_str().unwrap_or("").to_string();
+        let Some(term) = self.terminals.get(&tid) else {
+            return Ok(Some(json_err(id, -32002, "unknown terminalId")));
         };
-        let code = if let Some(c) = term.exit_code {
-            c
-        } else {
-            let st = term.child.wait().await.ok();
-            let c = st.and_then(|s| s.code()).unwrap_or(-1);
-            term.exit_code = Some(c);
-            c
-        };
-        let _ = term.done_tx.send(true);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let out = term.output.lock().unwrap().clone();
-        let cmd_str = term.command.clone();
-        let bound_tool_id = self.tool_terminals.lock().unwrap().get(tid).cloned();
-        if let Some(tc_id) = bound_tool_id {
-            let _ = self
-                .sink
-                .send(json!({
-                    "type": "session_update",
-                    "session_id": self.session_id,
-                    "kind": "tool_call",
-                    "tool_call_id": tc_id,
-                    "output": out,
-                }))
-                .await;
-        } else {
-            let _ = self
-                .sink
-                .send(json!({
-                    "type": "session_update",
-                    "session_id": self.session_id,
-                    "kind": "terminal_out",
-                    "command": cmd_str,
-                    "output": out,
-                    "exit_code": code,
-                }))
-                .await;
+        let already = *term.exit_rx.borrow();
+        if let Some(code) = already {
+            let _ = term.done_tx.send(true);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let out = term.output.lock().unwrap().clone();
+            let cmd_str = term.command.clone();
+            emit_terminal_final_via(
+                &self.sink,
+                &self.session_id,
+                &self.tool_terminals,
+                &tid,
+                &cmd_str,
+                &out,
+                code,
+            )
+            .await;
+            return Ok(Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "exitCode": code } })));
         }
-        Ok(json!({ "jsonrpc": "2.0", "id": id, "result": { "exitCode": code } }))
+
+        let mut exit_rx = term.exit_rx.clone();
+        let out_arc = term.output.clone();
+        let cmd_str = term.command.clone();
+        let tool_terminals = self.tool_terminals.clone();
+        let sink = self.sink.clone();
+        let session_id = self.session_id.clone();
+        let outbound_tx = self.outbound_tx.clone();
+        let mut cancel_rx = self.cancel.clone();
+        tokio::spawn(async move {
+            let code = loop {
+                if let Some(c) = *exit_rx.borrow() {
+                    break c;
+                }
+                if *cancel_rx.borrow() {
+                    let _ = outbound_tx.send(json_err(id, -32000, "session cancelled"));
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            let _ = outbound_tx.send(json_err(id, -32000, "session cancelled"));
+                            return;
+                        }
+                    }
+                    res = exit_rx.changed() => {
+                        if res.is_err() {
+                            break (*exit_rx.borrow()).unwrap_or(-1);
+                        }
+                    }
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let out = out_arc.lock().unwrap().clone();
+            emit_terminal_final_via(&sink, &session_id, &tool_terminals, &tid, &cmd_str, &out, code).await;
+            let _ = outbound_tx.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "exitCode": code }
+            }));
+        });
+        Ok(None)
     }
 
     fn handle_term_kill(&mut self, id: Value, params: &Value) -> Value {
         let tid = params["terminalId"].as_str().unwrap_or("");
         if let Some(mut t) = self.terminals.remove(tid) {
             let _ = t.done_tx.send(true);
-            tokio::spawn(async move {
-                command::kill_child_tree(&mut t.child).await;
-            });
+            if let Some(ktx) = t.kill_tx.take() {
+                let _ = ktx.send(());
+            }
         }
         json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    }
+}
+
+async fn emit_terminal_final_via(
+    sink: &mpsc::Sender<Value>,
+    session_id: &str,
+    tool_terminals: &Arc<Mutex<HashMap<String, String>>>,
+    tid: &str,
+    cmd_str: &str,
+    out: &str,
+    code: i32,
+) {
+    let bound_tool_id = tool_terminals.lock().unwrap().get(tid).cloned();
+    if let Some(tc_id) = bound_tool_id {
+        let _ = sink
+            .send(json!({
+                "type": "session_update",
+                "session_id": session_id,
+                "kind": "tool_call",
+                "tool_call_id": tc_id,
+                "output": out,
+            }))
+            .await;
+    } else {
+        let _ = sink
+            .send(json!({
+                "type": "session_update",
+                "session_id": session_id,
+                "kind": "terminal_out",
+                "command": cmd_str,
+                "output": out,
+                "exit_code": code,
+            }))
+            .await;
     }
 }
 
@@ -2657,6 +2808,283 @@ mod tests {
             events.last().unwrap()["phase"],
             "idle"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn acp_client_preserves_tool_title_on_sparse_update_and_leaves_tooling_when_done() {
+        let dir = std::env::temp_dir().join(format!("acp_sp_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (client_read, mut agent_write) = tokio::io::duplex(32 * 1024);
+        let (mut agent_read, client_write) = tokio::io::duplex(32 * 1024);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<Value>(32);
+        let pending_perms: PendingPerms = Arc::new(Mutex::new(HashMap::new()));
+        let perm_cache = Arc::new(Mutex::new(PermissionCache::default()));
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let agent_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(&mut agent_read).lines();
+
+            let r1: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            agent_write
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":r1["id"],"result":{"protocolVersion":1}}))
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let r2: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            agent_write
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":r2["id"],"result":{"sessionId":"acp-sp-1"}}))
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let r3: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            for upd in [
+                json!({
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":"tc-sp-1",
+                    "title":"bash: cargo test",
+                    "name":"bash",
+                    "kind":"execute",
+                    "status":"in_progress"
+                }),
+                // 稀疏更新：不携带 title/name/status，只补 output
+                json!({
+                    "sessionUpdate":"tool_call_update",
+                    "toolCallId":"tc-sp-1",
+                    "content":[{"type":"content","text":"running..."}]
+                }),
+                json!({
+                    "sessionUpdate":"tool_call_update",
+                    "toolCallId":"tc-sp-1",
+                    "status":"completed"
+                }),
+            ] {
+                agent_write
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-sp-1","update":upd}})
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            agent_write
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":r3["id"],"result":{"stopReason":"end_turn"}}))
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let msg = PromptStartMsg {
+            session_id: "s-sp".into(),
+            acp_session_key: None,
+            cwd: dir.to_string_lossy().into(),
+            agent: AgentConfig {
+                id: None,
+                preset: "codex".into(),
+                cmd: "codex-acp".into(),
+                env: HashMap::new(),
+            },
+            model: String::new(),
+            thinking_level: "中".into(),
+            permission_policy: "allow_all".into(),
+            text: "test".into(),
+            files: vec![],
+            attachments: vec![],
+        };
+
+        drive_stdio(
+            client_read,
+            client_write,
+            &msg,
+            &dir,
+            sink_tx,
+            pending_perms,
+            perm_cache,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        agent_task.await.unwrap();
+
+        let mut acts = Vec::new();
+        while let Ok(ev) = sink_rx.try_recv() {
+            if ev["kind"] == "activity" {
+                acts.push((
+                    ev["phase"].as_str().unwrap_or("").to_string(),
+                    ev["detail"].as_str().unwrap_or("").to_string(),
+                ));
+            }
+        }
+        assert!(
+            !acts.iter().any(|(_, d)| d == "执行工具中…"),
+            "sparse update should not overwrite title with generic placeholder: {acts:?}"
+        );
+        let tooling_idx = acts
+            .iter()
+            .position(|(p, d)| p == "tooling" && d == "bash: cargo test")
+            .expect("should report tooling with tool title");
+        assert!(
+            acts[tooling_idx + 1..]
+                .iter()
+                .any(|(p, _)| p == "connecting"),
+            "should leave tooling phase once tool_call completes: {acts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn acp_client_term_wait_does_not_block_cancel_or_kill() {
+        let dir = std::env::temp_dir().join(format!("acp_tw_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (client_read, mut agent_write) = tokio::io::duplex(32 * 1024);
+        let (mut agent_read, client_write) = tokio::io::duplex(32 * 1024);
+        let (sink_tx, _sink_rx) = mpsc::channel::<Value>(32);
+        let pending_perms: PendingPerms = Arc::new(Mutex::new(HashMap::new()));
+        let perm_cache = Arc::new(Mutex::new(PermissionCache::default()));
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (cmd_prog, cmd_args) = if cfg!(windows) {
+            ("cmd", vec!["/C", "ping", "-n", "15", "127.0.0.1"])
+        } else {
+            ("sh", vec!["-c", "sleep 15"])
+        };
+
+        let agent_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(&mut agent_read).lines();
+
+            let r1: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            agent_write
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":r1["id"],"result":{"protocolVersion":1}}))
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let r2: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            agent_write
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":r2["id"],"result":{"sessionId":"acp-tw-1"}}))
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let r3: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            agent_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":101,"method":"terminal/create","params":{"command":cmd_prog,"args":cmd_args}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let create_resp: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let tid = create_resp["result"]["terminalId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            // 发起阻塞性 terminal/wait_for_exit 后，立即紧接着发 terminal/kill，验证不会被 wait 卡死
+            agent_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":102,"method":"terminal/wait_for_exit","params":{"terminalId":tid}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            agent_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":103,"method":"terminal/kill","params":{"terminalId":tid}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let mut saw_kill = false;
+            let mut saw_wait = false;
+            while !(saw_kill && saw_wait) {
+                let line = tokio::time::timeout(Duration::from_secs(4), lines.next_line())
+                    .await
+                    .expect("wait/kill responses should arrive promptly without deadlock")
+                    .unwrap()
+                    .unwrap();
+                let resp: Value = serde_json::from_str(&line).unwrap();
+                if resp["id"] == 103 {
+                    saw_kill = true;
+                } else if resp["id"] == 102 {
+                    saw_wait = true;
+                }
+            }
+
+            agent_write
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":r3["id"],"result":{"stopReason":"end_turn"}}))
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let msg = PromptStartMsg {
+            session_id: "s-tw".into(),
+            acp_session_key: None,
+            cwd: dir.to_string_lossy().into(),
+            agent: AgentConfig {
+                id: None,
+                preset: "codex".into(),
+                cmd: "codex-acp".into(),
+                env: HashMap::new(),
+            },
+            model: String::new(),
+            thinking_level: "中".into(),
+            permission_policy: "allow_all".into(),
+            text: "wait".into(),
+            files: vec![],
+            attachments: vec![],
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            drive_stdio(
+                client_read,
+                client_write,
+                &msg,
+                &dir,
+                sink_tx,
+                pending_perms,
+                perm_cache,
+                cancel_rx,
+            ),
+        )
+        .await
+        .expect("drive_stdio should finish promptly without term wait deadlock")
+        .unwrap();
+        agent_task.await.unwrap();
 
         let _ = std::fs::remove_dir_all(dir);
     }

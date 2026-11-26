@@ -1,6 +1,8 @@
 use super::dirs::{clean_path_str, expand_tilde};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 
 #[cfg(windows)]
@@ -142,23 +144,33 @@ pub fn configure_child_group(cmd: &mut Command) {
     let _ = cmd;
 }
 
+pub async fn kill_pid_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut tk = Command::new("taskkill");
+        tk.args(["/T", "/F", "/PID", &pid.to_string()]);
+        tk.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = tokio::time::timeout(Duration::from_secs(5), tk.status()).await;
+    }
+    #[cfg(unix)]
+    {
+        let mut k = Command::new("kill");
+        k.args(["-KILL", &format!("-{pid}")]);
+        k.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = tokio::time::timeout(Duration::from_secs(5), k.status()).await;
+    }
+}
+
 pub async fn kill_child_tree(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
-        #[cfg(windows)]
-        {
-            let mut tk = Command::new("taskkill");
-            tk.args(["/T", "/F", "/PID", &pid.to_string()]);
-            tk.creation_flags(CREATE_NO_WINDOW);
-            let _ = tk.status().await;
-        }
-        #[cfg(unix)]
-        {
-            let mut k = Command::new("kill");
-            k.args(["-KILL", &format!("-{pid}")]);
-            let _ = k.status().await;
-        }
+        kill_pid_tree(pid).await;
     }
-    let _ = child.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
 }
 
 fn default_pathext() -> String {
@@ -243,8 +255,13 @@ fn hardened_git_args(args: &[&str]) -> Vec<String> {
 async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
     let full_args = hardened_git_args(args);
     let mut cmd = prepare("git", &full_args);
-    cmd.current_dir(dir);
-    let out = cmd.output().await.ok()?;
+    cmd.current_dir(dir)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }

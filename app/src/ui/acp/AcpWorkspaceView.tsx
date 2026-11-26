@@ -24,7 +24,7 @@ import {
   uploadAttachmentLocalFirst,
 } from "../../acpHost";
 import { acp } from "../../api";
-import { applyAcpBootstrap, getState, setState, useApp } from "../../store";
+import { applyAcpBootstrap, applyAcpEvent, getState, setState, useApp } from "../../store";
 import type {
   AcpActivityPhase,
   AcpAttachment,
@@ -407,11 +407,7 @@ export default function AcpWorkspaceView() {
 
   const patchSessionState = (updated: typeof activeSession) => {
     if (!updated) return;
-    setState((cur) => ({
-      acpSessions: cur.acpSessions.map((x) =>
-        x.id === updated.id ? { ...updated, turns: updated.turns ?? x.turns } : x,
-      ),
-    }));
+    setState((cur) => applyAcpEvent(cur, "session_upserted", { session: updated }));
   };
 
   const uploadFilesList = async (picked: File[]) => {
