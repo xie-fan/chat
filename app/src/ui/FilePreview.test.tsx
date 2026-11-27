@@ -530,4 +530,238 @@ describe("FilePreview", () => {
       setState(resetSessionState());
     }
   });
+
+  it("streams and caps chat text preview at 512 KiB bytes and handles UTF-8 boundary cleanly", async () => {
+    setViewportWidth(1280, 800);
+    const chunkSize = 64 * 1024;
+    const totalChunks = 20;
+    let pulledChunks = 0;
+    let streamCanceled = false;
+    let seenRange: string | null = null;
+    let seenSignal: AbortSignal | undefined;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        seenRange = new Headers(init?.headers).get("Range");
+        seenSignal = init?.signal ?? undefined;
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (pulledChunks >= totalChunks) {
+              controller.close();
+              return;
+            }
+            const buf = new Uint8Array(chunkSize).fill(0x61); // 'a'
+            // 第 8 个块是字节 [458752, 524288)：把 3 字节汉字 '中' (E4 B8 AD) 放在 524287..524289 跨过 512 KiB 边界
+            if (pulledChunks === 7) {
+              buf[chunkSize - 1] = 0xe4;
+            } else if (pulledChunks === 8) {
+              buf[0] = 0xb8;
+              buf[1] = 0xad;
+            }
+            pulledChunks++;
+            controller.enqueue(buf);
+          },
+          cancel() {
+            streamCanceled = true;
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }),
+    );
+
+    const { host, unmount } = await mountPreview({
+      variant: "chat",
+      target: {
+        kind: "chat-attachment",
+        key: "chat:huge.log",
+        fileName: "huge.log",
+        mime: "text/plain",
+        size: totalChunks * chunkSize,
+        url: "https://example.invalid/v1/files/huge?ticket=abc",
+      },
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(host.querySelector(".pv-trunc-banner")?.textContent).toContain(
+          "文件较大，当前仅展示前 512 KB 内容预览",
+        );
+      });
+      expect(seenRange).toBe("bytes=0-524288");
+      expect(seenSignal).toBeInstanceOf(AbortSignal);
+      expect(streamCanceled).toBe(true);
+      expect(pulledChunks).toBeLessThan(totalChunks);
+
+      const rendered = host.querySelector(".pv-code-lines")?.textContent ?? "";
+      expect(rendered.endsWith("\uFFFD")).toBe(false);
+      expect(new TextEncoder().encode(rendered).byteLength).toBeLessThanOrEqual(512 * 1024);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("handles 206 Partial Content and empty file / 416 responses cleanly", async () => {
+    setViewportWidth(1280, 800);
+    const seenRanges: Array<string | null> = [];
+    let mode: "partial" | "empty-known" | "empty-416" = "partial";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        seenRanges.push(new Headers(init?.headers).get("Range"));
+        if (mode === "partial") {
+          return new Response("partial-body-preview", {
+            status: 206,
+            headers: {
+              "content-type": "text/plain",
+              "content-range": "bytes 0-524288/2097152",
+            },
+          });
+        }
+        if (mode === "empty-known") {
+          return new Response("", {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          });
+        }
+        return new Response(null, {
+          status: 416,
+          headers: { "content-range": "bytes */0" },
+        });
+      }),
+    );
+
+    const { host, root, unmount } = await mountPreview({
+      variant: "chat",
+      target: {
+        kind: "chat-attachment",
+        key: "chat:partial.txt",
+        fileName: "partial.txt",
+        mime: "text/plain",
+        size: 2097152,
+        url: "https://example.invalid/v1/files/partial",
+      },
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(host.querySelector(".pv-trunc-banner")).not.toBeNull();
+      });
+      expect(host.textContent).toContain("partial-body-preview");
+      expect(seenRanges[0]).toBe("bytes=0-524288");
+
+      mode = "empty-known";
+      await act(async () => {
+        root.render(
+          <FilePreview
+            variant="chat"
+            target={{
+              kind: "chat-attachment",
+              key: "chat:empty-known.txt",
+              fileName: "empty-known.txt",
+              mime: "text/plain",
+              size: 0,
+              url: "https://example.invalid/v1/files/empty-known",
+            }}
+            onClose={() => {}}
+          />,
+        );
+      });
+      await vi.waitFor(() => {
+        expect(host.querySelector(".pv-code-lines")).not.toBeNull();
+      });
+      expect(host.querySelector(".pv-trunc-banner")).toBeNull();
+      expect(seenRanges[1]).toBeNull();
+
+      mode = "empty-416";
+      await act(async () => {
+        root.render(
+          <FilePreview
+            variant="chat"
+            target={{
+              kind: "chat-attachment",
+              key: "chat:empty-416.txt",
+              fileName: "empty-416.txt",
+              mime: "text/plain",
+              url: "https://example.invalid/v1/files/empty-416",
+            }}
+            onClose={() => {}}
+          />,
+        );
+      });
+      await vi.waitFor(() => {
+        expect(host.querySelector(".pv-code-lines")).not.toBeNull();
+      });
+      expect(host.querySelector(".pv-state-error")).toBeNull();
+      expect(host.querySelector(".pv-trunc-banner")).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("aborts in-flight chat text preview fetch when switching target or closing", async () => {
+    setViewportWidth(1280, 800);
+    const signals: AbortSignal[] = [];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+        const sig = init?.signal as AbortSignal;
+        signals.push(sig);
+        return new Promise<Response>(() => {});
+      }),
+    );
+
+    const { root, unmount } = await mountPreview({
+      variant: "chat",
+      target: {
+        kind: "chat-attachment",
+        key: "chat:slow-1.log",
+        fileName: "slow-1.log",
+        mime: "text/plain",
+        size: 1024 * 1024,
+        url: "https://example.invalid/v1/files/slow-1",
+      },
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(signals.length).toBe(1);
+      });
+      expect(signals[0].aborted).toBe(false);
+
+      await act(async () => {
+        root.render(
+          <FilePreview
+            variant="chat"
+            target={{
+              kind: "chat-attachment",
+              key: "chat:slow-2.log",
+              fileName: "slow-2.log",
+              mime: "text/plain",
+              size: 1024 * 1024,
+              url: "https://example.invalid/v1/files/slow-2",
+            }}
+            onClose={() => {}}
+          />,
+        );
+      });
+
+      await vi.waitFor(() => {
+        expect(signals.length).toBe(2);
+      });
+      expect(signals[0].aborted).toBe(true);
+      expect(signals[1].aborted).toBe(false);
+
+      unmount();
+      expect(signals[1].aborted).toBe(true);
+    } catch (e) {
+      unmount();
+      throw e;
+    }
+  });
 });

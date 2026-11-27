@@ -328,6 +328,28 @@ async fn recall_attachment_hidden_and_uploader_fetch() {
     .await;
     let mid = m["id"].as_str().unwrap().to_string();
 
+    // 撤回前：签发短时 ticket 访问原图/缩略图均返回 200，且强制 private, no-store 防止浏览器缓存
+    let ticket_resp = c
+        .get(format!("{base}/v1/files/{att_id}/ticket"))
+        .header("authorization", authz(&b.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ticket_resp.status(), 200);
+    assert_eq!(ticket_resp.headers()["cache-control"], "private, no-store");
+    let ticket = ticket_resp.json::<Value>().await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for pre_url in [
+        format!("{base}/v1/files/{att_id}?ticket={ticket}"),
+        format!("{base}/v1/files/{att_id}?thumb=1&ticket={ticket}"),
+    ] {
+        let r = c.get(&pre_url).send().await.unwrap();
+        assert_eq!(r.status(), 200, "撤回前 {pre_url} 应 200");
+        assert_eq!(r.headers()["cache-control"], "private, no-store");
+    }
+
     // 撤回：响应是上传者视角，带 recalled_attachment_id
     let r = recall_post(&base, &a.access, &mid).await;
     assert_eq!(r.status(), 200);
@@ -335,7 +357,7 @@ async fn recall_attachment_hidden_and_uploader_fetch() {
     assert!(tomb["attachment"].is_null());
     assert_eq!(tomb["recalled_attachment_id"], att_id);
 
-    // 公开路径全部 404：原图 / ?dl=1 / ?thumb=1
+    // 公开路径全部 404（含 Bearer 与撤回前签发的旧 ticket）：原图 / ?dl=1 / ?thumb=1，均带 no-store
     for url in [
         format!("{base}/v1/files/{att_id}"),
         format!("{base}/v1/files/{att_id}?dl=1"),
@@ -343,6 +365,15 @@ async fn recall_attachment_hidden_and_uploader_fetch() {
     ] {
         let dl = c.get(&url).header("authorization", authz(&a.access)).send().await.unwrap();
         assert_eq!(dl.status(), 404, "{url} 应 404");
+        assert_eq!(dl.headers()["cache-control"], "private, no-store");
+    }
+    for old_url in [
+        format!("{base}/v1/files/{att_id}?ticket={ticket}"),
+        format!("{base}/v1/files/{att_id}?thumb=1&ticket={ticket}"),
+    ] {
+        let dl = c.get(&old_url).send().await.unwrap();
+        assert_eq!(dl.status(), 404, "撤回后旧票据 {old_url} 应 404");
+        assert_eq!(dl.headers()["cache-control"], "private, no-store");
     }
 
     // 墓碑视图不暴露附件

@@ -300,6 +300,94 @@ interface LoadedData {
 
 const MAX_CLIENT_TEXT_BYTES = 512 * 1024;
 
+async function readLimitedText(
+  url: string,
+  maxBytes: number,
+  signal: AbortSignal,
+  knownSize?: number,
+): Promise<{ text: string; truncated: boolean }> {
+  const canUseRange =
+    knownSize !== 0 && !url.startsWith("blob:") && !url.startsWith("data:");
+  let resp = await fetch(url, {
+    cache: "no-store",
+    referrerPolicy: "no-referrer",
+    signal,
+    ...(canUseRange ? { headers: { Range: `bytes=0-${maxBytes}` } } : {}),
+  });
+
+  if (resp.status === 416) {
+    const contentRange = resp.headers.get("content-range") ?? "";
+    if (knownSize === 0 || /bytes\s+\*\/0\b/i.test(contentRange)) {
+      return { text: "", truncated: false };
+    }
+    resp = await fetch(url, {
+      cache: "no-store",
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  }
+
+  if (!resp.ok) {
+    throw new Error(`加载失败 (${resp.status})`);
+  }
+
+  const crMatch = /\/(\d+)\s*$/.exec(resp.headers.get("content-range") ?? "");
+  const contentTotal = crMatch ? Number(crMatch[1]) : undefined;
+
+  let merged: Uint8Array;
+  let exceeded = false;
+
+  if (resp.body) {
+    const reader = resp.body.getReader();
+    const onAbort = () => {
+      void reader.cancel().catch(() => {});
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    const chunks: Uint8Array[] = [];
+    let kept = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        if (kept + value.byteLength > maxBytes) {
+          if (kept < maxBytes) {
+            chunks.push(value.subarray(0, maxBytes - kept));
+            kept = maxBytes;
+          }
+          exceeded = true;
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        chunks.push(value);
+        kept += value.byteLength;
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      reader.releaseLock();
+    }
+
+    merged = new Uint8Array(kept);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+  } else {
+    const raw = new Uint8Array(await resp.arrayBuffer());
+    exceeded = raw.byteLength > maxBytes;
+    merged = exceeded ? raw.subarray(0, maxBytes) : raw;
+  }
+
+  const truncated =
+    exceeded ||
+    (contentTotal !== undefined && contentTotal > maxBytes) ||
+    (resp.status === 206 && knownSize !== undefined && knownSize > maxBytes);
+  const text = new TextDecoder("utf-8").decode(merged, { stream: truncated });
+  return { text, truncated };
+}
+
 export interface FilePreviewProps {
   variant: "chat" | "agent";
   target: FilePreviewTarget;
@@ -408,6 +496,7 @@ export default function FilePreview({
   // 加载预览内容并托管所有临时 ObjectURL 生命周期
   useEffect(() => {
     let alive = true;
+    const abortController = new AbortController();
     let revokeUrl: string | null = null;
 
     const assignObjectUrl = (blob: Blob) => {
@@ -520,7 +609,11 @@ export default function FilePreview({
               const url = target.url ?? await target.loadUrl?.();
               if (!alive) return;
               if (!url) throw new Error("找不到 PDF 附件");
-              const resp = await fetch(url, { cache: "no-store", referrerPolicy: "no-referrer" });
+              const resp = await fetch(url, {
+                cache: "no-store",
+                referrerPolicy: "no-referrer",
+                signal: abortController.signal,
+              });
               if (!resp.ok) throw new Error(`加载失败 (${resp.status})`);
               blob = await resp.blob();
             }
@@ -567,18 +660,21 @@ export default function FilePreview({
           }
 
           if (url && (vk === "markdown" || vk === "csv" || vk === "code")) {
-            const resp = await fetch(url, { cache: "no-store", referrerPolicy: "no-referrer" });
-            if (!resp.ok) throw new Error(`加载失败 (${resp.status})`);
-            const txt = await resp.text();
-            if (!alive) return;
+            const { text, truncated } = await readLimitedText(
+              url,
+              MAX_CLIENT_TEXT_BYTES,
+              abortController.signal,
+              target.size,
+            );
+            if (!alive || abortController.signal.aborted) return;
             setData({
               status: "ready",
               fileName: target.fileName,
               mime: target.mime,
               size: target.size,
               viewKind: vk,
-              textContent: txt.slice(0, MAX_CLIENT_TEXT_BYTES),
-              truncated: txt.length > MAX_CLIENT_TEXT_BYTES,
+              textContent: text,
+              truncated,
             });
             return;
           }
@@ -745,7 +841,7 @@ export default function FilePreview({
               : "二进制格式文件暂不支持直接预览",
         });
       } catch (err) {
-        if (!alive) return;
+        if (!alive || abortController.signal.aborted) return;
         setData((prev) => ({
           ...prev,
           status: "error",
@@ -757,6 +853,7 @@ export default function FilePreview({
     void load();
     return () => {
       alive = false;
+      abortController.abort();
       if (revokeUrl) URL.revokeObjectURL(revokeUrl);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

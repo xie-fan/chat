@@ -225,7 +225,11 @@ fn strip_trailing_line_col(raw: &str) -> Option<&str> {
 
 fn normalize_raw_file_input(raw: &str) -> String {
     let trimmed = strip_line_fragment(raw.trim());
-    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("file://") {
+    if trimmed
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file://"))
+    {
         if let Ok(u) = Url::parse(trimmed) {
             if let Ok(fp) = u.to_file_path() {
                 return fp.to_string_lossy().into_owned();
@@ -522,5 +526,42 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(base);
         let _ = std::fs::remove_dir_all(other_dir);
+    }
+
+    #[test]
+    fn read_file_handles_chinese_relative_paths_without_panicking() {
+        let base = std::env::temp_dir().join(format!("acp_read_cn_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("中文目录")).unwrap();
+        std::fs::create_dir_all(base.join("文档")).unwrap();
+
+        let root_doc = base.join("中文文档.md");
+        let nested_doc = base.join("中文目录/说明.txt");
+        let dot_doc = base.join("文档/备注.md");
+        std::fs::write(&root_doc, "# 中文标题\n内容\n").unwrap();
+        std::fs::write(&nested_doc, "目录中的文本\n").unwrap();
+        std::fs::write(&dot_doc, "相对点前缀\n").unwrap();
+
+        let cwd_str = base.to_string_lossy().to_string();
+
+        for (raw, expected_name, expected_content) in [
+            ("中文文档.md", "中文文档.md", "# 中文标题\n内容\n"),
+            ("中文文档.md:1:2", "中文文档.md", "# 中文标题\n内容\n"),
+            ("中文文档.md#L1-L2", "中文文档.md", "# 中文标题\n内容\n"),
+            ("中文目录/说明.txt", "说明.txt", "目录中的文本\n"),
+            ("./文档/备注.md", "备注.md", "相对点前缀\n"),
+        ] {
+            let res = read_file(raw, Some(&cwd_str), &[]).unwrap();
+            assert_eq!(res["file_name"], expected_name, "raw={raw}");
+            assert_eq!(res["encoding"], "utf8", "raw={raw}");
+            assert_eq!(res["content"], expected_content, "raw={raw}");
+        }
+
+        let file_uri = Url::from_file_path(&root_doc).unwrap().to_string();
+        let upper_uri = format!("FILE://{}", &file_uri[7..]);
+        let res_uri = read_file(&upper_uri, None, &[]).unwrap();
+        assert_eq!(res_uri["file_name"], "中文文档.md");
+        assert_eq!(res_uri["content"], "# 中文标题\n内容\n");
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }
